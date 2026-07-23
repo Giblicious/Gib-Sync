@@ -47,6 +47,8 @@ Build with `npm ci && npm run build`. Copy `plugin/main.js`, `plugin/manifest.js
 
 Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafile addresses, authenticate, load accessible libraries, and select a library and folder. The Seafile password is exchanged for an API token and is not saved by the plugin or service.
 
+In plugin settings, **Periodic sync** controls timer-based remote checks independently from **Sync when files change**. File-change sync waits two seconds after a vault file is created, saved, renamed, or deleted, coalesces rapid edits into one run, and ignores excluded paths.
+
 Another device can repeat manual setup and select the discovered existing vault. Alternatively, use the optional one-time QR/setup link, which expires after five minutes and works once.
 
 ## Development

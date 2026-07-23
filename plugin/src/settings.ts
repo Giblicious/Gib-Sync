@@ -13,14 +13,14 @@ export interface LiveSyncStatus {
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
-  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean;
+  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; syncOnFileChange: boolean;
   syncIntervalSeconds: number; syncObsidianConfig: boolean; exclusions: string[];
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, syncIntervalSeconds: 60, syncObsidianConfig: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -29,4 +29,14 @@ export const initialLiveStatus = (configured:boolean): LiveSyncStatus => ({ phas
 
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   return Object.assign({}, DEFAULT_SETTINGS, await plugin.loadData());
+}
+
+export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): boolean {
+  const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
+  if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
+  if(!settings.syncObsidianConfig&&(normalized===".obsidian"||normalized.startsWith(".obsidian/")))return false;
+  return !settings.exclusions.some((prefix)=>{
+    const excluded=prefix.replace(/\\/g,"/").replace(/^\/+/,"").replace(/\/+$/,"");
+    return Boolean(excluded)&&(normalized===excluded||normalized.startsWith(`${excluded}/`));
+  });
 }

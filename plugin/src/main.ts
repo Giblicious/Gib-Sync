@@ -2,12 +2,14 @@ import { Notice, Plugin } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
-import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings } from "./settings";
+import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { GibSyncSettingTab, HistoryModal, PairingQrModal, ScannerModal, SetupModal, claimSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
   private statusEl!: HTMLElement; private timer: number | null = null; private debounce: number | null = null;
+  private debounceKind: "automatic"|"file-change"|null = null;
+  private fileChangePending = false;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
 
@@ -24,10 +26,10 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({ id: "open-history", name: "Open version history", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new HistoryModal(this.app, this).open(); return true; } });
     this.registerObsidianProtocolHandler("gib-sync", async (params) => { if (params.data) { try { await this.claimPairingLink(params.data, navigator.platform || "Mobile"); new Notice("Gib Sync paired"); void this.runSync(); } catch (error) { new Notice(`Pairing failed: ${error instanceof Error ? error.message : String(error)}`, 10000); } } });
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", () => this.scheduleSync()));
-    this.registerEvent(this.app.vault.on("modify", () => this.scheduleSync()));
-    this.registerEvent(this.app.vault.on("delete", () => this.scheduleSync()));
-    this.registerEvent(this.app.vault.on("rename", () => this.scheduleSync()));
+    this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.scheduleFileChangeSync(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => this.scheduleFileChangeSync(file.path,oldPath)));
     this.configureTimer();
     if (this.settings.deviceToken && this.settings.autoSync) this.app.workspace.onLayoutReady(() => this.scheduleSync(2500));
   }
@@ -55,6 +57,7 @@ export default class GibSyncPlugin extends Plugin {
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
     if (this.liveStatus.running) return;
+    if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
@@ -66,13 +69,30 @@ export default class GibSyncPlugin extends Plugin {
       console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
       this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();this.report("error",`Sync failed: ${message}`,"error");new Notice(`Gib Sync failed: ${message}`,10000);
-    } finally { this.scheduleNextSyncLabel(); }
+    } finally {
+      if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
+      else this.scheduleNextSyncLabel();
+    }
   }
   scheduleSync(delay = 2000) {
     if (!this.settings.autoSync || !this.settings.deviceToken) return;
+    this.queueSync(delay,"Automatic sync","automatic");
+  }
+  scheduleFileChangeSync(...paths:string[]) {
+    if(!this.settings.syncOnFileChange||!this.settings.deviceToken||!paths.some((path)=>shouldSyncChangedPath(path,this.settings)))return;
+    if(this.liveStatus.running){this.fileChangePending=true;return;}
+    this.queueSync(2000,"Vault file changed","file-change");
+  }
+  configureFileChangeSync() {
+    if(this.settings.syncOnFileChange||this.debounceKind!=="file-change"||this.debounce===null)return;
+    window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;this.liveStatus.nextSyncAt=null;this.report("idle","File-change sync disabled");
+    this.scheduleNextSyncLabel();
+  }
+  private queueSync(delay:number,reason:string,kind:"automatic"|"file-change"="file-change") {
     if (this.debounce !== null) window.clearTimeout(this.debounce);
-    this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`Sync scheduled in ${Math.max(1,Math.round(delay/1000))}s`);
-    this.debounce = window.setTimeout(() => { this.debounce = null; void this.runSync(); }, delay);
+    this.debounceKind=kind;
+    this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`${reason}; sync in ${Math.max(1,Math.round(delay/1000))}s`);
+    this.debounce = window.setTimeout(() => { this.debounce = null;this.debounceKind=null;void this.runSync(); }, delay);
   }
   private scheduleNextSyncLabel() { if (this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } }
   configureTimer() {
