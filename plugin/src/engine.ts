@@ -3,13 +3,14 @@ import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import type { GibSyncSettings } from "./settings";
+import type { GibSyncSettings, SyncPhase } from "./settings";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; snapshotId: string | null; }
+export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; }
 
 export class SyncEngine {
   private running: Promise<SyncResult> | null = null;
@@ -18,7 +19,7 @@ export class SyncEngine {
     private readonly api: GibSyncApi,
     private readonly getSettings: () => GibSyncSettings,
     private readonly saveSettings: () => Promise<void>,
-    private readonly status: (message: string) => void
+    private readonly status: (progress: SyncProgress) => void
   ) {}
 
   sync(): Promise<SyncResult> {
@@ -40,9 +41,11 @@ export class SyncEngine {
 
   private async scan(): Promise<Map<string, FileState>> {
     const output = new Map<string, FileState>();
-    for (const path of await this.listFiles()) {
+    const paths = await this.listFiles(); let current = 0;
+    for (const path of paths) {
       const bytes = new Uint8Array(await this.adapter.readBinary(path)); const stat = await this.adapter.stat(path);
       output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now(), bytes });
+      current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:`Scanning local vault (${current}/${paths.length})`,current,total:paths.length});
     }
     return output;
   }
@@ -71,14 +74,14 @@ export class SyncEngine {
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
-    this.status("Scanning vault…"); const local = await this.scan();
-    this.status("Reading remote snapshot…"); const remoteSnapshot = (await this.api.state()).head;
+    this.status({phase:"scanning",message:"Listing local vault files"}); const local = await this.scan();
+    this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
     const baseSnapshot = settings.lastSnapshotId ? await this.api.snapshot(settings.lastSnapshotId).catch(() => null) : null;
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     for (const entry of local.values()) if (entry.bytes) bytes.set(entry.hash, entry.bytes);
-    let conflicts = 0;
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+    let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths`});
     for (const path of [...paths].sort()) {
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
@@ -104,7 +107,7 @@ export class SyncEngine {
     }
 
     let downloaded = 0, deleted = 0;
-    this.status("Applying merged changes…");
+    this.status({phase:"applying",message:"Applying merged changes to this device"});
     for (const [path, entry] of final) {
       if (local.get(path)?.hash === entry.hash) continue;
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
@@ -116,22 +119,23 @@ export class SyncEngine {
     const remoteEntries = [...remote.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
-      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings(); this.status("Up to date");
+      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings(); this.status({phase:"up-to-date",message:"Up to date"});
       return { uploaded: 0, downloaded, deleted, conflicts, snapshotId: settings.lastSnapshotId };
     }
 
-    this.status("Uploading encrypted changes…"); let uploaded = 0;
+    this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;
     for (const entry of entries) {
       const clear = bytes.get(entry.hash); if (!clear || remoteEntries.some((remoteEntry) => remoteEntry.hash === entry.hash)) continue;
       await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
+      this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
     }
-    this.status("Committing snapshot…");
+    this.status({phase:"committing",message:"Committing an atomic snapshot"});
     try {
       const snapshot = await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });
-      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings(); this.status(conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Synced");
+      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings(); this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete"});
       return { uploaded, downloaded, deleted, conflicts, snapshotId: snapshot.id };
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409 && attempt < 2) { this.status("Remote changed; merging again…"); return this.run(attempt + 1); }
+      if (error instanceof ApiError && error.status === 409 && attempt < 2) { this.status({phase:"merging",message:"Remote changed during sync; merging again"}); return this.run(attempt + 1); }
       throw error;
     }
   }

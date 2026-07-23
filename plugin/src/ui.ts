@@ -1,7 +1,7 @@
 import { App, Modal, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import QRCode from "qrcode";
 import jsQR from "jsqr";
-import type { HistoryItem, PairingPayload, SetupResponse } from "@gib-sync/protocol";
+import type { ExistingVaultLocation, HistoryItem, PairingPayload, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
 import { fromBase64Url, openPairingEnvelope } from "./crypto";
 
@@ -11,120 +11,110 @@ function defaultDeviceName(): string {
   return navigator.platform || "Desktop";
 }
 
+function when(value:string|null|undefined):string { return value?new Date(value).toLocaleString():"Never"; }
+function bytes(value:number):string { if(value<1024)return `${value} B`;if(value<1024**2)return `${(value/1024).toFixed(1)} KB`;if(value<1024**3)return `${(value/1024**2).toFixed(1)} MB`;return `${(value/1024**3).toFixed(2)} GB`; }
+
 export class SetupModal extends Modal {
   constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
   onOpen() {
-    this.setTitle("Set up Gib Sync");
-    let server = this.plugin.settings.serverUrl || "https://sync.example.com";
-    let token = ""; let vaultName = this.app.vault.getName(); let deviceName = defaultDeviceName();
-    new Setting(this.contentEl).setName("Server address").addText((text) => text.setValue(server).onChange((value) => server = value.trim()));
-    new Setting(this.contentEl).setName("One-time setup token").setDesc("This token is only used to enroll the first device and is never stored.").addText((text) => { text.inputEl.type = "password"; text.onChange((value) => token = value); });
-    new Setting(this.contentEl).setName("Vault name").addText((text) => text.setValue(vaultName).onChange((value) => vaultName = value));
-    new Setting(this.contentEl).setName("Device name").addText((text) => text.setValue(deviceName).onChange((value) => deviceName = value));
-    new Setting(this.contentEl).addButton((button) => button.setCta().setButtonText("Connect").onClick(async () => {
-      button.setDisabled(true).setButtonText("Connecting…");
-      try { const setup = await this.plugin.api.setup(server, token, vaultName, deviceName); await this.plugin.acceptSetup(setup, deviceName); this.close(); new Notice("Gib Sync connected. Starting first sync…"); void this.plugin.runSync(); }
-      catch (error) { new Notice(`Setup failed: ${error instanceof Error ? error.message : String(error)}`, 10000); button.setDisabled(false).setButtonText("Connect"); }
+    this.setTitle("Connect Gib Sync");
+    this.contentEl.createEl("p",{text:"Choose the Seafile account, library, and folder for this vault. Using the same location on another device reconnects it without a QR code. Your password is exchanged for a Seafile API token and is never saved in Obsidian."});
+    let server=this.plugin.settings.serverUrl||"https://sync.example.com";
+    let seafileUrl=this.plugin.settings.storage?.seafileUrl||"https://seafile.example.com";
+    let username=this.plugin.settings.storage?.username||"";let password="";let vaultName=this.app.vault.getName();let deviceName=defaultDeviceName();
+    let libraryId="";let libraryName="";let basePath=this.plugin.settings.storage?.basePath||`/Obsidian/${vaultName}`;let existingVaultId:string|undefined;let libraries:SeafileLibrary[]=[];let existingVaults:ExistingVaultLocation[]=[];
+    let pathInput!:HTMLInputElement;let vaultInput!:HTMLInputElement;
+    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setValue(server).onChange((value)=>server=value.trim()));
+    new Setting(this.contentEl).setName("Seafile server").addText((text)=>text.setValue(seafileUrl).onChange((value)=>seafileUrl=value.trim()));
+    new Setting(this.contentEl).setName("Seafile account").addText((text)=>text.setPlaceholder("you@example.com").setValue(username).onChange((value)=>username=value.trim()));
+    new Setting(this.contentEl).setName("Seafile password").setDesc("Used only during this connection request.").addText((text)=>{text.inputEl.type="password";text.onChange((value)=>password=value);});
+    const librarySetting=new Setting(this.contentEl).setName("Seafile library").setDesc("Load the libraries available to this account.");
+    const select=librarySetting.controlEl.createEl("select"); select.disabled=true; select.createEl("option",{text:"Load libraries first",value:""});
+    select.onchange=()=>{libraryId=select.value;libraryName=libraries.find((item)=>item.id===libraryId)?.name||"";existingVaultId=undefined;existingSelect.value="-1";};
+    const existingSetting=new Setting(this.contentEl).setName("Existing Gib Sync vault").setDesc("A discovered vault can fill the library and folder automatically.");
+    const existingSelect=existingSetting.controlEl.createEl("select");existingSelect.disabled=true;existingSelect.createEl("option",{text:"Load libraries first",value:""});
+    const useExisting=(index:number)=>{const existing=existingVaults[index];if(!existing)return;existingVaultId=existing.vaultId;libraryId=existing.libraryId;libraryName=existing.libraryName;select.value=libraryId;basePath=existing.basePath;pathInput.value=basePath;vaultName=existing.vaultName;vaultInput.value=vaultName;};
+    existingSelect.onchange=()=>{const index=Number(existingSelect.value);if(Number.isInteger(index)&&index>=0)useExisting(index);else existingVaultId=undefined;};
+    librarySetting.addButton((button)=>button.setButtonText("Load libraries").onClick(async()=>{
+      button.setDisabled(true).setButtonText("Loading…");
+      try { const result=await this.plugin.api.discover(server,seafileUrl,username,password);libraries=result.libraries;existingVaults=result.existingVaults;select.empty();for(const library of libraries)select.createEl("option",{text:library.name,value:library.id});select.disabled=false;
+        const preferred=this.plugin.settings.storage?.libraryId;libraryId=libraries.find((item)=>item.id===preferred)?.id||libraries[0]?.id||"";select.value=libraryId;libraryName=libraries.find((item)=>item.id===libraryId)?.name||"";button.setButtonText("Reload");
+        existingSelect.empty();existingSelect.createEl("option",{text:existingVaults.length?"Create or use the location below":"No existing vaults found",value:"-1"});for(const [index,vault] of existingVaults.entries())existingSelect.createEl("option",{text:`${vault.vaultName} — ${vault.libraryName}:${vault.basePath}`,value:String(index)});existingSelect.disabled=!existingVaults.length;if(existingVaults.length===1){existingSelect.value="0";useExisting(0);}
+        if(!libraries.length)new Notice("This Seafile account has no accessible libraries.");
+      } catch(error){new Notice(`Unable to load libraries: ${error instanceof Error?error.message:String(error)}`,10000);button.setButtonText("Try again");}
+      finally{button.setDisabled(false);}
+    }));
+    new Setting(this.contentEl).setName("Folder in library").setDesc("Gib Sync stores encrypted data in a hidden .gib-sync folder here.").addText((text)=>{pathInput=text.inputEl;text.setValue(basePath).onChange((value)=>{basePath=value.trim();existingVaultId=undefined;existingSelect.value="-1";});});
+    new Setting(this.contentEl).setName("Vault name").addText((text)=>{vaultInput=text.inputEl;text.setValue(vaultName).onChange((value)=>vaultName=value.trim());});
+    new Setting(this.contentEl).setName("Device name").addText((text)=>text.setValue(deviceName).onChange((value)=>deviceName=value.trim()));
+    new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Connect").onClick(async()=>{
+      if(!libraryId){new Notice("Load and select a Seafile library first.");return;}button.setDisabled(true).setButtonText("Connecting…");
+      try { const setup=await this.plugin.api.setup(server,{vaultName,deviceName,seafileUrl,seafileUsername:username,seafilePassword:password,libraryId,libraryName,basePath,existingVaultId});await this.plugin.acceptSetup(setup,deviceName);this.close();new Notice("Gib Sync connected. Starting first sync…");void this.plugin.runSync(); }
+      catch(error){new Notice(`Setup failed: ${error instanceof Error?error.message:String(error)}`,10000);button.setDisabled(false).setButtonText("Connect");}
     }));
   }
-  onClose() { this.contentEl.empty(); }
+  onClose(){this.contentEl.empty();}
 }
 
 export class PairingQrModal extends Modal {
-  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
-  async onOpen() {
-    this.setTitle("Add a mobile device"); this.contentEl.createEl("p", { text: "On mobile, install and enable Gib Sync, choose “Scan setup QR,” then scan this code. It expires in five minutes and works once." });
-    try {
-      const pairing = await this.plugin.api.createPairing();
-      const image = this.contentEl.createEl("img", { cls: "gib-sync-qr", attr: { alt: "Gib Sync mobile pairing QR code" } });
-      image.src = await QRCode.toDataURL(pairing.uri, { width: 640, margin: 2, errorCorrectionLevel: "M" });
-      new Setting(this.contentEl).addButton((button) => button.setButtonText("Copy pairing link").onClick(async () => { await navigator.clipboard.writeText(pairing.uri); new Notice("Pairing link copied"); }));
-      this.contentEl.createEl("p", { cls: "gib-sync-muted", text: `Expires ${new Date(pairing.expiresAt).toLocaleTimeString()}` });
-    } catch (error) { this.contentEl.createEl("p", { cls: "gib-sync-danger", text: error instanceof Error ? error.message : String(error) }); }
-  }
-  onClose() { this.contentEl.empty(); }
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  async onOpen(){this.setTitle("Quick-connect another device");this.contentEl.createEl("p",{text:"QR is optional. Scan it on another device, or copy the one-time pairing link and paste it there. You can also connect manually with the same Seafile account, library, and folder."});
+    try{const pairing=await this.plugin.api.createPairing();const image=this.contentEl.createEl("img",{cls:"gib-sync-qr",attr:{alt:"Gib Sync optional pairing QR code"}});image.src=await QRCode.toDataURL(pairing.uri,{width:640,margin:2,errorCorrectionLevel:"M"});
+      new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Copy one-time setup link").onClick(async()=>{await navigator.clipboard.writeText(pairing.uri);new Notice("One-time setup link copied");}));
+      this.contentEl.createEl("p",{cls:"gib-sync-muted",text:`Expires ${new Date(pairing.expiresAt).toLocaleTimeString()} and works once.`});
+    }catch(error){this.contentEl.createEl("p",{cls:"gib-sync-danger",text:error instanceof Error?error.message:String(error)});}}
+  onClose(){this.contentEl.empty();}
 }
 
 export class ScannerModal extends Modal {
-  private stream: MediaStream | null = null; private frame = 0; private stopped = false;
-  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
-  async onOpen() {
-    this.setTitle("Scan Gib Sync setup QR");
-    const video = this.contentEl.createEl("video", { cls: "gib-sync-video", attr: { playsinline: "true", muted: "true" } });
-    const status = this.contentEl.createEl("p", { cls: "gib-sync-muted", text: "Requesting camera…" });
-    let pasted = "";
-    new Setting(this.contentEl).setName("Or paste pairing link").addText((text) => text.onChange((value) => pasted = value)).addButton((button) => button.setButtonText("Use link").onClick(() => void this.finish(pasted)));
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false }); video.srcObject = this.stream; await video.play(); status.setText("Point the camera at the QR code on your desktop.");
-      const canvas = document.createElement("canvas"); const context = canvas.getContext("2d", { willReadFrequently: true });
-      const scan = () => {
-        if (this.stopped) return;
-        if (video.readyState >= 2 && context) {
-          canvas.width = video.videoWidth; canvas.height = video.videoHeight; context.drawImage(video, 0, 0);
-          const image = context.getImageData(0, 0, canvas.width, canvas.height); const result = jsQR(image.data, image.width, image.height, { inversionAttempts: "dontInvert" });
-          if (result?.data) { void this.finish(result.data); return; }
-        }
-        this.frame = requestAnimationFrame(scan);
-      };
-      this.frame = requestAnimationFrame(scan);
-    } catch (error) { status.setText(`Camera unavailable: ${error instanceof Error ? error.message : String(error)}. Paste the pairing link above.`); }
-  }
-  private async finish(value: string) {
-    if (!value) return; this.stopped = true; cancelAnimationFrame(this.frame); this.stream?.getTracks().forEach((track) => track.stop());
-    try { await this.plugin.claimPairingLink(value, defaultDeviceName()); this.close(); new Notice("Device paired. Starting first sync…"); void this.plugin.runSync(); }
-    catch (error) { this.stopped = false; new Notice(`Pairing failed: ${error instanceof Error ? error.message : String(error)}`, 10000); }
-  }
-  onClose() { this.stopped = true; cancelAnimationFrame(this.frame); this.stream?.getTracks().forEach((track) => track.stop()); this.contentEl.empty(); }
+  private stream:MediaStream|null=null;private frame=0;private stopped=false;
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  async onOpen(){this.setTitle("Quick-connect with QR or link");const video=this.contentEl.createEl("video",{cls:"gib-sync-video",attr:{playsinline:"true",muted:"true"}});const status=this.contentEl.createEl("p",{cls:"gib-sync-muted",text:"Requesting camera…"});let pasted="";
+    new Setting(this.contentEl).setName("One-time setup link").setDesc("Pasting the link is equivalent to scanning; the camera is optional.").addText((text)=>text.onChange((value)=>pasted=value)).addButton((button)=>button.setButtonText("Use link").onClick(()=>void this.finish(pasted)));
+    try{this.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}},audio:false});video.srcObject=this.stream;await video.play();status.setText("Point the camera at the optional QR code.");const canvas=document.createElement("canvas");const context=canvas.getContext("2d",{willReadFrequently:true});
+      const scan=()=>{if(this.stopped)return;if(video.readyState>=2&&context){canvas.width=video.videoWidth;canvas.height=video.videoHeight;context.drawImage(video,0,0);const data=context.getImageData(0,0,canvas.width,canvas.height);const result=jsQR(data.data,data.width,data.height,{inversionAttempts:"dontInvert"});if(result?.data){void this.finish(result.data);return;}}this.frame=requestAnimationFrame(scan);};this.frame=requestAnimationFrame(scan);
+    }catch(error){status.setText(`Camera unavailable: ${error instanceof Error?error.message:String(error)}. Paste the setup link above or use manual setup.`);}}
+  private async finish(value:string){if(!value)return;this.stopped=true;cancelAnimationFrame(this.frame);this.stream?.getTracks().forEach((track)=>track.stop());try{await this.plugin.claimPairingLink(value,defaultDeviceName());this.close();new Notice("Device paired. Starting first sync…");void this.plugin.runSync();}catch(error){this.stopped=false;new Notice(`Pairing failed: ${error instanceof Error?error.message:String(error)}`,10000);}}
+  onClose(){this.stopped=true;cancelAnimationFrame(this.frame);this.stream?.getTracks().forEach((track)=>track.stop());this.contentEl.empty();}
 }
 
 export class HistoryModal extends Modal {
-  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
-  async onOpen() {
-    this.setTitle("Gib Sync history"); const container = this.contentEl.createDiv({ cls: "gib-sync-history" }); container.setText("Loading…");
-    try {
-      const history = await this.plugin.api.history(); container.empty();
-      for (const item of history) this.row(container, item);
-      if (!history.length) container.setText("No snapshots yet.");
-    } catch (error) { container.setText(error instanceof Error ? error.message : String(error)); }
-  }
-  private row(container: HTMLElement, item: HistoryItem) {
-    const row = container.createDiv({ cls: "gib-sync-history-row" }); const details = row.createDiv();
-    details.createEl("strong", { text: item.message }); details.createEl("div", { cls: "gib-sync-muted", text: `${new Date(item.createdAt).toLocaleString()} · ${item.deviceName} · ${item.fileCount} files` });
-    const button = row.createEl("button", { text: "Restore" }); button.onclick = async () => {
-      if (!confirm(`Restore the vault snapshot from ${new Date(item.createdAt).toLocaleString()}? A new snapshot will preserve the current history.`)) return;
-      button.disabled = true;
-      try { await this.plugin.api.restore(item.id); this.close(); await this.plugin.runSync(); new Notice("Snapshot restored"); }
-      catch (error) { new Notice(`Restore failed: ${error instanceof Error ? error.message : String(error)}`, 10000); button.disabled = false; }
-    };
-  }
-  onClose() { this.contentEl.empty(); }
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  async onOpen(){this.setTitle("Gib Sync history");const container=this.contentEl.createDiv({cls:"gib-sync-history"});container.setText("Loading…");try{const history=await this.plugin.api.history();container.empty();for(const item of history)this.row(container,item);if(!history.length)container.setText("No snapshots yet.");}catch(error){container.setText(error instanceof Error?error.message:String(error));}}
+  private row(container:HTMLElement,item:HistoryItem){const row=container.createDiv({cls:"gib-sync-history-row"});const details=row.createDiv();details.createEl("strong",{text:item.message});details.createEl("div",{cls:"gib-sync-muted",text:`${new Date(item.createdAt).toLocaleString()} · ${item.deviceName} · ${item.fileCount} files`});const button=row.createEl("button",{text:"Restore"});button.onclick=async()=>{if(!confirm(`Restore the vault snapshot from ${new Date(item.createdAt).toLocaleString()}? A new snapshot will preserve the current history.`))return;button.disabled=true;try{await this.plugin.api.restore(item.id);this.close();await this.plugin.runSync();new Notice("Snapshot restored");}catch(error){new Notice(`Restore failed: ${error instanceof Error?error.message:String(error)}`,10000);button.disabled=false;}};}
+  onClose(){this.contentEl.empty();}
 }
 
 export class GibSyncSettingTab extends PluginSettingTab {
-  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app, plugin); }
-  display() {
-    this.containerEl.empty(); this.containerEl.createEl("h2", { text: "Gib Sync" }); const configured = Boolean(this.plugin.settings.deviceToken);
-    new Setting(this.containerEl).setName("Status").setDesc(configured ? `Connected to ${this.plugin.settings.serverUrl} as ${this.plugin.settings.deviceName}` : "Not connected")
-      .addButton((button) => button.setButtonText(configured ? "Sync now" : "Desktop setup").setCta().onClick(() => configured ? void this.plugin.runSync() : new SetupModal(this.app, this.plugin).open()));
-    new Setting(this.containerEl).setName("Scan setup QR").setDesc("Use this on the new mobile device.").addButton((button) => button.setButtonText("Open scanner").onClick(() => new ScannerModal(this.app, this.plugin).open()));
-    if (configured) new Setting(this.containerEl).setName("Add mobile device").setDesc("Generate a secure, one-time setup QR code.").addButton((button) => button.setButtonText("Show QR code").onClick(() => new PairingQrModal(this.app, this.plugin).open()));
-    new Setting(this.containerEl).setName("Automatic sync").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => { this.plugin.settings.autoSync = value; await this.plugin.saveSettings(); this.plugin.configureTimer(); }));
-    new Setting(this.containerEl).setName("Sync interval").setDesc("Seconds between periodic checks (minimum 15).").addText((text) => text.setValue(String(this.plugin.settings.syncIntervalSeconds)).onChange(async (value) => { const parsed = Number(value); if (Number.isFinite(parsed)) { this.plugin.settings.syncIntervalSeconds = Math.max(15, Math.round(parsed)); await this.plugin.saveSettings(); this.plugin.configureTimer(); } }));
-    new Setting(this.containerEl).setName("Sync Obsidian configuration").setDesc("Includes .obsidian except Gib Sync's own plugin directory. Disabled by default to avoid device-specific layout conflicts.").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async (value) => { this.plugin.settings.syncObsidianConfig = value; await this.plugin.saveSettings(); }));
-    new Setting(this.containerEl).setName("Excluded path prefixes").setDesc("One vault-relative prefix per line.").addTextArea((area) => area.setValue(this.plugin.settings.exclusions.join("\n")).onChange(async (value) => { this.plugin.settings.exclusions = value.split("\n").map((line) => line.trim()).filter(Boolean); await this.plugin.saveSettings(); }));
-    if (configured) new Setting(this.containerEl).setName("Version history").addButton((button) => button.setButtonText("Open history").onClick(() => new HistoryModal(this.app, this.plugin).open()));
+  private unsubscribe:(()=>void)|null=null;private liveRoot:HTMLElement|null=null;
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
+  display(){this.unsubscribe?.();this.containerEl.empty();this.containerEl.createEl("h2",{text:"Gib Sync"});const configured=Boolean(this.plugin.settings.deviceToken);
+    this.liveRoot=this.containerEl.createDiv({cls:"gib-sync-status-panel"});this.renderLive();this.unsubscribe=this.plugin.subscribeStatus(()=>this.renderLive());
+    const actions=new Setting(this.containerEl).setName("Actions").setDesc(configured?"Sync now, or refresh server-side counters and connection details.":"Connect manually with Seafile details, or use an optional one-time QR/link from an existing device.");
+    actions.addButton((button)=>button.setButtonText(configured?"Sync now":"Manual setup").setCta().onClick(()=>configured?void this.plugin.runSync():new SetupModal(this.app,this.plugin).open()));
+    if(configured)actions.addButton((button)=>button.setButtonText("Refresh status").onClick(()=>void this.plugin.refreshServerStatus()));
+    if(!configured)actions.addButton((button)=>button.setButtonText("QR / setup link").onClick(()=>new ScannerModal(this.app,this.plugin).open()));
+    if(configured)new Setting(this.containerEl).setName("Add another device (optional)").setDesc("Show a one-time QR code and copyable link. Manual setup with the same Seafile location also works.").addButton((button)=>button.setButtonText("Show QR and link").onClick(()=>new PairingQrModal(this.app,this.plugin).open())).addButton((button)=>button.setButtonText("Change manual connection").onClick(()=>new SetupModal(this.app,this.plugin).open()));
+    new Setting(this.containerEl).setName("Automatic sync").addToggle((toggle)=>toggle.setValue(this.plugin.settings.autoSync).onChange(async(value)=>{this.plugin.settings.autoSync=value;await this.plugin.saveSettings();this.plugin.configureTimer();}));
+    new Setting(this.containerEl).setName("Sync interval").setDesc("Seconds between periodic checks (minimum 15).").addText((text)=>text.setValue(String(this.plugin.settings.syncIntervalSeconds)).onChange(async(value)=>{const parsed=Number(value);if(Number.isFinite(parsed)){this.plugin.settings.syncIntervalSeconds=Math.max(15,Math.round(parsed));await this.plugin.saveSettings();this.plugin.configureTimer();}}));
+    new Setting(this.containerEl).setName("Sync Obsidian configuration").setDesc("Includes .obsidian except Gib Sync's own directory. Disabled by default to avoid device-specific layout conflicts.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async(value)=>{this.plugin.settings.syncObsidianConfig=value;await this.plugin.saveSettings();}));
+    new Setting(this.containerEl).setName("Excluded path prefixes").setDesc("One vault-relative prefix per line.").addTextArea((area)=>area.setValue(this.plugin.settings.exclusions.join("\n")).onChange(async(value)=>{this.plugin.settings.exclusions=value.split("\n").map((line)=>line.trim()).filter(Boolean);await this.plugin.saveSettings();}));
+    if(configured)new Setting(this.containerEl).setName("Version history").addButton((button)=>button.setButtonText("Open history").onClick(()=>new HistoryModal(this.app,this.plugin).open()));
+    if(configured)void this.plugin.refreshServerStatus();
+  }
+  hide(){this.unsubscribe?.();this.unsubscribe=null;}
+  private renderLive(){if(!this.liveRoot)return;const root=this.liveRoot;root.empty();const live=this.plugin.liveStatus;const server=this.plugin.serverStatus;const storage=server?.storage||this.plugin.settings.storage;
+    const header=root.createDiv({cls:`gib-sync-status-head is-${live.phase}`});header.createDiv({cls:"gib-sync-status-dot"});const copy=header.createDiv();copy.createEl("strong",{text:live.message});copy.createEl("div",{cls:"gib-sync-muted",text:live.running?`Running since ${when(live.startedAt)}`:`State: ${live.phase}`});
+    if(live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
+    const grid=root.createDiv({cls:"gib-sync-status-grid"});const item=(label:string,value:string)=>{const el=grid.createDiv();el.createEl("span",{text:label});el.createEl("strong",{text:value});};
+    item("Last success",when(live.lastSuccessAt));item("Last result",live.lastResult||"No completed sync yet");item("Next automatic sync",when(live.nextSyncAt));item("Last error",live.lastError||"None");
+    item("Server",this.plugin.settings.serverUrl||"Not connected");item("Vault / device",this.plugin.settings.vaultName?`${this.plugin.settings.vaultName} / ${this.plugin.settings.deviceName}`:"Not configured");
+    if(storage){item("Seafile",`${storage.username} @ ${storage.seafileUrl}`);item("Storage location",`${storage.libraryName}:${storage.basePath}/.gib-sync`);}
+    if(server){item("Remote inventory",`${server.snapshotCount} snapshots · ${server.blobCount} blobs · ${bytes(server.blobBytes)}`);item("Connected devices",String(server.deviceCount));}
+    const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();const copyButton=buttons.createEl("button",{text:"Copy diagnostics"});copyButton.onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify({generatedAt:new Date().toISOString(),live,server,connection:{serverUrl:this.plugin.settings.serverUrl,vaultId:this.plugin.settings.vaultId,deviceId:this.plugin.settings.deviceId,storage}},null,2));new Notice("Gib Sync diagnostics copied (no passwords, keys, or tokens)");};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
+    const log=activity.createDiv({cls:"gib-sync-activity-log"});for(const entry of [...live.activities].reverse().slice(0,30)){const row=log.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}if(!live.activities.length)log.createEl("div",{cls:"gib-sync-muted",text:"Activity will appear here as Gib Sync works."});
   }
 }
 
-export function decodePairing(value: string): PairingPayload {
-  const data = value.startsWith("obsidian://") ? new URL(value).searchParams.get("data") : value;
-  if (!data) throw new Error("Pairing code is missing data");
-  const payload = JSON.parse(new TextDecoder().decode(fromBase64Url(decodeURIComponent(data)))) as PairingPayload;
-  if (payload.v !== 1 || !payload.server || !payload.pairingId || !payload.secret) throw new Error("Unsupported pairing code");
-  return payload;
-}
-
-export async function claimSetup(plugin: GibSyncPlugin, value: string, deviceName: string): Promise<SetupResponse> {
-  const payload = decodePairing(value); const response = await plugin.api.claimPairing(payload.server, payload.pairingId, payload.secret, deviceName);
-  return openPairingEnvelope<SetupResponse>(response.envelope, payload.secret, payload.pairingId);
-}
+export function decodePairing(value:string):PairingPayload{const data=value.startsWith("obsidian://")?new URL(value).searchParams.get("data"):value;if(!data)throw new Error("Pairing code is missing data");const payload=JSON.parse(new TextDecoder().decode(fromBase64Url(decodeURIComponent(data)))) as PairingPayload;if(payload.v!==1||!payload.server||!payload.pairingId||!payload.secret)throw new Error("Unsupported pairing code");return payload;}
+export async function claimSetup(plugin:GibSyncPlugin,value:string,deviceName:string):Promise<SetupResponse>{const payload=decodePairing(value);const response=await plugin.api.claimPairing(payload.server,payload.pairingId,payload.secret,deviceName);return openPairingEnvelope<SetupResponse>(response.envelope,payload.secret,payload.pairingId);}

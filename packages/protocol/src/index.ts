@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export interface ManifestEntry {
   path: string;
@@ -27,6 +27,61 @@ export interface SetupResponse {
   deviceToken: string;
   vaultKey: string;
   head: Snapshot | null;
+  storage: StorageLocation;
+}
+
+export interface StorageLocation {
+  seafileUrl: string;
+  username: string;
+  libraryId: string;
+  libraryName: string;
+  basePath: string;
+}
+
+export interface SeafileLibrary {
+  id: string;
+  name: string;
+}
+
+export interface StorageDiscovery {
+  username: string;
+  libraries: SeafileLibrary[];
+  existingVaults: ExistingVaultLocation[];
+}
+
+export interface ExistingVaultLocation {
+  vaultId: string;
+  vaultName: string;
+  libraryId: string;
+  libraryName: string;
+  basePath: string;
+}
+
+export interface StorageSetupRequest {
+  vaultName: string;
+  deviceName: string;
+  seafileUrl: string;
+  seafileUsername: string;
+  seafilePassword: string;
+  libraryId: string;
+  libraryName: string;
+  basePath: string;
+  existingVaultId?: string;
+}
+
+export interface ServerStatus {
+  protocolVersion: number;
+  vaultId: string;
+  vaultName: string;
+  deviceId: string;
+  deviceName: string;
+  deviceCount: number;
+  snapshotCount: number;
+  blobCount: number;
+  blobBytes: number;
+  head: Snapshot | null;
+  storage: StorageLocation;
+  serverTime: string;
 }
 
 export interface PairingPayload {
@@ -54,4 +109,3 @@ export interface HistoryItem {
   message: string;
   fileCount: number;
 }
-

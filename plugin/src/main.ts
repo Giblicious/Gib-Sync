@@ -1,18 +1,21 @@
 import { Notice, Plugin } from "obsidian";
-import type { SetupResponse } from "@gib-sync/protocol";
+import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
-import { DEFAULT_SETTINGS, type GibSyncSettings, loadSettings } from "./settings";
+import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings } from "./settings";
 import { GibSyncSettingTab, HistoryModal, PairingQrModal, ScannerModal, SetupModal, claimSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
   private statusEl!: HTMLElement; private timer: number | null = null; private debounce: number | null = null;
+  liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
+  private statusListeners = new Set<() => void>();
 
   async onload() {
     this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
-    this.statusEl = this.addStatusBarItem(); this.setStatus(this.settings.deviceToken ? "Gib Sync ready" : "Gib Sync not configured");
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (message) => this.setStatus(message));
+    this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
+    this.statusEl = this.addStatusBarItem(); this.updateStatusBar();
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,"info",progress.current,progress.total));
     this.addRibbonIcon("refresh-cw", "Gib Sync now", () => void this.runSync());
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
     this.addCommand({ id: "desktop-setup", name: "Set up first device", callback: () => new SetupModal(this.app, this).open() });
@@ -30,25 +33,51 @@ export default class GibSyncPlugin extends Plugin {
   }
 
   onunload() { if (this.timer !== null) window.clearInterval(this.timer); if (this.debounce !== null) window.clearTimeout(this.debounce); }
-  setStatus(message: string) { this.statusEl?.setText(message); this.statusEl?.setAttr("aria-label", message); }
+  private updateStatusBar() { const text = `Gib Sync: ${this.liveStatus.message}`; this.statusEl?.setText(text); this.statusEl?.setAttr("aria-label", text); }
+  private emitStatus() { this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
+  subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
+  report(phase:SyncPhase,message:string,level:ActivityLevel="info",current?:number,total?:number) {
+    this.liveStatus.phase=phase; this.liveStatus.message=message; this.liveStatus.current=current; this.liveStatus.total=total;
+    const previous=this.liveStatus.activities.at(-1); if (!previous || previous.message!==message) {
+      this.liveStatus.activities.push({at:new Date().toISOString(),phase,level,message,current,total});
+      if (this.liveStatus.activities.length>100) this.liveStatus.activities.splice(0,this.liveStatus.activities.length-100);
+    }
+    this.emitStatus();
+  }
+  clearActivity() { this.liveStatus.activities=[]; this.emitStatus(); }
+  async refreshServerStatus() { if (!this.settings.deviceToken) return; try { this.serverStatus=await this.api.status(); this.settings.storage=this.serverStatus.storage; await this.saveSettings(); this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
   async saveSettings() { await this.saveData(this.settings); }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, lastSnapshotId: null, initialized: false });
-    await this.saveSettings(); this.configureTimer();
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false });
+    this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); void this.refreshServerStatus();
   }
   async claimPairingLink(value: string, deviceName: string) { await this.acceptSetup(await claimSetup(this, value, deviceName), deviceName); }
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
-    try { const result = await this.engine.sync(); if (result.conflicts) new Notice(`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`, 8000); }
-    catch (error) { console.error("Gib Sync failed", error); this.setStatus("Gib Sync error"); new Notice(`Gib Sync failed: ${error instanceof Error ? error.message : String(error)}`, 10000); }
+    if (this.liveStatus.running) return;
+    this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
+    try {
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} uploaded · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
+      this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
+      this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
+      this.report(result.uploaded||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
+      if (result.conflicts) new Notice(`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`, 8000); void this.refreshServerStatus();
+    } catch (error) {
+      console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
+      this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
+      this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();this.report("error",`Sync failed: ${message}`,"error");new Notice(`Gib Sync failed: ${message}`,10000);
+    } finally { this.scheduleNextSyncLabel(); }
   }
   scheduleSync(delay = 2000) {
     if (!this.settings.autoSync || !this.settings.deviceToken) return;
     if (this.debounce !== null) window.clearTimeout(this.debounce);
+    this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`Sync scheduled in ${Math.max(1,Math.round(delay/1000))}s`);
     this.debounce = window.setTimeout(() => { this.debounce = null; void this.runSync(); }, delay);
   }
+  private scheduleNextSyncLabel() { if (this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } }
   configureTimer() {
     if (this.timer !== null) window.clearInterval(this.timer); this.timer = null;
-    if (this.settings.autoSync && this.settings.deviceToken) this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000);
+    if (this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
+    else { this.liveStatus.nextSyncAt=null;this.emitStatus(); }
   }
 }

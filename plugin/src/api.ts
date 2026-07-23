@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { CommitRequest, HistoryItem, SetupResponse, Snapshot, SyncState } from "@gib-sync/protocol";
+import type { CommitRequest, HistoryItem, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
@@ -18,8 +18,10 @@ export class GibSyncApi {
     if (response.status < 200 || response.status >= 300) throw new ApiError(response.json?.error ?? `Gib Sync request failed (${response.status})`, response.status, response.json);
     return response.json as T;
   }
-  setup(server: string, token: string, vaultName: string, deviceName: string) { return this.json<SetupResponse>("POST", "/v1/setup", { vaultName, deviceName }, token, server); }
+  discover(server:string,seafileUrl:string,seafileUsername:string,seafilePassword:string) { return this.json<StorageDiscovery>("POST","/v1/storage/discover",{seafileUrl,seafileUsername,seafilePassword},undefined,server); }
+  setup(server: string, body: StorageSetupRequest) { return this.json<SetupResponse>("POST", "/v1/setup", body, undefined, server); }
   state() { return this.json<SyncState>("GET", "/v1/state", undefined, this.settings().deviceToken); }
+  status() { return this.json<ServerStatus>("GET", "/v1/status", undefined, this.settings().deviceToken); }
   snapshot(id: string) { return this.json<Snapshot>("GET", `/v1/snapshots/${id}`, undefined, this.settings().deviceToken); }
   history() { return this.json<HistoryItem[]>("GET", "/v1/history?limit=100", undefined, this.settings().deviceToken); }
   commit(body: CommitRequest) { return this.json<Snapshot>("POST", "/v1/commit", body, this.settings().deviceToken); }
