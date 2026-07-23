@@ -20,6 +20,9 @@ services:
       - ${GIBSYNC_DATA_PATH:-./data}:/data
     ports:
       - "8787:8787"
+    networks:
+      - default
+      - seafile-net
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>{if(!r.ok)process.exit(1)})"]
       interval: 30s
@@ -27,3 +30,6 @@ services:
       retries: 3
       start_period: 20s
 
+networks:
+  seafile-net:
+    external: true
