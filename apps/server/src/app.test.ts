@@ -32,6 +32,8 @@ describe("Gib Sync API", () => {
     const {config,store,storage} = fixture(); const app = await buildApp(config, store, storage as unknown as SeafileStorage);
     const setup = await app.inject({method:"POST",url:"/v1/setup",headers:{authorization:`Bearer ${config.GIBSYNC_SETUP_TOKEN}`},payload:{vaultName:"Test",deviceName:"Desktop"}});
     expect(setup.statusCode).toBe(200); const credentials = setup.json(); const auth = {authorization:`Bearer ${credentials.deviceToken}`};
+    const repeatedSetup = await app.inject({method:"POST",url:"/v1/setup",headers:{authorization:`Bearer ${config.GIBSYNC_SETUP_TOKEN}`},payload:{vaultName:"Other",deviceName:"Intruder"}});
+    expect(repeatedSetup.statusCode).toBe(409);
     const hash = "a".repeat(64); const blob = Buffer.from("encrypted-content");
     expect((await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:blob})).statusCode).toBe(201);
     const commit = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"note.md",hash,size:7,mtime:1}]}});

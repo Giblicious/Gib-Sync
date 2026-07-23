@@ -46,12 +46,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if (!safeEqual(token, config.GIBSYNC_SETUP_TOKEN)) return reply.unauthorized();
     const body = z.object({ vaultName: z.string().min(1).max(100), deviceName: z.string().min(1).max(100) }).parse(request.body);
     let vault = store.one<{id:string;name:string}>("SELECT id,name FROM vaults ORDER BY created_at LIMIT 1");
+    if (vault) return reply.conflict("Initial setup is already complete; enroll additional devices with a pairing QR code");
     const now = new Date().toISOString();
-    if (!vault) {
-      const id = randomUUID(); const vaultKey = randomToken(32);
-      store.run("INSERT INTO vaults(id,name,wrapped_key,created_at) VALUES(?,?,?,?)", id, body.vaultName, sealJson(vaultKey, config.GIBSYNC_SERVER_SECRET, id), now);
-      vault = { id, name: body.vaultName };
-    }
+    const id = randomUUID(); const vaultKey = randomToken(32);
+    store.run("INSERT INTO vaults(id,name,wrapped_key,created_at) VALUES(?,?,?,?)", id, body.vaultName, sealJson(vaultKey, config.GIBSYNC_SERVER_SECRET, id), now);
+    vault = { id, name: body.vaultName };
     const deviceId = randomUUID(); const deviceToken = randomToken();
     store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at) VALUES(?,?,?,?,?,?)", deviceId, vault.id, body.deviceName, sha256(deviceToken), now, now);
     return setupResponse(vault.id, vault.name, deviceId, deviceToken);
