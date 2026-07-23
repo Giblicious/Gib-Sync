@@ -1,9 +1,9 @@
 {
   "id": "gib-sync",
   "name": "Gib Sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.5.0",
-  "description": "Secure, self-hosted, versioned vault sync with per-vault Seafile storage and live status.",
+  "description": "Self-hosted, versioned vault sync with readable Seafile recovery copies and live status.",
   "author": "Giblicious",
   "authorUrl": "https://github.com/Giblicious",
   "isDesktopOnly": false

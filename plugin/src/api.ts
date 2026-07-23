@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { CommitRequest, HistoryItem, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState } from "@gib-sync/protocol";
+import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
@@ -26,6 +26,8 @@ export class GibSyncApi {
   history() { return this.json<HistoryItem[]>("GET", "/v1/history?limit=100", undefined, this.settings().deviceToken); }
   commit(body: CommitRequest) { return this.json<Snapshot>("POST", "/v1/commit", body, this.settings().deviceToken); }
   restore(id: string) { return this.json<Snapshot>("POST", `/v1/restore/${id}`, {}, this.settings().deviceToken); }
+  mirrorPlan(snapshotId:string,entries:ManifestEntry[]){return this.json<MirrorPlanResponse>("POST","/v1/mirror/plan",{snapshotId,entries},this.settings().deviceToken);}
+  mirrorComplete(snapshotId:string){return this.json<MirrorCompleteResponse>("POST","/v1/mirror/complete",{snapshotId},this.settings().deviceToken);}
   createPairing() { return this.json<{uri:string;expiresAt:string}>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
   claimPairing(server: string, id: string, secret: string, deviceName: string) { return this.json<{envelope:string}>("POST", `/v1/pairings/${id}/claim`, { secret, deviceName }, undefined, server); }
   async getBlob(hash: string): Promise<Uint8Array> {
@@ -37,5 +39,9 @@ export class GibSyncApi {
     const body = bytes.slice().buffer;
     const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "PUT", headers: { Authorization: `Bearer ${this.settings().deviceToken}`, "Content-Type": "application/octet-stream" }, body, throw: false });
     if (response.status < 200 || response.status >= 300) throw new ApiError(`Blob upload failed (${response.status})`, response.status, response.text);
+  }
+  async putMirrorFile(snapshotId:string,path:string,hash:string,bytes:Uint8Array):Promise<void>{
+    const response=await requestUrl({url:this.url(`/v1/mirror/file?path=${encodeURIComponent(path)}`),method:"PUT",headers:{Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream","X-Gib-Sync-Snapshot":snapshotId,"X-Gib-Sync-Hash":hash},body:bytes.slice().buffer,throw:false});
+    if(response.status<200||response.status>=300)throw new ApiError(`Readable mirror upload failed for ${path} (${response.status})`,response.status,response.json??response.text);
   }
 }

@@ -25,7 +25,7 @@ class MemoryAdapter {
 }
 
 class MemoryApi {
-  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); commits = 0;
+  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); commits = 0;
   async state() { return {head:this.head}; }
   async snapshot(id: string) { if (this.head?.id !== id) throw new Error("missing"); return this.head; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
@@ -33,6 +33,9 @@ class MemoryApi {
   async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"]}) {
     this.commits++; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries}; return this.head;
   }
+  async mirrorPlan(_snapshotId:string,entries:Snapshot["entries"]){return {uploadPaths:entries.filter((entry)=>!this.mirror.has(entry.path)).map((entry)=>entry.path),deletePaths:[],alreadyCurrent:false};}
+  async putMirrorFile(_snapshotId:string,path:string,_hash:string,bytes:Uint8Array){this.mirror.set(path,bytes.slice());}
+  async mirrorComplete(snapshotId:string){return {mirroredFiles:this.mirror.size,deletedFiles:0,snapshotId};}
 }
 
 function settings(): GibSyncSettings {
@@ -45,12 +48,12 @@ describe("SyncEngine", () => {
     const adapter = new MemoryAdapter(); const api = new MemoryApi(); const config = settings(); const clear = new TextEncoder().encode("hello\n"); adapter.files.set("note.md",clear);
     const engine = new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}); const result = await engine.sync();
     expect(result.uploaded).toBe(1); expect(api.head?.entries[0].path).toBe("note.md"); const hash = await hashBytes(clear);
-    expect(await decryptBlob(api.blobs.get(hash)!,config.vaultKey,hash)).toEqual(clear); expect(config.initialized).toBe(true);
+    expect(await decryptBlob(api.blobs.get(hash)!,config.vaultKey,hash)).toEqual(clear);expect(api.mirror.get("note.md")).toEqual(clear);expect(result.mirrored).toBe(1);expect(config.initialized).toBe(true);
   });
   it("pulls an existing remote snapshot onto a newly paired mobile vault", async () => {
     const adapter = new MemoryAdapter(); const api = new MemoryApi(); const config = settings(); config.deviceName="Mobile"; const clear = new TextEncoder().encode("from desktop\n"); const hash = await hashBytes(clear);
     api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash)); api.head={id:"00000000-0000-4000-8000-000000000123",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"folder/note.md",hash,size:clear.length,mtime:1}]};
     const engine = new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}); const result=await engine.sync();
-    expect(result.downloaded).toBe(1); expect(api.commits).toBe(0); expect(adapter.files.get("folder/note.md")).toEqual(clear); expect(config.lastSnapshotId).toBe(api.head.id);
+    expect(result.downloaded).toBe(1);expect(result.mirrored).toBe(1);expect(api.commits).toBe(0);expect(adapter.files.get("folder/note.md")).toEqual(clear);expect(api.mirror.get("folder/note.md")).toEqual(clear);expect(config.lastSnapshotId).toBe(api.head.id);
   });
 });

@@ -3,12 +3,12 @@ import Fastify, { type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import sensible from "@fastify/sensible";
-import { PROTOCOL_VERSION, type CommitRequest, type SetupResponse, type Snapshot, type StorageSetupRequest } from "@gib-sync/protocol";
+import { PROTOCOL_VERSION, type CommitRequest, type MirrorPlanRequest, type SetupResponse, type Snapshot, type StorageSetupRequest } from "@gib-sync/protocol";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
-import { openJson, randomToken, safeEqual, sealJson, sha256 } from "./security.js";
+import { decryptVaultBlob, openJson, randomToken, safeEqual, sealJson, sha256 } from "./security.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -21,8 +21,14 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       legacy.url, legacy.username, legacy.libraryId, legacy.libraryName, "/", storage.sealToken(vault.id, legacy.token), vault.id
     );
   }
+  const mirrorUnconfigured=store.all<{id:string;name:string;storage_layout:string;storage_base_path:string}>("SELECT id,name,storage_layout,storage_base_path FROM vaults WHERE mirror_base_path IS NULL");
+  for(const vault of mirrorUnconfigured){
+    const safeName=vault.name.replace(/[\\/:*?\"<>|\x00-\x1f]/g,"-").replace(/^\.+/,"").trim()||`Vault-${vault.id.slice(0,8)}`;
+    const path=vault.storage_layout==="legacy"?`/Obsidian/${safeName}`:vault.storage_base_path;
+    store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
+  }
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
-  app.addHook("onClose", async () => { store.db.close(); });
+  app.addHook("onClose", async () => { for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]); store.db.close(); });
   await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
   await app.register(sensible);
@@ -38,10 +44,26 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
 
   function storageRow(vaultId: string): VaultStorageRow {
-    const row = store.one<VaultStorageRow>("SELECT id,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout FROM vaults WHERE id=?", vaultId);
+    const row = store.one<VaultStorageRow>("SELECT id,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout,mirror_base_path,mirror_head_id FROM vaults WHERE id=?", vaultId);
     if (!row?.storage_url || !row.storage_token) throw new Error("Vault storage is not configured");
     return row;
   }
+
+  const mirrorJobs=new Map<string,Promise<void>>();const mirrorTimers=new Set<NodeJS.Timeout>();
+  function reconcileReadableMirror(vaultId:string):Promise<void>{
+    const active=mirrorJobs.get(vaultId);if(active)return active;
+    const job=(async()=>{for(let attempt=0;attempt<3;attempt++){
+      const vault=store.one<{head_id:string|null;mirror_head_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id||vault.mirror_head_id===vault.head_id)return;
+      const snapshot=store.getSnapshot(vault.head_id);if(!snapshot)return;const row=storageRow(vaultId);const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);const target=new Set(snapshot.entries.map((entry)=>entry.path));
+      for(const entry of snapshot.entries){const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash)continue;
+        const encrypted=await storage.get(row,`blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`);const clear=decryptVaultBlob(encrypted,key,entry.hash);await storage.putReadable(row,entry.path,clear);
+        store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",vaultId,entry.path,entry.hash,clear.length,new Date().toISOString());}
+      for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",vaultId)){if(target.has(path))continue;await storage.deleteReadable(row,path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,path);}
+      const latest=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id;if(latest===snapshot.id){store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",snapshot.id,vaultId);return;}
+    }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);})().catch((error)=>{app.log.error({err:error,vaultId},"Readable mirror reconciliation failed");}).finally(()=>mirrorJobs.delete(vaultId));
+    mirrorJobs.set(vaultId,job);return job;
+  }
+  function scheduleMirror(vaultId:string,delay=2000){const timer=setTimeout(()=>{mirrorTimers.delete(timer);void reconcileReadableMirror(vaultId);},delay);timer.unref();mirrorTimers.add(timer);}
 
   function setupResponse(vaultId: string, vaultName: string, deviceId: string, deviceToken: string): SetupResponse {
     const vault = store.one<{wrapped_key: string; head_id: string | null}>("SELECT wrapped_key,head_id FROM vaults WHERE id=?", vaultId)!;
@@ -52,7 +74,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true, vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 
@@ -78,8 +100,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if (vault && vault.storage_username !== credentials.username) return reply.forbidden("This storage location belongs to another Gib Sync user");
     if (!vault) {
       const id = randomUUID(); const vaultKey = randomToken(32);
-      store.run("INSERT INTO vaults(id,name,wrapped_key,created_at,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        id,body.vaultName,sealJson(vaultKey,config.GIBSYNC_SERVER_SECRET,id),now,credentials.url,credentials.username,library.id,library.name,basePath,storage.sealToken(id,credentials.token),"standard");
+      store.run("INSERT INTO vaults(id,name,wrapped_key,created_at,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout,mirror_base_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        id,body.vaultName,sealJson(vaultKey,config.GIBSYNC_SERVER_SECRET,id),now,credentials.url,credentials.username,library.id,library.name,basePath,storage.sealToken(id,credentials.token),"standard",basePath);
       vault = { id, name:body.vaultName, storage_username:credentials.username, storage_url:credentials.url }; await storage.initVault(storageRow(id));
     } else {
       store.run("UPDATE vaults SET storage_token=?,storage_repo_name=? WHERE id=?", storage.sealToken(vault.id,credentials.token),library.name,vault.id);
@@ -121,12 +143,48 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.get("/v1/status", async (request) => {
-    const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null}>("SELECT name,head_id FROM vaults WHERE id=?",device.vault_id)!;
+    const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null}>("SELECT name,head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
     return { protocolVersion:PROTOCOL_VERSION,vaultId:device.vault_id,vaultName:vault.name,deviceId:device.id,deviceName:device.name,
       deviceCount:store.one<{count:number}>("SELECT COUNT(*) count FROM devices WHERE vault_id=? AND revoked_at IS NULL",device.vault_id)?.count ?? 0,
       snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?store.getSnapshot(vault.head_id):null,
-      storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString() };
+      storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
+      mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
+      mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id) };
+  });
+
+  const entrySchema=z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
+  app.post("/v1/mirror/plan",async(request,reply)=>{
+    const device=await authenticate(request);const body=z.object({snapshotId:z.string().uuid(),entries:z.array(entrySchema).max(200000)}).parse(request.body) as MirrorPlanRequest;
+    const vault=store.one<{head_id:string|null;mirror_head_id:string|null}>("SELECT head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;
+    if(vault.head_id!==body.snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
+    const current=new Map(store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",device.vault_id).map((entry)=>[entry.path,entry.hash]));
+    const target=new Map(body.entries.map((entry)=>[entry.path,entry.hash]));
+    const uploadPaths=body.entries.filter((entry)=>current.get(entry.path)!==entry.hash).map((entry)=>entry.path);
+    const deletePaths=[...current.keys()].filter((path)=>!target.has(path));
+    return {uploadPaths,deletePaths,alreadyCurrent:vault.mirror_head_id===body.snapshotId&&!uploadPaths.length&&!deletePaths.length};
+  });
+
+  app.put("/v1/mirror/file",async(request,reply)=>{
+    const device=await authenticate(request);const path=z.string().min(1).max(4000).parse((request.query as Record<string,unknown>).path);
+    const snapshotId=z.string().uuid().parse(request.headers["x-gib-sync-snapshot"]);const expectedHash=z.string().regex(/^[a-f0-9]{64}$/).parse(request.headers["x-gib-sync-hash"]);
+    const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;if(vault.head_id!==snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
+    const snapshot=store.getSnapshot(snapshotId);const entry=snapshot?.entries.find((item)=>item.path===path&&item.hash===expectedHash);if(!entry)return reply.badRequest("File is not part of this snapshot");
+    const bytes=Buffer.from(request.body as Buffer);if(bytes.length!==entry.size||sha256(bytes)!==expectedHash)return reply.badRequest("Readable file integrity check failed");
+    await storage.putReadable(storageRow(device.vault_id),path,new Uint8Array(bytes));
+    store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",device.vault_id,path,expectedHash,bytes.length,new Date().toISOString());
+    return reply.code(204).send();
+  });
+
+  app.post("/v1/mirror/complete",async(request,reply)=>{
+    const device=await authenticate(request);const snapshotId=z.object({snapshotId:z.string().uuid()}).parse(request.body).snapshotId;
+    const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;if(vault.head_id!==snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
+    const snapshot=store.getSnapshot(snapshotId);if(!snapshot)return reply.notFound();const target=new Set(snapshot.entries.map((entry)=>entry.path));let deletedFiles=0;
+    for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",device.vault_id)){if(target.has(path))continue;await storage.deleteReadable(storageRow(device.vault_id),path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",device.vault_id,path);deletedFiles++;}
+    const missing=snapshot.entries.filter((entry)=>!store.one("SELECT 1 FROM mirror_entries WHERE vault_id=? AND path=? AND hash=?",device.vault_id,entry.path,entry.hash));
+    if(missing.length)return reply.code(422).send({error:"Readable mirror is incomplete",paths:missing.slice(0,100).map((entry)=>entry.path)});
+    store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",snapshotId,device.vault_id);
+    return {mirroredFiles:snapshot.entries.length,deletedFiles,snapshotId};
   });
 
   app.get("/v1/snapshots/:id", async (request, reply) => {
@@ -175,7 +233,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)", snapshot.id, snapshot.vaultId, snapshot.parentId, snapshot.deviceId, snapshot.deviceName, snapshot.createdAt, snapshot.message, JSON.stringify(snapshot));
       store.run("UPDATE vaults SET head_id=? WHERE id=?", snapshot.id, device.vault_id); store.db.exec("COMMIT");
     } catch (error) { try { store.db.exec("ROLLBACK"); } catch {} throw error; }
-    return reply.code(201).send(snapshot);
+    scheduleMirror(device.vault_id);return reply.code(201).send(snapshot);
   });
 
   app.post("/v1/restore/:id", async (request, reply) => {
@@ -187,8 +245,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     store.db.exec("BEGIN IMMEDIATE");
     try { store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)", restored.id,restored.vaultId,restored.parentId,restored.deviceId,restored.deviceName,restored.createdAt,restored.message,JSON.stringify(restored)); store.run("UPDATE vaults SET head_id=? WHERE id=?",restored.id,device.vault_id); store.db.exec("COMMIT"); }
     catch(error){ store.db.exec("ROLLBACK"); throw error; }
-    return reply.code(201).send(restored);
+    scheduleMirror(device.vault_id);return reply.code(201).send(restored);
   });
+
+  app.addHook("onReady",async()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL AND (mirror_head_id IS NULL OR mirror_head_id<>head_id)"))scheduleMirror(id,50);});
 
   return app;
 }

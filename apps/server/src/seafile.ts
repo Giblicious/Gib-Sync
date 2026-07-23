@@ -14,6 +14,8 @@ export interface VaultStorageRow {
   storage_base_path: string;
   storage_token: string;
   storage_layout: string;
+  mirror_base_path: string;
+  mirror_head_id: string | null;
 }
 
 export interface StorageCredentials {
@@ -32,6 +34,12 @@ export function normalizeBasePath(value: string): string {
   const parts = value.replace(/\\/g, "/").split("/").filter(Boolean);
   if (parts.some((part) => part === "." || part === "..")) throw new Error("Storage folder cannot contain . or .. segments");
   return parts.length ? `/${parts.join("/")}` : "/";
+}
+
+export function safeRelativePath(value:string):string {
+  if(!value||value.includes("\\")||value.startsWith("/"))throw new Error("Invalid vault-relative path");
+  const parts=value.split("/");if(parts.some((part)=>!part||part==="."||part==="..")||parts[0]===".gib-sync")throw new Error("Invalid vault-relative path");
+  return parts.join("/");
 }
 
 export class SeafileStorage {
@@ -84,7 +92,7 @@ export class SeafileStorage {
 
   location(row: VaultStorageRow): StorageLocation {
     const seafileUrl=this.equivalentServer(row.storage_url,this.config.SEAFILE_URL)&&this.config.SEAFILE_PUBLIC_URL?this.config.SEAFILE_PUBLIC_URL:row.storage_url;
-    return { seafileUrl, username: row.storage_username, libraryId: row.storage_repo_id, libraryName: row.storage_repo_name, basePath: row.storage_base_path };
+    return { seafileUrl, username: row.storage_username, libraryId: row.storage_repo_id, libraryName: row.storage_repo_name, basePath: row.storage_base_path, readablePath:row.mirror_base_path };
   }
 
   equivalentServer(first:string,second:string):boolean {
@@ -98,6 +106,7 @@ export class SeafileStorage {
     if (row.storage_layout === "legacy") return `/vaults/${row.id}`;
     return `${row.storage_base_path === "/" ? "" : row.storage_base_path}/.gib-sync` || "/.gib-sync";
   }
+  private readableRoot(row:VaultStorageRow):string { return row.mirror_base_path==="/"?"":row.mirror_base_path; }
 
   private async mkdir(row: VaultStorageRow, path: string): Promise<void> {
     const key=`${row.storage_url}|${row.storage_repo_id}|${path}`;if(this.knownDirectories.has(key))return;
@@ -118,8 +127,8 @@ export class SeafileStorage {
 
   async initVault(row: VaultStorageRow): Promise<void> { await this.ensureDirectory(row,this.root(row)); }
 
-  async put(row: VaultStorageRow, relativePath: string, bytes: Uint8Array, contentType = "application/octet-stream"): Promise<void> {
-    const path = `${this.root(row)}/${relativePath.replace(/^\/+/, "")}`; await this.ensureParents(row, path);
+  private async putAt(row:VaultStorageRow,path:string,bytes:Uint8Array,contentType="application/octet-stream"):Promise<void>{
+    await this.ensureParents(row, path);
     const parent = path.slice(0, path.lastIndexOf("/")) || "/"; const name = path.slice(path.lastIndexOf("/") + 1); const credentials = this.credentials(row);
     const linkResponse = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/upload-link/?p=${encodeURIComponent(parent)}`);
     if (!linkResponse.ok) throw new Error(`Seafile upload link failed (${linkResponse.status})`);
@@ -127,6 +136,20 @@ export class SeafileStorage {
     form.set("parent_dir", parent); form.set("replace", "1"); form.set("file", new Blob([bytes.slice().buffer], { type: contentType }), name);
     const response = await this.request(credentials, uploadUrl, { method: "POST", body: form });
     if (!response.ok) throw new Error(`Seafile upload ${path} failed (${response.status}: ${await response.text()})`);
+  }
+
+  async put(row: VaultStorageRow, relativePath: string, bytes: Uint8Array, contentType = "application/octet-stream"): Promise<void> {
+    await this.putAt(row,`${this.root(row)}/${relativePath.replace(/^\/+/, "")}`,bytes,contentType);
+  }
+
+  async putReadable(row:VaultStorageRow,relativePath:string,bytes:Uint8Array):Promise<void>{
+    const safe=safeRelativePath(relativePath);await this.putAt(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,bytes);
+  }
+
+  async deleteReadable(row:VaultStorageRow,relativePath:string):Promise<void>{
+    const safe=safeRelativePath(relativePath);const path=`${this.readableRoot(row)}/${safe}`||`/${safe}`;
+    const response=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`,{method:"DELETE"});
+    if(!response.ok&&response.status!==404)throw new Error(`Seafile delete ${path} failed (${response.status}: ${await response.text()})`);
   }
 
   async get(row: VaultStorageRow, relativePath: string): Promise<Uint8Array> {

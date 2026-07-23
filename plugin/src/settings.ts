@@ -1,7 +1,7 @@
 import type { Plugin } from "obsidian";
 import type { StorageLocation } from "@gib-sync/protocol";
 
-export type SyncPhase = "not-configured"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"complete"|"up-to-date"|"error";
+export type SyncPhase = "not-configured"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
 export interface SyncActivity { at:string; phase:SyncPhase; level:ActivityLevel; message:string; current?:number; total?:number; }
 export interface LiveSyncStatus {

@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export interface ManifestEntry {
   path: string;
@@ -36,6 +36,7 @@ export interface StorageLocation {
   libraryId: string;
   libraryName: string;
   basePath: string;
+  readablePath: string;
 }
 
 export interface SeafileLibrary {
@@ -82,6 +83,26 @@ export interface ServerStatus {
   head: Snapshot | null;
   storage: StorageLocation;
   serverTime: string;
+  mirrorHeadId: string | null;
+  mirrorFileCount: number;
+  mirrorCurrent: boolean;
+}
+
+export interface MirrorPlanRequest {
+  snapshotId: string;
+  entries: ManifestEntry[];
+}
+
+export interface MirrorPlanResponse {
+  uploadPaths: string[];
+  deletePaths: string[];
+  alreadyCurrent: boolean;
+}
+
+export interface MirrorCompleteResponse {
+  mirroredFiles: number;
+  deletedFiles: number;
+  snapshotId: string;
 }
 
 export interface PairingPayload {

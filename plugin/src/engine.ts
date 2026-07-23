@@ -9,7 +9,7 @@ type FileState = ManifestEntry & { bytes?: Uint8Array };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
-export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; snapshotId: string | null; }
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; mirrored:number; snapshotId: string | null; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; }
 
 export class SyncEngine {
@@ -29,6 +29,7 @@ export class SyncEngine {
 
   private include(path: string): boolean {
     const settings = this.getSettings(); const normalized = normalizePath(path);
+    if(normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
     if (!settings.syncObsidianConfig && (normalized === ".obsidian" || normalized.startsWith(".obsidian/"))) return false;
     return !settings.exclusions.some((prefix) => normalized === prefix.replace(/\/$/, "") || normalized.startsWith(prefix));
   }
@@ -71,6 +72,13 @@ export class SyncEngine {
     return index > path.lastIndexOf("/") ? `${path.slice(0,index)}${suffix}${path.slice(index)}` : `${path}${suffix}`;
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
+
+  private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
+    this.status({phase:"mirroring",message:"Planning the readable Seafile recovery copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
+    let mirrored=0;for(const path of plan.uploadPaths){const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);bytes.set(entry.hash,clear);
+      await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);mirrored++;this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
+    await this.api.mirrorComplete(snapshotId);this.status({phase:"mirroring",message:`Readable recovery copy is current · ${entries.length} files`});return mirrored;
+  }
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
@@ -119,8 +127,8 @@ export class SyncEngine {
     const remoteEntries = [...remote.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
-      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings(); this.status({phase:"up-to-date",message:"Up to date"});
-      return { uploaded: 0, downloaded, deleted, conflicts, snapshotId: settings.lastSnapshotId };
+      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();const mirrored=remoteSnapshot?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
+      return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
     }
 
     this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;
@@ -132,8 +140,8 @@ export class SyncEngine {
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
     try {
       const snapshot = await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });
-      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings(); this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete"});
-      return { uploaded, downloaded, deleted, conflicts, snapshotId: snapshot.id };
+      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();const mirrored=await this.mirror(snapshot.id,entries,final,bytes,remoteCache);this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
+      return { uploaded, downloaded, deleted, conflicts, mirrored, snapshotId: snapshot.id };
     } catch (error) {
       if (error instanceof ApiError && error.status === 409 && attempt < 2) { this.status({phase:"merging",message:"Remote changed during sync; merging again"}); return this.run(attempt + 1); }
       throw error;

@@ -4,61 +4,50 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## What it provides
 
-- End-to-end encrypted file contents using AES-256-GCM.
-- Content-addressed storage, immutable full-vault snapshots, and point-in-time restore.
-- Compare-and-swap commits that prevent silent concurrent overwrites.
-- Three-way, line-aware text merging and binary conflict-copy preservation.
-- Per-vault Seafile routing: each person chooses a Seafile account, library, and folder while sharing one Gib Sync service.
-- Two ways to add another device: repeat the Seafile setup manually or use an optional short-lived QR/setup link.
-- A live status dashboard with phases, progress, timestamps, errors, remote inventory, device counts, activity history, and secret-free diagnostics.
+- A complete, readable 1:1 recovery copy of the synchronized vault in Seafile.
+- Encrypted content-addressed history, immutable snapshots, and point-in-time restore in a hidden `.gib-sync` sidecar.
+- Compare-and-swap commits, three-way text merging, and binary conflict-copy preservation.
+- Per-vault Seafile routing: every person chooses an account, library, and folder while sharing one Gib Sync service.
+- Manual multi-device setup plus optional short-lived QR/setup links.
+- Live phases, progress, timestamps, errors, remote inventory, mirror health, device counts, activity history, and secret-free diagnostics.
 
-## Architecture
+## Storage layout
 
 ```text
-Obsidian desktop/mobile
-  ├─ scan, merge, encrypt, verify
-  └─ HTTPS + per-device token
-             ↓
-Gib Sync service
-  ├─ SQLite: vault/device routes, snapshot index, atomic heads
-  └─ encrypted per-vault Seafile API token
-             ↓
-User-selected Seafile account / library / folder
-  └─ .gib-sync: encrypted blobs and immutable snapshot manifests
+Selected Seafile library and folder
+├── Notes/
+│   └── Example.md              # ordinary readable file
+├── Attachments/
+│   └── image.png               # ordinary readable file
+└── .gib-sync/
+    ├── blobs/                  # encrypted synchronization history
+    └── snapshots/              # immutable manifests
 ```
 
-File contents are encrypted before leaving Obsidian. Paths, sizes, modification times, plaintext content hashes, device names, and snapshot messages are visible to the Gib Sync service because synchronization and deduplication require that metadata.
+The readable tree is a recovery copy managed by Gib Sync. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Make edits through Obsidian; direct Seafile edits are not currently imported and may be replaced during reconciliation.
 
-## Deploy the service
+The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
+
+`.obsidian` is excluded by default because workspace state is often device-specific. Enable **Sync Obsidian configuration** if it should be part of the synchronized and readable recovery tree. Explicit exclusions are omitted from both representations.
+
+## Deployment
 
 1. Copy `.env.example` to `.env` and replace every secret.
-2. Set `PUBLIC_URL` to the TLS endpoint that proxies to port `8787`.
-3. Keep the legacy `SEAFILE_*` values for migrating any pre-0.2 vault.
-4. Set `SEAFILE_ALLOWED_HOSTS` to the public Seafile hostnames users may select, comma-separated and including ports when nonstandard.
+2. Set `PUBLIC_URL` to the TLS endpoint proxying port `8787`.
+3. Keep the legacy `SEAFILE_*` values for migrating pre-0.2 vaults.
+4. Set `SEAFILE_ALLOWED_HOSTS` to the public Seafile hostnames users may select.
 5. Run `docker compose up -d --build`.
-6. Verify `https://your-sync-host/healthz` returns `{"ok":true,...}`.
+6. Verify `/healthz` reports `readableMirrors: true`.
 
-Persist `/data` and include it in server backups. Version 0.2 automatically records the old global Seafile library as the storage route for existing vaults, so their objects do not move.
+Persist and back up `/data`. Existing encrypted vaults migrate without moving their sidecar objects. Their readable recovery path is created automatically under `Obsidian/<vault name>` and materialized by the first v0.3 sync.
 
-## Install and connect the Obsidian plugin
+## Install and connect
 
-Build with `npm ci && npm run build`. Copy these files into `<vault>/.obsidian/plugins/gib-sync/`:
+Build with `npm ci && npm run build`. Copy `plugin/main.js`, `plugin/manifest.json`, `plugin/styles.css`, and `plugin/versions.json` into `<vault>/.obsidian/plugins/gib-sync/`.
 
-- `plugin/main.js`
-- `plugin/manifest.json`
-- `plugin/styles.css`
+Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafile addresses, authenticate, load accessible libraries, and select a library and folder. The Seafile password is exchanged for an API token and is not saved by the plugin or service.
 
-Reload Obsidian, enable **Gib Sync**, then open its settings and choose **Manual setup**. Enter the Gib Sync URL plus the Seafile URL, account, and password; load accessible libraries; then choose a library and folder. Gib Sync stores encrypted data below `<folder>/.gib-sync`. The password is discarded after Seafile issues an API token.
-
-To add mobile or another desktop, either repeat manual setup with the same Seafile account/library/folder, or show the optional QR/setup link on an existing device. Each quick-connect link expires after five minutes and works once. QR scanning is never required.
-
-The settings status panel updates live during scans, downloads, merges, uploads, and commits. **Copy diagnostics** exports status and identifiers but excludes passwords, vault keys, API tokens, and device bearer tokens.
-
-## Synchronization behavior
-
-Gib Sync synchronizes ordinary vault files and attachments. `.obsidian` is excluded by default because workspace/layout state often differs by device; it can be enabled in settings. The plugin's own directory, `.git`, and `.trash` remain excluded.
-
-Overlapping text edits receive standard conflict markers. For binary conflicts, the remote version retains the original path and the local version is saved beside it with a timestamped conflict suffix. Every successful change creates a snapshot; restoring history creates another snapshot rather than erasing later history.
+Another device can repeat manual setup and select the discovered existing vault. Alternatively, use the optional one-time QR/setup link, which expires after five minutes and works once.
 
 ## Development
 

@@ -1,11 +1,14 @@
 # Security
 
-Gib Sync encrypts vault file contents in the Obsidian plugin before upload. The server and Seafile receive AES-256-GCM ciphertext; the plaintext SHA-256 hash is used as the immutable object identifier and authenticated encryption associated data.
+Gib Sync stores two complementary representations:
 
-Device access uses independent 256-bit bearer tokens. The server stores only token hashes. Vault keys and per-vault Seafile API tokens are encrypted at rest with `GIBSYNC_SERVER_SECRET`. The setup password is sent only over TLS to exchange it for a Seafile API token; it is not stored by the plugin or service. `SEAFILE_ALLOWED_HOSTS` prevents the setup API from becoming an arbitrary server-side request proxy.
+- The visible recovery tree contains ordinary readable vault files. Seafile, the Gib Sync service, the Seafile account owner, and administrators with sufficient access can read these files.
+- The hidden `.gib-sync` sidecar keeps AES-256-GCM encrypted content-addressed history used for synchronization, conflict handling, and snapshot restoration.
 
-Another device can authenticate to the same Seafile account, library, and folder to join its personal vault. As an optional convenience, one-time pairing links expire after five minutes, are single-use, and encrypt returned credentials with a key derived from the pairing secret using HKDF-SHA-256. A storage location owned by one Seafile identity cannot be claimed by a different identity.
+The readable representation deliberately favors recoverability over protection from the server. Losing every device, the Gib Sync database, and the server secret does not make the latest mirrored vault unreadable: it can be downloaded directly from Seafile. Use Seafile permissions, HTTPS, host security, and encrypted disks/backups to protect it.
 
-Keep `.env`, the server secret, and legacy Seafile credentials out of Git. Terminate public traffic with TLS. Back up `/data`; losing both `/data` and the server secret invalidates enrolled device metadata even though encrypted Seafile objects remain.
+Device access uses independent 256-bit bearer tokens; the server stores only hashes. Vault keys and Seafile API tokens are encrypted at rest with `GIBSYNC_SERVER_SECRET`. Setup passwords are sent only over TLS to exchange them for Seafile API tokens and are not stored. `SEAFILE_ALLOWED_HOSTS` limits storage setup to approved hosts.
 
-Report vulnerabilities privately to the repository owner rather than opening a public issue.
+One-time pairing links expire after five minutes, work once, and encrypt returned credentials using a key derived from the pairing secret. Manual enrollment requires valid credentials for the same Seafile identity and selected vault.
+
+Keep `.env`, the server secret, and legacy Seafile credentials out of Git. Back up `/data`, but also back up the readable Seafile tree independently. Report vulnerabilities privately to the repository owner rather than opening a public issue.

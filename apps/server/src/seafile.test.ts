@@ -15,7 +15,7 @@ describe("Seafile directories",()=>{
       return directories.has(path)?new Response("[]",{status:200,headers:{"content-type":"application/json"}}):new Response("missing",{status:404});
     }));
     const storage=new SeafileStorage(config);const id="11111111-1111-4111-8111-111111111111";
-    const row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/Team/Obsidian",storage_token:storage.sealToken(id,"token"),storage_layout:"standard"};
+    const row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/Team/Obsidian",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/Team/Obsidian",mirror_head_id:null};
     await storage.initVault(row);await storage.initVault(row);
     expect([...directories]).toEqual(["/Team","/Team/Obsidian","/Team/Obsidian/.gib-sync"]);expect(creates).toBe(3);
   });

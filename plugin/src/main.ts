@@ -57,10 +57,10 @@ export default class GibSyncPlugin extends Plugin {
     if (this.liveStatus.running) return;
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
     try {
-      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} uploaded · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
-      this.report(result.uploaded||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
+      this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
       if (result.conflicts) new Notice(`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`, 8000); void this.refreshServerStatus();
     } catch (error) {
       console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
