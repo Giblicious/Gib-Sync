@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 
-type Repo = { id: string; name: string };
+type Repo = { id?: string; repo_id?: string; name: string };
 
 export class SeafileStorage {
   private token = "";
@@ -34,7 +34,8 @@ export class SeafileStorage {
       if (!created.ok) throw new Error(`Unable to create Seafile library (${created.status}: ${await created.text()})`);
       repo = await created.json() as Repo;
     }
-    this.repoId = repo.id;
+    this.repoId = repo.id ?? repo.repo_id ?? "";
+    if (!this.repoId) throw new Error("Seafile returned a library without an id");
     for (const path of ["/vaults"]) await this.mkdir(path);
   }
 
