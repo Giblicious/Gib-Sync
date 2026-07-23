@@ -1,0 +1,26 @@
+{
+  "name": "gib-sync-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@gib-sync/protocol": "0.1.0",
+    "diff": "^8.0.2",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/qrcode": "^1.5.5",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "^0.25.9",
+    "obsidian": "latest",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

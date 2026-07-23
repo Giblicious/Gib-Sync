@@ -1,0 +1,138 @@
+import { normalizePath, type DataAdapter } from "obsidian";
+import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
+import { ApiError, GibSyncApi } from "./api";
+import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
+import { mergeText } from "./merge";
+import type { GibSyncSettings } from "./settings";
+
+type FileState = ManifestEntry & { bytes?: Uint8Array };
+const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
+const decoder = new TextDecoder(); const encoder = new TextEncoder();
+
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; snapshotId: string | null; }
+
+export class SyncEngine {
+  private running: Promise<SyncResult> | null = null;
+  constructor(
+    private readonly adapter: DataAdapter,
+    private readonly api: GibSyncApi,
+    private readonly getSettings: () => GibSyncSettings,
+    private readonly saveSettings: () => Promise<void>,
+    private readonly status: (message: string) => void
+  ) {}
+
+  sync(): Promise<SyncResult> {
+    if (this.running) return this.running;
+    this.running = this.run(0).finally(() => { this.running = null; }); return this.running;
+  }
+
+  private include(path: string): boolean {
+    const settings = this.getSettings(); const normalized = normalizePath(path);
+    if (!settings.syncObsidianConfig && (normalized === ".obsidian" || normalized.startsWith(".obsidian/"))) return false;
+    return !settings.exclusions.some((prefix) => normalized === prefix.replace(/\/$/, "") || normalized.startsWith(prefix));
+  }
+
+  private async listFiles(path = ""): Promise<string[]> {
+    const listing = await this.adapter.list(path); const files = listing.files.filter((file) => this.include(file));
+    for (const folder of listing.folders.filter((item) => this.include(item))) files.push(...await this.listFiles(folder));
+    return files;
+  }
+
+  private async scan(): Promise<Map<string, FileState>> {
+    const output = new Map<string, FileState>();
+    for (const path of await this.listFiles()) {
+      const bytes = new Uint8Array(await this.adapter.readBinary(path)); const stat = await this.adapter.stat(path);
+      output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now(), bytes });
+    }
+    return output;
+  }
+
+  private map(snapshot: Snapshot | null): Map<string, FileState> {
+    return new Map((snapshot?.entries ?? []).filter((entry) => this.include(entry.path)).map((entry) => [entry.path, { ...entry }]));
+  }
+
+  private async remoteBytes(entry: FileState, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
+    const existing = cache.get(entry.hash); if (existing) return existing;
+    const encrypted = await this.api.getBlob(entry.hash); const bytes = await decryptBlob(encrypted, this.getSettings().vaultKey, entry.hash);
+    cache.set(entry.hash, bytes); return bytes;
+  }
+
+  private async ensureParent(path: string): Promise<void> {
+    const parts = normalizePath(path).split("/").slice(0, -1); let current = "";
+    for (const part of parts) { current = current ? `${current}/${part}` : part; if (!await this.adapter.exists(current)) await this.adapter.mkdir(current); }
+  }
+
+  private text(path: string): boolean { return TEXT_EXTENSIONS.has(path.split(".").pop()?.toLowerCase() ?? ""); }
+  private conflictPath(path: string): string {
+    const index = path.lastIndexOf("."); const stamp = new Date().toISOString().replace(/[:.]/g, "-"); const suffix = ` (conflict ${this.getSettings().deviceName} ${stamp})`;
+    return index > path.lastIndexOf("/") ? `${path.slice(0,index)}${suffix}${path.slice(index)}` : `${path}${suffix}`;
+  }
+  private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
+
+  private async run(attempt: number): Promise<SyncResult> {
+    const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
+    this.status("Scanning vault…"); const local = await this.scan();
+    this.status("Reading remote snapshot…"); const remoteSnapshot = (await this.api.state()).head;
+    const baseSnapshot = settings.lastSnapshotId ? await this.api.snapshot(settings.lastSnapshotId).catch(() => null) : null;
+    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
+    const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
+    for (const entry of local.values()) if (entry.bytes) bytes.set(entry.hash, entry.bytes);
+    let conflicts = 0;
+    const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+    for (const path of [...paths].sort()) {
+      const b = base.get(path), l = local.get(path), r = remote.get(path);
+      if (this.same(l, r)) { if (l) final.set(path, l); continue; }
+      if (!settings.initialized && !b && !l && r) { final.set(path, r); continue; }
+      if (this.same(l, b)) { if (r) final.set(path, r); continue; }
+      if (this.same(r, b)) { if (l) final.set(path, l); continue; }
+      if (!b && l && !r) { final.set(path, l); continue; }
+      if (!b && !l && r) { final.set(path, r); continue; }
+      if (!l && !r) continue;
+      if (l && r && this.text(path)) {
+        const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
+        const localText = decoder.decode(l.bytes!); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
+        const merged = mergeText(baseText, localText, remoteText, settings.deviceName, r.path);
+        const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
+        final.set(path, { path, hash, size: mergedBytes.length, mtime: Date.now(), bytes: mergedBytes });
+        if (merged.conflicted) conflicts++;
+        continue;
+      }
+      // A binary conflict never destroys either side: remote keeps the original path and local gets a conflict copy.
+      conflicts++;
+      if (r) final.set(path, r);
+      if (l) { const copyPath = this.conflictPath(path); final.set(copyPath, { ...l, path: copyPath, mtime: Date.now() }); }
+    }
+
+    let downloaded = 0, deleted = 0;
+    this.status("Applying merged changes…");
+    for (const [path, entry] of final) {
+      if (local.get(path)?.hash === entry.hash) continue;
+      const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
+      await this.ensureParent(path); await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
+    }
+    for (const path of local.keys()) if (!final.has(path) && this.include(path)) { await this.adapter.remove(path); deleted++; }
+
+    const entries = [...final.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
+    const remoteEntries = [...remote.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
+    const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
+    if (unchanged) {
+      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings(); this.status("Up to date");
+      return { uploaded: 0, downloaded, deleted, conflicts, snapshotId: settings.lastSnapshotId };
+    }
+
+    this.status("Uploading encrypted changes…"); let uploaded = 0;
+    for (const entry of entries) {
+      const clear = bytes.get(entry.hash); if (!clear || remoteEntries.some((remoteEntry) => remoteEntry.hash === entry.hash)) continue;
+      await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
+    }
+    this.status("Committing snapshot…");
+    try {
+      const snapshot = await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });
+      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings(); this.status(conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Synced");
+      return { uploaded, downloaded, deleted, conflicts, snapshotId: snapshot.id };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && attempt < 2) { this.status("Remote changed; merging again…"); return this.run(attempt + 1); }
+      throw error;
+    }
+  }
+}

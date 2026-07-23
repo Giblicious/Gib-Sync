@@ -1,0 +1,14 @@
+{
+  "name": "gib-sync",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*", "plugin"],
+  "scripts": {
+    "build": "npm run build -w @gib-sync/protocol && npm run build -w @gib-sync/server && npm run build -w gib-sync-plugin",
+    "test": "npm run test -w @gib-sync/server && npm run test -w gib-sync-plugin",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:server": "npm run dev -w @gib-sync/server",
+    "dev:plugin": "npm run dev -w gib-sync-plugin"
+  },
+  "engines": { "node": ">=22" }
+}

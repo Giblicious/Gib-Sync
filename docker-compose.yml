@@ -1,0 +1,29 @@
+services:
+  gib-sync:
+    build: .
+    image: ghcr.io/giblicious/gib-sync:latest
+    container_name: gib-sync
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      PUBLIC_URL: ${PUBLIC_URL}
+      GIBSYNC_SETUP_TOKEN: ${GIBSYNC_SETUP_TOKEN}
+      GIBSYNC_SERVER_SECRET: ${GIBSYNC_SERVER_SECRET}
+      SEAFILE_URL: ${SEAFILE_URL}
+      SEAFILE_USERNAME: ${SEAFILE_USERNAME}
+      SEAFILE_PASSWORD: ${SEAFILE_PASSWORD}
+      SEAFILE_LIBRARY: ${SEAFILE_LIBRARY:-Gib Sync}
+      DATA_DIR: /data
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${GIBSYNC_DATA_PATH:-./data}:/data
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
