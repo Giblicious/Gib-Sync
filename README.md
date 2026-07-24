@@ -8,7 +8,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Encrypted content-addressed history, immutable snapshots, and point-in-time restore in a hidden `.gib-sync` sidecar.
 - Compare-and-swap commits, three-way text merging, and binary conflict-copy preservation.
 - Per-vault Seafile routing: every person chooses an account, library, and folder while sharing one Gib Sync service.
-- Manual multi-device setup plus optional short-lived QR/setup links.
+- Manual multi-device setup plus short-lived, one-time quick codes that are easy to type between devices.
 - Live phases, progress, timestamps, errors, remote inventory, mirror health, device counts, activity history, and secret-free diagnostics.
 
 ## Storage layout
@@ -49,7 +49,7 @@ Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafi
 
 In plugin settings, **Periodic sync** controls timer-based remote checks independently from **Sync when files change**. File-change sync waits two seconds after a vault file is created, saved, renamed, or deleted, coalesces rapid edits into one run, and ignores excluded paths.
 
-Another device can repeat manual setup and select the discovered existing vault. Alternatively, use the optional one-time QR/setup link, which expires after five minutes and works once.
+Another device can repeat manual setup and select the discovered existing vault. Alternatively, choose **Show quick code** on a connected device, then choose **Enter quick code** on the new device. The five-digit numeric code changes every 60 seconds and works once. QR scanning and camera access are not used.
 
 ## Development
 

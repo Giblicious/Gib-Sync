@@ -9,6 +9,6 @@ The readable representation deliberately favors recoverability over protection f
 
 Device access uses independent 256-bit bearer tokens; the server stores only hashes. Vault keys and Seafile API tokens are encrypted at rest with `GIBSYNC_SERVER_SECRET`. Setup passwords are sent only over TLS to exchange them for Seafile API tokens and are not stored. `SEAFILE_ALLOWED_HOSTS` limits storage setup to approved hosts.
 
-One-time pairing links expire after five minutes, work once, and encrypt returned credentials using a key derived from the pairing secret. Manual enrollment requires valid credentials for the same Seafile identity and selected vault.
+Temporary quick codes contain five random decimal digits, expire and roll every 60 seconds, work once, and permit at most five failed guesses per client per 60-second window. Returned credentials are encrypted using a key derived from the code. Manual enrollment requires valid credentials for the same Seafile identity and selected vault.
 
 Keep `.env`, the server secret, and legacy Seafile credentials out of Git. Back up `/data`, but also back up the readable Seafile tree independently. Report vulnerabilities privately to the repository owner rather than opening a public issue.

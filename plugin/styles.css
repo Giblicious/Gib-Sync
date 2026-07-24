@@ -1,5 +1,4 @@
-.gib-sync-qr { display: block; width: min(320px, 85vw); margin: 1rem auto; border-radius: 12px; }
-.gib-sync-video { display: block; width: 100%; max-height: 60vh; background: #111; border-radius: 12px; }
+.gib-sync-quick-code { margin: 1.25rem 0; padding: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px; background: var(--background-secondary); color: var(--text-normal); font-family: var(--font-monospace); font-size: clamp(1.8rem, 10vw, 3rem); font-weight: 700; letter-spacing: .12em; line-height: 1.2; text-align: center; user-select: all; }
 .gib-sync-history { max-height: 60vh; overflow: auto; }
 .gib-sync-history-row { display: grid; grid-template-columns: 1fr auto; gap: .75rem; padding: .75rem 0; border-bottom: 1px solid var(--background-modifier-border); }
 .gib-sync-muted { color: var(--text-muted); font-size: var(--font-ui-smaller); }

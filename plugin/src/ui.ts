@@ -1,9 +1,7 @@
 import { App, Modal, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
-import QRCode from "qrcode";
-import jsQR from "jsqr";
-import type { ExistingVaultLocation, HistoryItem, PairingPayload, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
+import type { ExistingVaultLocation, HistoryItem, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
-import { fromBase64Url, openPairingEnvelope } from "./crypto";
+import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -18,7 +16,7 @@ export class SetupModal extends Modal {
   constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
   onOpen() {
     this.setTitle("Connect Gib Sync");
-    this.contentEl.createEl("p",{text:"Choose the Seafile account, library, and folder for this vault. Using the same location on another device reconnects it without a QR code. Your password is exchanged for a Seafile API token and is never saved in Obsidian."});
+    this.contentEl.createEl("p",{text:"Choose the Seafile account, library, and folder for this vault. Using the same location on another device reconnects it manually. Your password is exchanged for a Seafile API token and is never saved in Obsidian."});
     let server=this.plugin.settings.serverUrl||"https://sync.example.com";
     let seafileUrl=this.plugin.settings.storage?.seafileUrl||"https://seafile.example.com";
     let username=this.plugin.settings.storage?.username||"";let password="";let vaultName=this.app.vault.getName();let deviceName=defaultDeviceName();
@@ -56,26 +54,30 @@ export class SetupModal extends Modal {
   onClose(){this.contentEl.empty();}
 }
 
-export class PairingQrModal extends Modal {
+export class QuickCodeDisplayModal extends Modal {
+  private timer:number|null=null;private expiresAt=0;private refreshing=false;private closed=false;private codeEl!:HTMLElement;private statusEl!:HTMLElement;
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
-  async onOpen(){this.setTitle("Quick-connect another device");this.contentEl.createEl("p",{text:"QR is optional. Scan it on another device, or copy the one-time pairing link and paste it there. You can also connect manually with the same Seafile account, library, and folder."});
-    try{const pairing=await this.plugin.api.createPairing();const image=this.contentEl.createEl("img",{cls:"gib-sync-qr",attr:{alt:"Gib Sync optional pairing QR code"}});image.src=await QRCode.toDataURL(pairing.uri,{width:640,margin:2,errorCorrectionLevel:"M"});
-      new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Copy one-time setup link").onClick(async()=>{await navigator.clipboard.writeText(pairing.uri);new Notice("One-time setup link copied");}));
-      this.contentEl.createEl("p",{cls:"gib-sync-muted",text:`Expires ${new Date(pairing.expiresAt).toLocaleTimeString()} and works once.`});
-    }catch(error){this.contentEl.createEl("p",{cls:"gib-sync-danger",text:error instanceof Error?error.message:String(error)});}}
-  onClose(){this.contentEl.empty();}
+  async onOpen(){this.closed=false;this.setTitle("Connect another device");this.contentEl.createEl("p",{text:"Enter this five-digit code in Gib Sync on the other device."});this.codeEl=this.contentEl.createDiv({cls:"gib-sync-quick-code",text:"-----"});this.statusEl=this.contentEl.createEl("p",{cls:"gib-sync-muted"});
+    await this.refresh();this.timer=window.setInterval(()=>void this.tick(),1000);}
+  private async refresh(){if(this.refreshing||this.closed)return;this.refreshing=true;try{const pairing=await this.plugin.api.createPairing();if(this.closed)return;this.codeEl.setText(pairing.code);this.codeEl.setAttr("aria-label",`Quick code ${pairing.code}`);this.expiresAt=Date.parse(pairing.expiresAt);this.tick();}
+    catch(error){if(!this.closed)this.statusEl.setText(error instanceof Error?error.message:String(error));}finally{this.refreshing=false;}}
+  private tick(){const seconds=Math.max(0,Math.ceil((this.expiresAt-Date.now())/1000));this.statusEl.setText(`Changes in ${seconds} second${seconds===1?"":"s"} · works once.`);if(seconds===0)void this.refresh();}
+  onClose(){this.closed=true;if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;this.contentEl.empty();}
 }
 
-export class ScannerModal extends Modal {
-  private stream:MediaStream|null=null;private frame=0;private stopped=false;
+export class QuickCodeEntryModal extends Modal {
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
-  async onOpen(){this.setTitle("Quick-connect with QR or link");const video=this.contentEl.createEl("video",{cls:"gib-sync-video",attr:{playsinline:"true",muted:"true"}});const status=this.contentEl.createEl("p",{cls:"gib-sync-muted",text:"Requesting camera…"});let pasted="";
-    new Setting(this.contentEl).setName("One-time setup link").setDesc("Pasting the link is equivalent to scanning; the camera is optional.").addText((text)=>text.onChange((value)=>pasted=value)).addButton((button)=>button.setButtonText("Use link").onClick(()=>void this.finish(pasted)));
-    try{this.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}},audio:false});video.srcObject=this.stream;await video.play();status.setText("Point the camera at the optional QR code.");const canvas=document.createElement("canvas");const context=canvas.getContext("2d",{willReadFrequently:true});
-      const scan=()=>{if(this.stopped)return;if(video.readyState>=2&&context){canvas.width=video.videoWidth;canvas.height=video.videoHeight;context.drawImage(video,0,0);const data=context.getImageData(0,0,canvas.width,canvas.height);const result=jsQR(data.data,data.width,data.height,{inversionAttempts:"dontInvert"});if(result?.data){void this.finish(result.data);return;}}this.frame=requestAnimationFrame(scan);};this.frame=requestAnimationFrame(scan);
-    }catch(error){status.setText(`Camera unavailable: ${error instanceof Error?error.message:String(error)}. Paste the setup link above or use manual setup.`);}}
-  private async finish(value:string){if(!value)return;this.stopped=true;cancelAnimationFrame(this.frame);this.stream?.getTracks().forEach((track)=>track.stop());try{await this.plugin.claimPairingLink(value,defaultDeviceName());this.close();new Notice("Device paired. Starting first sync…");void this.plugin.runSync();}catch(error){this.stopped=false;new Notice(`Pairing failed: ${error instanceof Error?error.message:String(error)}`,10000);}}
-  onClose(){this.stopped=true;cancelAnimationFrame(this.frame);this.stream?.getTracks().forEach((track)=>track.stop());this.contentEl.empty();}
+  onOpen(){this.setTitle("Enter quick code");let server=this.plugin.settings.serverUrl||"https://sync.example.com";let code="";let deviceName=defaultDeviceName();
+    this.contentEl.createEl("p",{text:"On an already connected device, choose “Show quick code,” then type that temporary code here."});
+    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setValue(server).onChange((value)=>server=value.trim()));
+    new Setting(this.contentEl).setName("Quick code").setDesc("Five numbers. The code changes every 60 seconds.").addText((text)=>{text.setPlaceholder("12345").onChange((value)=>code=value);text.inputEl.inputMode="numeric";text.inputEl.pattern="[0-9]*";text.inputEl.autocomplete="one-time-code";text.inputEl.maxLength=5;});
+    new Setting(this.contentEl).setName("Device name").addText((text)=>text.setValue(deviceName).onChange((value)=>deviceName=value.trim()));
+    new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Connect").onClick(async()=>{button.setDisabled(true).setButtonText("Connecting…");
+      try{await this.plugin.claimQuickCode(server,code,deviceName);this.close();new Notice("Device connected. Starting first sync…");void this.plugin.runSync();}
+      catch(error){new Notice(`Quick-code setup failed: ${error instanceof Error?error.message:String(error)}`,10000);button.setDisabled(false).setButtonText("Connect");}
+    }));
+  }
+  onClose(){this.contentEl.empty();}
 }
 
 export class HistoryModal extends Modal {
@@ -90,11 +92,11 @@ export class GibSyncSettingTab extends PluginSettingTab {
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   display(){this.unsubscribe?.();this.containerEl.empty();this.containerEl.createEl("h2",{text:"Gib Sync"});const configured=Boolean(this.plugin.settings.deviceToken);
     this.liveRoot=this.containerEl.createDiv({cls:"gib-sync-status-panel"});this.renderLive();this.unsubscribe=this.plugin.subscribeStatus(()=>this.renderLive());
-    const actions=new Setting(this.containerEl).setName("Actions").setDesc(configured?"Sync now, or refresh server-side counters and connection details.":"Connect manually with Seafile details, or use an optional one-time QR/link from an existing device.");
+    const actions=new Setting(this.containerEl).setName("Actions").setDesc(configured?"Sync now, or refresh server-side counters and connection details.":"Connect manually with Seafile details, or enter a temporary quick code from an existing device.");
     actions.addButton((button)=>button.setButtonText(configured?"Sync now":"Manual setup").setCta().onClick(()=>configured?void this.plugin.runSync():new SetupModal(this.app,this.plugin).open()));
     if(configured)actions.addButton((button)=>button.setButtonText("Refresh status").onClick(()=>void this.plugin.refreshServerStatus()));
-    if(!configured)actions.addButton((button)=>button.setButtonText("QR / setup link").onClick(()=>new ScannerModal(this.app,this.plugin).open()));
-    if(configured)new Setting(this.containerEl).setName("Add another device (optional)").setDesc("Show a one-time QR code and copyable link. Manual setup with the same Seafile location also works.").addButton((button)=>button.setButtonText("Show QR and link").onClick(()=>new PairingQrModal(this.app,this.plugin).open())).addButton((button)=>button.setButtonText("Change manual connection").onClick(()=>new SetupModal(this.app,this.plugin).open()));
+    if(!configured)actions.addButton((button)=>button.setButtonText("Enter quick code").onClick(()=>new QuickCodeEntryModal(this.app,this.plugin).open()));
+    if(configured)new Setting(this.containerEl).setName("Add another device").setDesc("Show a five-digit code that changes every 60 seconds and works once.").addButton((button)=>button.setButtonText("Show quick code").onClick(()=>new QuickCodeDisplayModal(this.app,this.plugin).open())).addButton((button)=>button.setButtonText("Change manual connection").onClick(()=>new SetupModal(this.app,this.plugin).open()));
     new Setting(this.containerEl).setName("Periodic sync").setDesc("Checks for remote changes on a timer.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.autoSync).onChange(async(value)=>{this.plugin.settings.autoSync=value;await this.plugin.saveSettings();this.plugin.configureTimer();}));
     new Setting(this.containerEl).setName("Sync interval").setDesc("Seconds between periodic checks (minimum 15).").addText((text)=>text.setValue(String(this.plugin.settings.syncIntervalSeconds)).onChange(async(value)=>{const parsed=Number(value);if(Number.isFinite(parsed)){this.plugin.settings.syncIntervalSeconds=Math.max(15,Math.round(parsed));await this.plugin.saveSettings();this.plugin.configureTimer();}}));
     new Setting(this.containerEl).setName("Sync when files change").setDesc("After a vault file is created, saved, renamed, or deleted, wait two seconds for edits to settle and then sync. Excluded paths do not trigger it.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncOnFileChange).onChange(async(value)=>{this.plugin.settings.syncOnFileChange=value;this.plugin.configureFileChangeSync();await this.plugin.saveSettings();}));
@@ -117,5 +119,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
   }
 }
 
-export function decodePairing(value:string):PairingPayload{const data=value.startsWith("obsidian://")?new URL(value).searchParams.get("data"):value;if(!data)throw new Error("Pairing code is missing data");const payload=JSON.parse(new TextDecoder().decode(fromBase64Url(decodeURIComponent(data)))) as PairingPayload;if(payload.v!==1||!payload.server||!payload.pairingId||!payload.secret)throw new Error("Unsupported pairing code");return payload;}
-export async function claimSetup(plugin:GibSyncPlugin,value:string,deviceName:string):Promise<SetupResponse>{const payload=decodePairing(value);const response=await plugin.api.claimPairing(payload.server,payload.pairingId,payload.secret,deviceName);return openPairingEnvelope<SetupResponse>(response.envelope,payload.secret,payload.pairingId);}
+export async function claimQuickCodeSetup(plugin:GibSyncPlugin,server:string,value:string,deviceName:string):Promise<SetupResponse>{
+  const code=normalizeQuickCode(value);const response=await plugin.api.claimQuickCode(server,code,deviceName);
+  return openPairingEnvelope<SetupResponse>(response.envelope,code,response.pairingId);
+}

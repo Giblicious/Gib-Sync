@@ -13,7 +13,6 @@ const schema = z.object({
   SEAFILE_PASSWORD: z.string().min(1),
   SEAFILE_LIBRARY: z.string().default("Gib Sync"),
   SEAFILE_ALLOWED_HOSTS: z.string().optional(),
-  PAIRING_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(300),
   MAX_BLOB_BYTES: z.coerce.number().int().positive().default(1073741824)
 });
 

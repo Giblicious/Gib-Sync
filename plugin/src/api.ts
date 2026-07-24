@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState } from "@gib-sync/protocol";
+import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, QuickCodeClaim, QuickCodePairing, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
@@ -28,8 +28,8 @@ export class GibSyncApi {
   restore(id: string) { return this.json<Snapshot>("POST", `/v1/restore/${id}`, {}, this.settings().deviceToken); }
   mirrorPlan(snapshotId:string,entries:ManifestEntry[]){return this.json<MirrorPlanResponse>("POST","/v1/mirror/plan",{snapshotId,entries},this.settings().deviceToken);}
   mirrorComplete(snapshotId:string){return this.json<MirrorCompleteResponse>("POST","/v1/mirror/complete",{snapshotId},this.settings().deviceToken);}
-  createPairing() { return this.json<{uri:string;expiresAt:string}>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
-  claimPairing(server: string, id: string, secret: string, deviceName: string) { return this.json<{envelope:string}>("POST", `/v1/pairings/${id}/claim`, { secret, deviceName }, undefined, server); }
+  createPairing() { return this.json<QuickCodePairing>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
+  claimQuickCode(server:string,code:string,deviceName:string){return this.json<QuickCodeClaim>("POST","/v1/pairings/claim-code",{code,deviceName},undefined,server);}
   async getBlob(hash: string): Promise<Uint8Array> {
     const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "GET", headers: { Authorization: `Bearer ${this.settings().deviceToken}` }, throw: false });
     if (response.status !== 200) throw new ApiError(`Blob download failed (${response.status})`, response.status, null);

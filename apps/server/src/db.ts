@@ -24,6 +24,9 @@ export class Store {
     for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT"})) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE vaults ADD COLUMN ${name} ${type}`);
     }
+    const pairingColumns=new Set(this.all<{name:string}>("PRAGMA table_info(pairings)").map((row)=>row.name));
+    if(!pairingColumns.has("quick_code_hash"))this.db.exec("ALTER TABLE pairings ADD COLUMN quick_code_hash TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS pairing_quick_code ON pairings(quick_code_hash)");
     this.db.exec("CREATE INDEX IF NOT EXISTS vault_storage_location ON vaults(storage_url,storage_repo_id,storage_base_path)");
   }
   one<T>(sql: string, ...params: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...params) as T | undefined; }

@@ -2,7 +2,7 @@ import { afterEach,describe,expect,it,vi } from "vitest";
 import type { Config } from "./config.js";
 import { SeafileStorage,type VaultStorageRow } from "./seafile.js";
 
-const config:Config={HOST:"127.0.0.1",PORT:8787,PUBLIC_URL:"https://sync.example.test",DATA_DIR:"/tmp",GIBSYNC_SERVER_SECRET:"server-secret-that-is-at-least-thirty-two-characters",SEAFILE_URL:"https://seafile.example.test",SEAFILE_PUBLIC_URL:"https://seafile.example.test",SEAFILE_USERNAME:"test@example.test",SEAFILE_PASSWORD:"password",SEAFILE_LIBRARY:"Notes",SEAFILE_ALLOWED_HOSTS:"seafile.example.test",PAIRING_TTL_SECONDS:300,MAX_BLOB_BYTES:1024};
+const config:Config={HOST:"127.0.0.1",PORT:8787,PUBLIC_URL:"https://sync.example.test",DATA_DIR:"/tmp",GIBSYNC_SERVER_SECRET:"server-secret-that-is-at-least-thirty-two-characters",SEAFILE_URL:"https://seafile.example.test",SEAFILE_PUBLIC_URL:"https://seafile.example.test",SEAFILE_USERNAME:"test@example.test",SEAFILE_PASSWORD:"password",SEAFILE_LIBRARY:"Notes",SEAFILE_ALLOWED_HOSTS:"seafile.example.test",MAX_BLOB_BYTES:1024};
 
 afterEach(()=>vi.unstubAllGlobals());
 

@@ -13,6 +13,12 @@ export function fromBase64Url(value: string): Uint8Array {
   return bytes;
 }
 
+export function normalizeQuickCode(value:string):string {
+  const compact=value.replace(/\s/g,"");
+  if(!/^\d{5}$/.test(compact))throw new Error("Enter the five-digit quick code");
+  return compact;
+}
+
 export async function hashBytes(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");

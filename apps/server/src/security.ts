@@ -1,7 +1,16 @@
-import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 
 export const randomToken = (bytes = 32) => randomBytes(bytes).toString("base64url");
 export const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+export function quickCode():string {
+  return randomInt(0,100_000).toString().padStart(5,"0");
+}
+
+export function normalizeQuickCode(value:string):string {
+  const compact=value.replace(/\s/g,"");
+  if(!/^\d{5}$/.test(compact))throw new Error("Invalid quick code");
+  return compact;
+}
 
 export function safeEqual(a: string, b: string): boolean {
   const aa = Buffer.from(a); const bb = Buffer.from(b);

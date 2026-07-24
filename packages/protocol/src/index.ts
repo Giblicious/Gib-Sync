@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export interface ManifestEntry {
   path: string;
@@ -105,12 +105,8 @@ export interface MirrorCompleteResponse {
   snapshotId: string;
 }
 
-export interface PairingPayload {
-  v: 1;
-  server: string;
-  pairingId: string;
-  secret: string;
-}
+export interface QuickCodePairing { code:string; expiresAt:string; }
+export interface QuickCodeClaim { pairingId:string; envelope:string; }
 
 export interface SyncState {
   head: Snapshot | null;

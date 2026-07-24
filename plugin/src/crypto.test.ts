@@ -1,8 +1,9 @@
 import { webcrypto } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { openPairingEnvelope, toBase64Url } from "./crypto";
+import { normalizeQuickCode,openPairingEnvelope, toBase64Url } from "./crypto";
 
 describe("pairing envelope", () => {
+  it("normalizes a typed quick code",()=>{expect(normalizeQuickCode(" 01234 ")).toBe("01234");expect(()=>normalizeQuickCode("1234")).toThrow();});
   it("opens the server IV-tag-ciphertext format", async () => {
     Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
     const secret = "pairing-secret-value"; const id = "00000000-0000-4000-8000-000000000000";

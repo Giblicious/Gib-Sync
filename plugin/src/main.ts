@@ -3,7 +3,7 @@ import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
-import { GibSyncSettingTab, HistoryModal, PairingQrModal, ScannerModal, SetupModal, claimSetup } from "./ui";
+import { GibSyncSettingTab, HistoryModal, QuickCodeDisplayModal, QuickCodeEntryModal, SetupModal, claimQuickCodeSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
@@ -21,10 +21,9 @@ export default class GibSyncPlugin extends Plugin {
     this.addRibbonIcon("refresh-cw", "Gib Sync now", () => void this.runSync());
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
     this.addCommand({ id: "desktop-setup", name: "Set up first device", callback: () => new SetupModal(this.app, this).open() });
-    this.addCommand({ id: "show-pairing-qr", name: "Show mobile setup QR", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new PairingQrModal(this.app, this).open(); return true; } });
-    this.addCommand({ id: "scan-pairing-qr", name: "Scan setup QR", callback: () => new ScannerModal(this.app, this).open() });
+    this.addCommand({ id: "show-quick-code", name: "Show temporary mobile setup code", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new QuickCodeDisplayModal(this.app, this).open(); return true; } });
+    this.addCommand({ id: "enter-quick-code", name: "Enter temporary setup code", callback: () => new QuickCodeEntryModal(this.app, this).open() });
     this.addCommand({ id: "open-history", name: "Open version history", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new HistoryModal(this.app, this).open(); return true; } });
-    this.registerObsidianProtocolHandler("gib-sync", async (params) => { if (params.data) { try { await this.claimPairingLink(params.data, navigator.platform || "Mobile"); new Notice("Gib Sync paired"); void this.runSync(); } catch (error) { new Notice(`Pairing failed: ${error instanceof Error ? error.message : String(error)}`, 10000); } } });
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
@@ -53,7 +52,7 @@ export default class GibSyncPlugin extends Plugin {
     Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false });
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); void this.refreshServerStatus();
   }
-  async claimPairingLink(value: string, deviceName: string) { await this.acceptSetup(await claimSetup(this, value, deviceName), deviceName); }
+  async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
     if (this.liveStatus.running) return;

@@ -8,7 +8,7 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
-import { decryptVaultBlob, openJson, randomToken, safeEqual, sealJson, sha256 } from "./security.js";
+import { decryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -27,7 +27,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const path=vault.storage_layout==="legacy"?`/Obsidian/${safeName}`:vault.storage_base_path;
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
-  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
+  const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
   app.addHook("onClose", async () => { for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]); store.db.close(); });
   await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
@@ -74,7 +74,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true, vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true, quickCodes:true,quickCodeSeconds:60,vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 
@@ -111,29 +111,44 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return setupResponse(vault.id,vault.name,deviceId,deviceToken);
   });
 
-  app.post("/v1/pairings", async (request) => {
-    const device = await authenticate(request); const pairingId = randomUUID(); const secret = randomToken();
-    const expiresAt = new Date(Date.now() + config.PAIRING_TTL_SECONDS * 1000).toISOString();
-    store.run("INSERT INTO pairings(id,vault_id,secret_hash,created_by_device,expires_at) VALUES(?,?,?,?,?)", pairingId, device.vault_id, sha256(secret), device.id, expiresAt);
-    const payload = { v: 1 as const, server: config.PUBLIC_URL, pairingId, secret };
-    return { payload, uri: `obsidian://gib-sync?data=${encodeURIComponent(Buffer.from(JSON.stringify(payload)).toString("base64url"))}`, expiresAt };
+  type PairingRow={id:string;vault_id:string;expires_at:string;consumed_at:string|null};
+  const quickCodeAttempts=new Map<string,{failures:number;resetAt:number}>();
+  function failedQuickCodeAttempt(ip:string):boolean{
+    const now=Date.now();if(quickCodeAttempts.size>1000){for(const [key,value] of quickCodeAttempts)if(value.resetAt<=now)quickCodeAttempts.delete(key);if(quickCodeAttempts.size>5000)quickCodeAttempts.clear();}
+    const current=quickCodeAttempts.get(ip);const attempt=!current||current.resetAt<=now?{failures:1,resetAt:now+60_000}:{failures:current.failures+1,resetAt:current.resetAt};
+    quickCodeAttempts.set(ip,attempt);return attempt.failures>5;
+  }
+  function consumePairing(row:PairingRow,deviceName:string,secret:string,context:string){
+    const vault=store.one<{name:string}>("SELECT name FROM vaults WHERE id=?",row.vault_id)!;
+    const deviceId=randomUUID();const deviceToken=randomToken();const now=new Date().toISOString();
+    store.db.exec("BEGIN IMMEDIATE");
+    try{
+      const consumed=store.run("UPDATE pairings SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND expires_at>=?",now,row.id,now);
+      if(consumed.changes!==1){store.db.exec("ROLLBACK");return null;}
+      store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",deviceId,row.vault_id,deviceName,sha256(deviceToken),now,now);
+      store.db.exec("COMMIT");
+    }catch(error){store.db.exec("ROLLBACK");throw error;}
+    return {pairingId:row.id,envelope:sealJson(setupResponse(row.vault_id,vault.name,deviceId,deviceToken),secret,context)};
+  }
+
+  app.post("/v1/pairings",async(request)=>{
+    const device=await authenticate(request);const pairingId=randomUUID();
+    const expiresAt=new Date(Date.now()+60_000).toISOString();
+    store.run("UPDATE pairings SET quick_code_hash=NULL WHERE consumed_at IS NOT NULL OR expires_at<?",new Date().toISOString());
+    let code="";let normalized="";
+    for(let attempt=0;attempt<8;attempt++){code=quickCode();normalized=normalizeQuickCode(code);if(!store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))break;}
+    if(!code||store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))throw new Error("Unable to allocate a quick code");
+    store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at) VALUES(?,?,?,?,?,?)",pairingId,device.vault_id,sha256(normalized),sha256(normalized),device.id,expiresAt);
+    return {code,expiresAt};
   });
 
-  app.post("/v1/pairings/:id/claim", async (request, reply) => {
-    const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const body = z.object({ secret: z.string().min(20), deviceName: z.string().min(1).max(100) }).parse(request.body);
-    const row = store.one<{vault_id:string;secret_hash:string;expires_at:string;consumed_at:string|null}>("SELECT vault_id,secret_hash,expires_at,consumed_at FROM pairings WHERE id=?", params.id);
-    if (!row || row.consumed_at || Date.parse(row.expires_at) < Date.now() || !safeEqual(row.secret_hash, sha256(body.secret))) return reply.code(410).send({ error: "Pairing expired or invalid" });
-    const vault = store.one<{name:string}>("SELECT name FROM vaults WHERE id=?", row.vault_id)!;
-    const deviceId = randomUUID(); const deviceToken = randomToken(); const now = new Date().toISOString();
-    store.db.exec("BEGIN IMMEDIATE");
-    try {
-      const consumed = store.run("UPDATE pairings SET consumed_at=? WHERE id=? AND consumed_at IS NULL", now, params.id);
-      if (consumed.changes !== 1) throw new Error("Pairing was already consumed");
-      store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at) VALUES(?,?,?,?,?,?)", deviceId, row.vault_id, body.deviceName, sha256(deviceToken), now, now);
-      store.db.exec("COMMIT");
-    } catch (error) { store.db.exec("ROLLBACK"); throw error; }
-    return { envelope: sealJson(setupResponse(row.vault_id, vault.name, deviceId, deviceToken), body.secret, `pairing:${params.id}`) };
+  app.post("/v1/pairings/claim-code",async(request,reply)=>{
+    const body=z.object({code:z.string().min(5).max(12),deviceName:z.string().min(1).max(100)}).parse(request.body);let code:string;
+    try{code=normalizeQuickCode(body.code);}catch{return reply.code(410).send({error:"Quick code expired or invalid"});}
+    const row=store.one<PairingRow>("SELECT id,vault_id,expires_at,consumed_at FROM pairings WHERE quick_code_hash=?",sha256(code));
+    if(!row||row.consumed_at||Date.parse(row.expires_at)<Date.now()){const limited=failedQuickCodeAttempt(request.ip);return reply.code(limited?429:410).send({error:limited?"Too many quick-code attempts; try again later":"Quick code expired or invalid"});}
+    quickCodeAttempts.delete(request.ip);
+    return consumePairing(row,body.deviceName,code,`pairing:${row.id}`)??reply.code(410).send({error:"Quick code expired or invalid"});
   });
 
   app.get("/v1/state", async (request) => {
