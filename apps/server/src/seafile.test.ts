@@ -32,4 +32,17 @@ describe("Seafile directories",()=>{
     const pooled=Buffer.from("exact");await storage.put(row,"snapshots/test.json",pooled);
     expect(uploaded).toEqual(Uint8Array.from(pooled));
   });
+  it("lists readable files recursively and excludes the Gib Sync sidecar",async()=>{
+    vi.stubGlobal("fetch",vi.fn(async()=>Response.json([
+      {type:"file",parent_dir:"/Team/Obsidian/",id:"note-id",name:"Note.md",mtime:123,size:9},
+      {type:"file",parent_dir:"/Team/Obsidian/Folder",id:"nested-id",name:"Nested.md",mtime:456,size:12},
+      {type:"file",parent_dir:"/Team/Obsidian/.gib-sync/blobs/aa",id:"blob-id",name:"hash.gbs",mtime:789,size:40}
+    ])));
+    const storage=new SeafileStorage(config);const id="11111111-1111-4111-8111-111111111111";
+    const row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/Team/Obsidian",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/Team/Obsidian",mirror_head_id:null};
+    expect(await storage.listReadable(row)).toEqual([
+      {path:"Folder/Nested.md",id:"nested-id",mtime:456,size:12},
+      {path:"Note.md",id:"note-id",mtime:123,size:9}
+    ]);
+  });
 });

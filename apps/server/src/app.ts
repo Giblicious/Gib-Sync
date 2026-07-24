@@ -7,6 +7,7 @@ import { PROTOCOL_VERSION, type CommitRequest, type MirrorPlanRequest, type Setu
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
+import { ExternalImporter } from "./external.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
 import { decryptVaultBlob, encryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
 
@@ -28,6 +29,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
+  const externalImporter=new ExternalImporter(config,store,storage);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null;
   const watchWaiters=new Map<string,Set<(headId:string|null)=>void>>();
   function notifyVault(vaultId:string,headId:string|null){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
@@ -35,7 +37,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   app.addHook("onClose", async () => {
     for(const [vaultId] of watchWaiters)notifyVault(vaultId,null);
-    for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]); store.db.close();
+    if(externalTimer)clearInterval(externalTimer);if(externalStartupTimer)clearTimeout(externalStartupTimer);
+    for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]);await externalImporter.settle();store.db.close();
   });
   await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
@@ -58,9 +61,15 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
 
   const mirrorJobs=new Map<string,Promise<void>>();const mirrorTimers=new Set<NodeJS.Timeout>();
+  async function ingestExternalChanges(vaultId:string){
+    const result=await externalImporter.scan(vaultId);
+    if(result.snapshotId){notifyVault(vaultId,result.snapshotId);scheduleMirror(vaultId,50);app.log.info({vaultId,...result},"Imported external Seafile changes");}
+    return result;
+  }
   function reconcileReadableMirror(vaultId:string):Promise<void>{
     const active=mirrorJobs.get(vaultId);if(active)return active;
     const job=(async()=>{for(let attempt=0;attempt<3;attempt++){
+      await ingestExternalChanges(vaultId);
       const vault=store.one<{head_id:string|null;mirror_head_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id||vault.mirror_head_id===vault.head_id)return;
       const snapshot=store.getSnapshot(vault.head_id);if(!snapshot)return;const row=storageRow(vaultId);const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);const target=new Set(snapshot.entries.map((entry)=>entry.path));
       for(const entry of snapshot.entries){const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash)continue;
@@ -82,7 +91,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true, quickCodes:true,quickCodeSeconds:60,instantReceive:true,vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 
@@ -185,19 +194,24 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.get("/v1/status", async (request) => {
-    const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null}>("SELECT name,head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;
+    const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
     return { protocolVersion:PROTOCOL_VERSION,vaultId:device.vault_id,vaultName:vault.name,deviceId:device.id,deviceName:device.name,
       deviceCount:store.one<{count:number}>("SELECT COUNT(*) count FROM devices WHERE vault_id=? AND revoked_at IS NULL",device.vault_id)?.count ?? 0,
       snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?store.getSnapshot(vault.head_id):null,
       storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
       mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
-      mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id) };
+      mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id),externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error };
+  });
+
+  app.post("/v1/external/scan",async(request)=>{
+    const device=await authenticate(request);return ingestExternalChanges(device.vault_id);
   });
 
   const entrySchema=z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
   app.post("/v1/mirror/plan",async(request,reply)=>{
     const device=await authenticate(request);const body=z.object({snapshotId:z.string().uuid(),entries:z.array(entrySchema).max(200000)}).parse(request.body) as MirrorPlanRequest;
+    await ingestExternalChanges(device.vault_id);
     const vault=store.one<{head_id:string|null;mirror_head_id:string|null}>("SELECT head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;
     if(vault.head_id!==body.snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
     const current=new Map(store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",device.vault_id).map((entry)=>[entry.path,entry.hash]));
@@ -273,6 +287,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.post("/v1/commit", async (request, reply) => {
     const device = await authenticate(request);
+    await ingestExternalChanges(device.vault_id);
     const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()})).max(200000) }).parse(request.body) as CommitRequest;
     const missing = body.entries.filter((entry) => !store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, entry.hash));
     if (missing.length) return reply.code(422).send({ error: "Missing blobs", hashes: missing.slice(0,100).map((e) => e.hash) });
@@ -289,7 +304,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.post("/v1/restore/:id", async (request, reply) => {
-    const device = await authenticate(request); const id = z.object({id:z.string().uuid()}).parse(request.params).id;
+    const device = await authenticate(request);await ingestExternalChanges(device.vault_id); const id = z.object({id:z.string().uuid()}).parse(request.params).id;
     const source = store.getSnapshot(id); if (!source || source.vaultId !== device.vault_id) return reply.notFound();
     const vault = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!;
     const restored: Snapshot = { ...source, id: randomUUID(), parentId: vault.head_id, deviceId: device.id, deviceName: device.name, createdAt: new Date().toISOString(), message: `Restore ${id}` };
@@ -300,7 +315,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     notifyVault(device.vault_id,restored.id);scheduleMirror(device.vault_id);return reply.code(201).send(restored);
   });
 
-  app.addHook("onReady",async()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL AND (mirror_head_id IS NULL OR mirror_head_id<>head_id)"))scheduleMirror(id,50);});
+  app.addHook("onReady",async()=>{
+    for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL AND (mirror_head_id IS NULL OR mirror_head_id<>head_id)"))scheduleMirror(id,50);
+    const scanAll=()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NOT NULL"))void ingestExternalChanges(id).catch((error)=>app.log.error({err:error,vaultId:id},"External Seafile scan failed"));};
+    externalTimer=setInterval(scanAll,3000);externalTimer.unref();externalStartupTimer=setTimeout(scanAll,250);externalStartupTimer.unref();
+  });
 
   return app;
 }

@@ -86,6 +86,9 @@ export interface ServerStatus {
   mirrorHeadId: string | null;
   mirrorFileCount: number;
   mirrorCurrent: boolean;
+  externalScanAt: string | null;
+  externalImportAt: string | null;
+  externalError: string | null;
 }
 
 export interface MirrorPlanRequest {

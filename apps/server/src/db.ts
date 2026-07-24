@@ -28,6 +28,13 @@ export class Store {
     if(!pairingColumns.has("quick_code_hash"))this.db.exec("ALTER TABLE pairings ADD COLUMN quick_code_hash TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS pairing_quick_code ON pairings(quick_code_hash)");
     this.db.exec("CREATE INDEX IF NOT EXISTS vault_storage_location ON vaults(storage_url,storage_repo_id,storage_base_path)");
+    const mirrorColumns=new Set(this.all<{name:string}>("PRAGMA table_info(mirror_entries)").map((row)=>row.name));
+    if(!mirrorColumns.has("storage_id"))this.db.exec("ALTER TABLE mirror_entries ADD COLUMN storage_id TEXT");
+    if(!mirrorColumns.has("storage_mtime"))this.db.exec("ALTER TABLE mirror_entries ADD COLUMN storage_mtime INTEGER");
+    const currentVaultColumns=new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row)=>row.name));
+    if(!currentVaultColumns.has("external_scan_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_scan_at TEXT");
+    if(!currentVaultColumns.has("external_import_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_import_at TEXT");
+    if(!currentVaultColumns.has("external_error"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_error TEXT");
   }
   one<T>(sql: string, ...params: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...params) as T | undefined; }
   all<T>(sql: string, ...params: SQLInputValue[]): T[] { return this.db.prepare(sql).all(...params) as T[]; }

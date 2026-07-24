@@ -7,7 +7,7 @@ import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { buildApp } from "./app.js";
 import type { SeafileStorage } from "./seafile.js";
-import { normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
+import { decryptVaultBlob,normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
 
 class MemoryStorage {
   files = new Map<string, Uint8Array>();
@@ -23,6 +23,7 @@ class MemoryStorage {
   async getReadable(row:any,path:string){const bytes=this.files.get(`read:${row.id}:${path}`);if(!bytes)throw new Error("missing readable");return bytes.slice();}
   async putReadable(row:any,path:string,bytes:Uint8Array){this.files.set(`read:${row.id}:${path}`,bytes.slice());}
   async deleteReadable(row:any,path:string){this.files.delete(`read:${row.id}:${path}`);}
+  async listReadable(row:any){const prefix=`read:${row.id}:`;return [...this.files.entries()].filter(([key])=>key.startsWith(prefix)).map(([key,bytes])=>({path:key.slice(prefix.length),id:sha256(bytes),mtime:1,size:bytes.length}));}
 }
 
 const roots: string[] = [];
@@ -87,6 +88,37 @@ describe("Gib Sync API", () => {
     await new Promise((resolve)=>setTimeout(resolve,10));
     const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Two",entries:[]}})).json();
     const notified=await waiting;expect(notified.statusCode).toBe(200);expect(notified.json()).toEqual({changed:true,headId:second.id});
+    await app.close();
+  });
+  it("imports externally created and deleted readable Seafile files as snapshots",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`};
+    const external=Buffer.from("# Edited in Seafile\n");storage.files.set(`read:${credentials.vaultId}:external.md`,external);
+    const imported=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});
+    expect(imported.statusCode).toBe(200);expect(imported.json()).toMatchObject({snapshotId:expect.any(String),changedFiles:1,deletedFiles:0});
+    let state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.deviceName).toBe("Seafile");expect(state.head.entries).toMatchObject([{path:"external.md",hash:sha256(external)}]);
+    storage.files.delete(`read:${credentials.vaultId}:external.md`);
+    const deleted=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});
+    expect(deleted.json()).toMatchObject({snapshotId:expect.any(String),changedFiles:0,deletedFiles:1});
+    state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.entries).toEqual([]);
+    await app.close();
+  });
+  it("three-way merges simultaneous Obsidian and Seafile text edits",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
+    const base=Buffer.from("a\nb\nc\n"),baseHash=sha256(base);
+    await app.inject({method:"PUT",url:`/v1/blobs/${baseHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(base,key,baseHash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Base",entries:[{path:"note.md",hash:baseHash,size:base.length,mtime:1}]}})).json();
+    await app.inject({method:"PUT",url:"/v1/mirror/file?path=note.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":first.id,"x-gib-sync-hash":baseHash},payload:base});
+    await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:first.id}});
+    const obsidian=Buffer.from("A\nb\nc\n"),obsidianHash=sha256(obsidian);
+    await app.inject({method:"PUT",url:`/v1/blobs/${obsidianHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(obsidian,key,obsidianHash)});
+    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Obsidian",entries:[{path:"note.md",hash:obsidianHash,size:obsidian.length,mtime:2}]}})).json();
+    const seafile=Buffer.from("a\nb\nC\n");storage.files.set(`read:${credentials.vaultId}:note.md`,seafile);
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),conflicts:0});
+    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.parentId).toBe(second.id);
+    const entry=head.entries[0],encrypted=storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!;
+    expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,entry.hash)).toString()).toBe("A\nb\nC\n");
     await app.close();
   });
   it("expires rolling codes after 60 seconds and throttles five-digit guesses",async()=>{

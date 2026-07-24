@@ -24,7 +24,7 @@ Selected Seafile library and folder
     └── snapshots/              # immutable manifests
 ```
 
-The readable tree is a recovery copy managed by Gib Sync. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Make edits through Obsidian; direct Seafile edits are not currently imported and may be replaced during reconciliation.
+The readable tree is bidirectional. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Direct changes from Seafile's web editor, WebDAV, desktop sync client, or another external source are detected, committed into Gib Sync history, and pushed to connected Obsidian devices. Simultaneous edits use three-way text merging; overlapping text edits receive conflict markers and binary versions are both preserved.
 
 The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
 

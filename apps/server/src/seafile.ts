@@ -4,6 +4,8 @@ import { allowedSeafileHosts } from "./config.js";
 import { openJson, sealJson } from "./security.js";
 
 type Repo = { id?: string; repo_id?: string; name: string };
+type SeafileDirEntry={type:string;parent_dir:string;id:string;name:string;mtime:number;size?:number};
+export interface ReadableStorageEntry{path:string;id:string;mtime:number;size:number;}
 
 export interface VaultStorageRow {
   id: string;
@@ -169,5 +171,23 @@ export class SeafileStorage {
     const response=await this.request(credentials,await link.json() as string);
     if(!response.ok)throw new Error(`Seafile readable download failed (${response.status})`);
     return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async listReadable(row:VaultStorageRow):Promise<ReadableStorageEntry[]>{
+    const root=this.readableRoot(row)||"/",credentials=this.credentials(row);
+    const response=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(root)}&recursive=1`);
+    if(!response.ok)throw new Error(`Seafile readable listing failed (${response.status})`);
+    const body=await response.json() as SeafileDirEntry[]|"uptodate";
+    if(!Array.isArray(body))throw new Error("Seafile returned an unexpected readable listing");
+    const normalizedRoot=root==="/"?"/":`${root.replace(/\/+$/,"")}/`;
+    const output:ReadableStorageEntry[]=[];
+    for(const entry of body){
+      if(entry.type!=="file")continue;
+      const full=`${entry.parent_dir.replace(/\/+$/,"")}/${entry.name}`.replace(/\/+/g,"/");
+      const path=normalizedRoot==="/"?full.replace(/^\/+/,""):full.startsWith(normalizedRoot)?full.slice(normalizedRoot.length):"";
+      if(!path)continue;
+      try{output.push({path:safeRelativePath(path),id:entry.id,mtime:entry.mtime,size:entry.size??0});}catch{}
+    }
+    return output.sort((left,right)=>left.path.localeCompare(right.path));
   }
 }
