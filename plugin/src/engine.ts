@@ -19,7 +19,8 @@ export class SyncEngine {
     private readonly api: GibSyncApi,
     private readonly getSettings: () => GibSyncSettings,
     private readonly saveSettings: () => Promise<void>,
-    private readonly status: (progress: SyncProgress) => void
+    private readonly status: (progress: SyncProgress) => void,
+    private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds))
   ) {}
 
   sync(): Promise<SyncResult> {
@@ -72,6 +73,13 @@ export class SyncEngine {
     return index > path.lastIndexOf("/") ? `${path.slice(0,index)}${suffix}${path.slice(index)}` : `${path}${suffix}`;
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
+  private async convergeAfterConflict(attempt:number,reason:string):Promise<SyncResult>{
+    if(attempt>=7)throw new Error("The vault kept changing during eight convergence attempts. Gib Sync preserved every committed version; retry once editing settles.");
+    const delay=Math.min(2000,100*(2**attempt))+Math.floor(Math.random()*250);
+    this.status({phase:"merging",message:`${reason}; converging again in ${(delay/1000).toFixed(1)}s`});
+    await this.wait(delay);return this.run(attempt+1);
+  }
+  private retryableMirrorError(error:unknown):boolean{return error instanceof ApiError&&(error.status===409||error.status===422);}
 
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
     this.status({phase:"mirroring",message:"Planning the readable Seafile recovery copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
@@ -127,7 +135,10 @@ export class SyncEngine {
     const remoteEntries = [...remote.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
-      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();const mirrored=remoteSnapshot?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
+      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();let mirrored=0;
+      try{mirrored=remoteSnapshot?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
+      catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
+      this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
       return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
     }
 
@@ -138,13 +149,13 @@ export class SyncEngine {
       this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
     }
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
-    try {
-      const snapshot = await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });
-      settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();const mirrored=await this.mirror(snapshot.id,entries,final,bytes,remoteCache);this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
-      return { uploaded, downloaded, deleted, conflicts, mirrored, snapshotId: snapshot.id };
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 409 && attempt < 2) { this.status({phase:"merging",message:"Remote changed during sync; merging again"}); return this.run(attempt + 1); }
-      throw error;
-    }
+    let snapshot:Snapshot;
+    try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });}
+    catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
+    settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
+    try{mirrored=await this.mirror(snapshot.id,entries,final,bytes,remoteCache);}
+    catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
+    this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
+    return { uploaded, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
   }
 }
