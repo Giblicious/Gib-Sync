@@ -133,7 +133,8 @@ export class SeafileStorage {
     const linkResponse = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/upload-link/?p=${encodeURIComponent(parent)}`);
     if (!linkResponse.ok) throw new Error(`Seafile upload link failed (${linkResponse.status})`);
     const uploadUrl = await linkResponse.json() as string; const form = new FormData();
-    form.set("parent_dir", parent); form.set("replace", "1"); form.set("file", new Blob([bytes.slice().buffer], { type: contentType }), name);
+    const exactBytes=Uint8Array.from(bytes);
+    form.set("parent_dir", parent); form.set("replace", "1"); form.set("file", new Blob([exactBytes.buffer], { type: contentType }), name);
     const response = await this.request(credentials, uploadUrl, { method: "POST", body: form });
     if (!response.ok) throw new Error(`Seafile upload ${path} failed (${response.status}: ${await response.text()})`);
   }
@@ -158,6 +159,15 @@ export class SeafileStorage {
     if (!link.ok) throw new Error(`Seafile file link failed (${link.status})`);
     const response = await this.request(credentials, await link.json() as string);
     if (!response.ok) throw new Error(`Seafile download failed (${response.status})`);
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async getReadable(row:VaultStorageRow,relativePath:string):Promise<Uint8Array>{
+    const safe=safeRelativePath(relativePath);const path=`${this.readableRoot(row)}/${safe}`||`/${safe}`;const credentials=this.credentials(row);
+    const link=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`);
+    if(!link.ok)throw new Error(`Seafile readable file link failed (${link.status})`);
+    const response=await this.request(credentials,await link.json() as string);
+    if(!response.ok)throw new Error(`Seafile readable download failed (${response.status})`);
     return new Uint8Array(await response.arrayBuffer());
   }
 }

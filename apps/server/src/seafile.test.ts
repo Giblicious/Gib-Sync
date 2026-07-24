@@ -19,4 +19,17 @@ describe("Seafile directories",()=>{
     await storage.initVault(row);await storage.initVault(row);
     expect([...directories]).toEqual(["/Team","/Team/Obsidian","/Team/Obsidian/.gib-sync"]);expect(creates).toBe(3);
   });
+  it("uploads only the visible bytes of a pooled Buffer",async()=>{
+    let uploaded:Uint8Array|undefined;
+    vi.stubGlobal("fetch",vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+      const url=new URL(typeof input==="string"||input instanceof URL?input:input.url);
+      if(url.hostname==="upload.example.test"){const file=(init?.body as FormData).get("file") as Blob;uploaded=new Uint8Array(await file.arrayBuffer());return new Response("{}",{status:200});}
+      if(url.pathname.endsWith("/upload-link/"))return Response.json("https://upload.example.test/upload");
+      return new Response("[]",{status:200,headers:{"content-type":"application/json"}});
+    }));
+    const storage=new SeafileStorage(config);const id="11111111-1111-4111-8111-111111111111";
+    const row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/",mirror_head_id:null};
+    const pooled=Buffer.from("exact");await storage.put(row,"snapshots/test.json",pooled);
+    expect(uploaded).toEqual(Uint8Array.from(pooled));
+  });
 });

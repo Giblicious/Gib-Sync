@@ -20,6 +20,7 @@ class MemoryStorage {
   async legacySelection(){return {url:"https://seafile.example.test",username:"legacy@example.test",token:"legacy",libraryId:"library-1",libraryName:"Notes",basePath:"/"};}
   async put(row:any,path:string,bytes:Uint8Array) { this.files.set(`${row.id}:${path}`, bytes.slice()); }
   async get(row:any,path:string) { const bytes = this.files.get(`${row.id}:${path}`); if (!bytes) throw new Error("missing"); return bytes.slice(); }
+  async getReadable(row:any,path:string){const bytes=this.files.get(`read:${row.id}:${path}`);if(!bytes)throw new Error("missing readable");return bytes.slice();}
   async putReadable(row:any,path:string,bytes:Uint8Array){this.files.set(`read:${row.id}:${path}`,bytes.slice());}
   async deleteReadable(row:any,path:string){this.files.delete(`read:${row.id}:${path}`);}
 }
@@ -108,5 +109,15 @@ describe("Gib Sync API", () => {
     store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshotId,id,null,"device","Desktop",now,"Initial",JSON.stringify(snapshot));store.run("INSERT INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",id,hash,clear.length,now);
     storage.files.set(`${id}:blobs/${hash.slice(0,2)}/${hash}.gbs`,encryptedFixture(clear,key,hash));const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();
     await vi.waitFor(()=>expect(Buffer.from(storage.files.get(`read:${id}:folder/note.md`)??[])).toEqual(clear),{timeout:1000});expect(store.one<any>("SELECT mirror_head_id,mirror_base_path FROM vaults WHERE id=?",id)).toMatchObject({mirror_head_id:snapshotId,mirror_base_path:"/Obsidian/Recovery"});await app.close();
+  });
+  it("recovers a missing current blob from the verified readable mirror",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${setup.deviceToken}`};
+    const clear=Buffer.from("recover the encrypted object\n");const hash=sha256(clear);const key=Buffer.from(setup.vaultKey,"base64url");const encrypted=encryptedFixture(clear,key,hash);
+    expect((await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encrypted})).statusCode).toBe(201);
+    const commit=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]}})).json();
+    storage.files.set(`read:${setup.vaultId}:note.md`,clear);store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",commit.id,setup.vaultId);storage.files.delete(`${setup.vaultId}:blobs/${hash.slice(0,2)}/${hash}.gbs`);
+    const response=await app.inject({method:"GET",url:`/v1/blobs/${hash}`,headers:auth});expect(response.statusCode).toBe(200);
+    expect(storage.files.get(`${setup.vaultId}:blobs/${hash.slice(0,2)}/${hash}.gbs`)?.length).toBe(encrypted.length);await app.close();
   });
 });

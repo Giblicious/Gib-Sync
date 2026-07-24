@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 
 export const randomToken = (bytes = 32) => randomBytes(bytes).toString("base64url");
-export const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+export const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 export function quickCode():string {
   return randomInt(0,100_000).toString().padStart(5,"0");
 }
@@ -40,4 +40,10 @@ export function decryptVaultBlob(payload:Uint8Array,vaultKey:string,hash:string)
   const packed=Buffer.from(payload);const ciphertext=packed.subarray(13,packed.length-16);const tag=packed.subarray(packed.length-16);
   const decipher=createDecipheriv("aes-256-gcm",Buffer.from(vaultKey,"base64url"),packed.subarray(1,13));decipher.setAAD(Buffer.from(hash));decipher.setAuthTag(tag);
   const clear=Buffer.concat([decipher.update(ciphertext),decipher.final()]);if(sha256(clear)!==hash)throw new Error(`Integrity check failed for ${hash}`);return new Uint8Array(clear);
+}
+
+export function encryptVaultBlob(payload:Uint8Array,vaultKey:string,hash:string):Uint8Array {
+  if(sha256(payload)!==hash)throw new Error(`Integrity check failed for ${hash}`);
+  const iv=randomBytes(12);const cipher=createCipheriv("aes-256-gcm",Buffer.from(vaultKey,"base64url"),iv);cipher.setAAD(Buffer.from(hash));
+  return Uint8Array.from(Buffer.concat([Buffer.from([1]),iv,cipher.update(payload),cipher.final(),cipher.getAuthTag()]));
 }

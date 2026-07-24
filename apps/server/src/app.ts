@@ -8,7 +8,7 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
-import { decryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
+import { decryptVaultBlob, encryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -220,7 +220,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
     const exists = store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, hash);
     if (!exists) return reply.notFound();
-    const bytes = await storage.get(storageRow(device.vault_id), `blobs/${hash.slice(0,2)}/${hash}.gbs`);
+    const row=storageRow(device.vault_id);let bytes:Uint8Array;
+    try{bytes=await storage.get(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`);}
+    catch(error){
+      const vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",device.vault_id);
+      const entry=vault?.head_id?store.getSnapshot(vault.head_id)?.entries.find((item)=>item.hash===hash):undefined;
+      if(!entry)throw error;
+      const clear=await storage.getReadable(row,entry.path);if(sha256(clear)!==hash)throw error;
+      const key=openJson<string>(vault!.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id);
+      bytes=encryptVaultBlob(clear,key,hash);await storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,bytes);
+      app.log.warn({vaultId:device.vault_id,hash,path:entry.path},"Recovered missing encrypted blob from readable mirror");
+    }
     return reply.type("application/octet-stream").send(Buffer.from(bytes));
   });
 
