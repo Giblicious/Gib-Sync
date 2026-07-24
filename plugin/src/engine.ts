@@ -28,6 +28,19 @@ export class SyncEngine {
     this.running = this.run(0).finally(() => { this.running = null; }); return this.running;
   }
 
+  async restoreAcceptedSnapshot():Promise<{downloaded:number;deleted:number}>{
+    const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
+    const local=await this.scan(),head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();let downloaded=0,deleted=0;
+    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);await this.adapter.writeBinary(path,clear.slice().buffer);downloaded++;}
+    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){await this.adapter.remove(path);deleted++;}
+    settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
+  }
+
+  private entropy(bytes:Uint8Array):number{
+    if(bytes.length<1024)return 0;const counts=new Uint32Array(256);for(const value of bytes)counts[value]++;let result=0;
+    for(const count of counts)if(count){const probability=count/bytes.length;result-=probability*Math.log2(probability);}return result;
+  }
+
   private include(path: string): boolean {
     const settings = this.getSettings(); const normalized = normalizePath(path);
     if(normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
@@ -129,6 +142,11 @@ export class SyncEngine {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
     this.status({phase:"scanning",message:"Listing local vault files"}); const local = await this.scan();
     this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
+    if(!settings.initialized&&remoteSnapshot&&local.size){
+      const remoteHashes=new Map(remoteSnapshot.entries.map((entry)=>[entry.path,entry.hash]));
+      const unexpected=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)!==entry.hash);
+      if(unexpected.length)throw new Error(`New-device protection paused the first upload because this vault already contains ${unexpected.length} file${unexpected.length===1?"":"s"} that differ from the shared vault. Review the vault location before replacing or merging anything.`);
+    }
     const baseSnapshot = settings.lastSnapshotId ? await this.api.snapshot(settings.lastSnapshotId).catch(() => null) : null;
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
@@ -198,7 +216,10 @@ export class SyncEngine {
     }
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
     let snapshot:Snapshot;
-    try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries });}
+    const highEntropyPaths=entries.filter((entry)=>this.text(entry.path)&&!remoteEntries.some((remoteEntry)=>remoteEntry.path===entry.path&&remoteEntry.hash===entry.hash))
+      .filter((entry)=>{const clear=bytes.get(entry.hash);return clear?this.entropy(clear)>7.2:false;}).map((entry)=>entry.path);
+    try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,
+      clientTime:new Date().toISOString(),signals:{highEntropyPaths,vaultIdentity:settings.vaultIdentity} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
     settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
     try{mirrored=await this.mirror(snapshot.id,entries,final,bytes,remoteCache);}

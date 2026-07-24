@@ -1,9 +1,9 @@
 import { Notice, Plugin } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
-import { GibSyncApi } from "./api";
+import { ApiError,GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
-import { GibSyncSettingTab, HistoryModal, QuickCodeDisplayModal, QuickCodeEntryModal, SetupModal, claimQuickCodeSetup } from "./ui";
+import { GibSyncSettingTab, HistoryModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, claimQuickCodeSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
@@ -13,6 +13,7 @@ export default class GibSyncPlugin extends Plugin {
   private watchGeneration = 0;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
+  private safeguardModalOpen=false;
 
   async onload() {
     this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
@@ -25,6 +26,7 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({ id: "show-quick-code", name: "Show temporary mobile setup code", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new QuickCodeDisplayModal(this.app, this).open(); return true; } });
     this.addCommand({ id: "enter-quick-code", name: "Enter temporary setup code", callback: () => new QuickCodeEntryModal(this.app, this).open() });
     this.addCommand({ id: "open-history", name: "Open version history", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new HistoryModal(this.app, this).open(); return true; } });
+    this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
@@ -53,14 +55,26 @@ export default class GibSyncPlugin extends Plugin {
   clearActivity() { this.liveStatus.activities=[]; this.emitStatus(); }
   async refreshServerStatus() { if (!this.settings.deviceToken) return; try { this.serverStatus=await this.api.status(); this.settings.storage=this.serverStatus.storage; await this.saveSettings(); this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
   async saveSettings() { await this.saveData(this.settings); }
+  currentVaultIdentity():string {
+    const adapter=this.app.vault.adapter as unknown as {getBasePath?:()=>string};
+    return `${this.app.vault.getName()}|${adapter.getBasePath?.()??"mobile-adapter"}`.replace(/\\/g,"/").toLowerCase();
+  }
+  async acceptCurrentVaultIdentity(){this.settings.vaultIdentity=this.currentVaultIdentity();await this.saveSettings();this.report("idle","Current vault location trusted","success");}
+  openSafeguards(){if(this.safeguardModalOpen)return;this.safeguardModalOpen=true;new SafeguardReviewModal(this.app,this,()=>{this.safeguardModalOpen=false;}).open();}
   async acceptSetup(setup: SetupResponse, deviceName: string) {
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity() });
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
     if (this.liveStatus.running) return;
+    const identity=this.currentVaultIdentity();
+    if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
+      const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
+      this.report("error",message,"error");new Notice(message,12000);return;
+    }
+    if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
     try {
@@ -68,11 +82,14 @@ export default class GibSyncPlugin extends Plugin {
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
       this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
+      await this.api.markDeviceReady().catch(()=>{});
       if (result.conflicts) new Notice(`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`, 8000); void this.refreshServerStatus();
     } catch (error) {
       console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
-      this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();this.report("error",`Sync failed: ${message}`,"error");new Notice(`Gib Sync failed: ${message}`,10000);
+      this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
+      if(error instanceof ApiError&&error.status===423){this.report("error",message,"warning");new Notice(message,12000);if((error.responseBody as any)?.quarantine)this.openSafeguards();}
+      else{this.report("error",`Sync failed: ${message}`,"error");new Notice(`Gib Sync failed: ${message}`,10000);}
     } finally {
       if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
       else this.scheduleNextSyncLabel();
@@ -115,7 +132,12 @@ export default class GibSyncPlugin extends Plugin {
         const result=await this.api.watch(this.settings.lastSnapshotId);
         if(generation!==this.watchGeneration)return;
         failures=0;
-        if(result.changed&&result.headId!==this.settings.lastSnapshotId){
+        if(result.attention){
+          await this.refreshServerStatus();
+          this.report("scheduled","Suspicious remote changes need review","warning");
+          new Notice("Gib Sync quarantined suspicious remote changes. Review them in settings.",12000);
+          this.openSafeguards();
+        }else if(result.changed&&result.headId!==this.settings.lastSnapshotId){
           this.report("scheduled","Remote change detected; syncing now","info");
           await this.runSync();
         }

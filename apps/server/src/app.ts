@@ -3,13 +3,14 @@ import Fastify, { type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import sensible from "@fastify/sensible";
-import { PROTOCOL_VERSION, type CommitRequest, type MirrorPlanRequest, type SetupResponse, type Snapshot, type StorageSetupRequest } from "@gib-sync/protocol";
+import { PROTOCOL_VERSION, type CommitRequest, type ManifestEntry, type MirrorPlanRequest, type RestorePreview, type SafeguardPolicy, type SetupResponse, type Snapshot, type StorageSetupRequest } from "@gib-sync/protocol";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { ExternalImporter } from "./external.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
 import { decryptVaultBlob, encryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
+import { assessChanges,policyFor,SafeguardService } from "./safeguards.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -29,11 +30,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
-  const externalImporter=new ExternalImporter(config,store,storage);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null;
-  const watchWaiters=new Map<string,Set<(headId:string|null)=>void>>();
-  function notifyVault(vaultId:string,headId:string|null){
+  const safeguards=new SafeguardService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null;
+  const skipExternalOnce=new Set<string>();
+  const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
+  function notifyVault(vaultId:string,headId:string|null,attention=false){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
-    watchWaiters.delete(vaultId);for(const resolve of waiters)resolve(headId);
+    watchWaiters.delete(vaultId);for(const resolve of waiters)resolve(headId,attention);
   }
   app.addHook("onClose", async () => {
     for(const [vaultId] of watchWaiters)notifyVault(vaultId,null);
@@ -64,12 +66,13 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   async function ingestExternalChanges(vaultId:string){
     const result=await externalImporter.scan(vaultId);
     if(result.snapshotId){notifyVault(vaultId,result.snapshotId);scheduleMirror(vaultId,50);app.log.info({vaultId,...result},"Imported external Seafile changes");}
+    else if(result.quarantineId){const headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id??null;notifyVault(vaultId,headId,true);}
     return result;
   }
   function reconcileReadableMirror(vaultId:string):Promise<void>{
     const active=mirrorJobs.get(vaultId);if(active)return active;
     const job=(async()=>{for(let attempt=0;attempt<3;attempt++){
-      await ingestExternalChanges(vaultId);
+      if(skipExternalOnce.has(vaultId))skipExternalOnce.delete(vaultId);else await ingestExternalChanges(vaultId);
       const vault=store.one<{head_id:string|null;mirror_head_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id||vault.mirror_head_id===vault.head_id)return;
       const snapshot=store.getSnapshot(vault.head_id);if(!snapshot)return;const row=storageRow(vaultId);const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);const target=new Set(snapshot.entries.map((entry)=>entry.path));
       for(const entry of snapshot.entries){const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash)continue;
@@ -91,7 +94,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 
@@ -109,9 +112,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const credentials = await storage.authenticate(body.seafileUrl, body.seafileUsername, body.seafilePassword);
     const libraries = await storage.libraries(credentials); const library = libraries.find((item) => item.id === body.libraryId);
     if (!library) return reply.badRequest("The selected Seafile library is not accessible to this account");
-    const basePath = normalizeBasePath(body.basePath); let vault = body.existingVaultId ? store.one<{id:string;name:string;storage_username:string;storage_url:string}>(
-      "SELECT id,name,storage_username,storage_url FROM vaults WHERE id=? AND storage_repo_id=?",body.existingVaultId,library.id) : store.one<{id:string;name:string;storage_username:string;storage_url:string}>(
-      "SELECT id,name,storage_username,storage_url FROM vaults WHERE storage_url=? AND storage_repo_id=? AND storage_base_path=? AND storage_layout='standard'",credentials.url,library.id,basePath);
+    const basePath = normalizeBasePath(body.basePath); let vault = body.existingVaultId ? store.one<{id:string;name:string;storage_username:string;storage_url:string;head_id:string|null}>(
+      "SELECT id,name,storage_username,storage_url,head_id FROM vaults WHERE id=? AND storage_repo_id=?",body.existingVaultId,library.id) : store.one<{id:string;name:string;storage_username:string;storage_url:string;head_id:string|null}>(
+      "SELECT id,name,storage_username,storage_url,head_id FROM vaults WHERE storage_url=? AND storage_repo_id=? AND storage_base_path=? AND storage_layout='standard'",credentials.url,library.id,basePath);
     if (body.existingVaultId && (!vault || !storage.equivalentServer(vault.storage_url,credentials.url))) return reply.forbidden("The selected existing vault is not available to this Seafile account");
     const now = new Date().toISOString();
     if (vault && vault.storage_username !== credentials.username) return reply.forbidden("This storage location belongs to another Gib Sync user");
@@ -119,12 +122,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const id = randomUUID(); const vaultKey = randomToken(32);
       store.run("INSERT INTO vaults(id,name,wrapped_key,created_at,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout,mirror_base_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         id,body.vaultName,sealJson(vaultKey,config.GIBSYNC_SERVER_SECRET,id),now,credentials.url,credentials.username,library.id,library.name,basePath,storage.sealToken(id,credentials.token),"standard",basePath);
-      vault = { id, name:body.vaultName, storage_username:credentials.username, storage_url:credentials.url }; await storage.initVault(storageRow(id));
+      vault = { id, name:body.vaultName, storage_username:credentials.username, storage_url:credentials.url,head_id:null }; await storage.initVault(storageRow(id));
     } else {
       store.run("UPDATE vaults SET storage_token=?,storage_repo_name=? WHERE id=?", storage.sealToken(vault.id,credentials.token),library.name,vault.id);
     }
     const deviceId = randomUUID(); const deviceToken = randomToken();
-    store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",deviceId,vault.id,body.deviceName,sha256(deviceToken),now,now);
+    store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at,initial_sync_complete) VALUES(?,?,?,?,?,?,?)",deviceId,vault.id,body.deviceName,sha256(deviceToken),now,now,vault.head_id?0:1);
     return setupResponse(vault.id,vault.name,deviceId,deviceToken);
   });
 
@@ -179,14 +182,14 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const supplied=z.object({head:z.union([z.literal(""),z.string().uuid()]).default("")}).parse(request.query).head||null;
     const current=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!.head_id;
     if(current!==supplied)return {changed:true,headId:current};
-    return await new Promise<{changed:boolean;headId:string|null}>((resolve)=>{
+    return await new Promise<{changed:boolean;headId:string|null;attention?:boolean}>((resolve)=>{
       let settled=false;
-      const finish=(headId:string|null,changed:boolean)=>{
+      const finish=(headId:string|null,changed:boolean,attention=false)=>{
         if(settled)return;settled=true;clearTimeout(timer);
         const waiters=watchWaiters.get(device.vault_id);waiters?.delete(onChange);if(waiters?.size===0)watchWaiters.delete(device.vault_id);
-        resolve({changed,headId});
+        resolve(attention?{changed:true,headId,attention:true}:{changed,headId});
       };
-      const onChange=(headId:string|null)=>finish(headId,headId!==supplied);
+      const onChange=(headId:string|null,attention:boolean)=>finish(headId,headId!==supplied,attention);
       const timer=setTimeout(()=>finish(supplied,false),25_000);timer.unref();
       let waiters=watchWaiters.get(device.vault_id);if(!waiters){waiters=new Set();watchWaiters.set(device.vault_id,waiters);}
       waiters.add(onChange);
@@ -196,12 +199,21 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   app.get("/v1/status", async (request) => {
     const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
+    const devices=store.all<{id:string;name:string;created_at:string;last_seen_at:string;revoked_at:string|null;initial_sync_complete:number;clock_skew_ms:number}>("SELECT id,name,created_at,last_seen_at,revoked_at,initial_sync_complete,clock_skew_ms FROM devices WHERE vault_id=? ORDER BY created_at",device.vault_id)
+      .map((item)=>({id:item.id,name:item.name,createdAt:item.created_at,lastSeenAt:item.last_seen_at,revokedAt:item.revoked_at,ready:Boolean(item.initial_sync_complete),clockSkewMs:item.clock_skew_ms,current:item.id===device.id}));
+    const healthAlerts=store.all<{code:string;level:"info"|"warning"|"error";message:string;created_at:string}>("SELECT code,level,message,created_at FROM health_events WHERE vault_id=? AND cleared_at IS NULL ORDER BY created_at DESC LIMIT 20",device.vault_id)
+      .map((item)=>({code:item.code,level:item.level,message:item.message,at:item.created_at}));
+    if(vault.external_error)healthAlerts.unshift({code:"external_error",level:"error",message:`External Seafile scan: ${vault.external_error}`,at:vault.external_scan_at??new Date().toISOString()});
+    if(vault.head_id&&vault.mirror_head_id!==vault.head_id)healthAlerts.unshift({code:"mirror_diverged",level:"warning",message:"Readable Seafile mirror is catching up",at:new Date().toISOString()});
+    for(const item of devices)if(!item.revokedAt&&Math.abs(item.clockSkewMs)>safeguards.policy(device.vault_id).clockSkewMinutes*60_000)healthAlerts.unshift({code:`clock_skew:${item.id}`,level:"warning",message:`${item.name}'s clock differs from the server by ${Math.round(Math.abs(item.clockSkewMs)/60_000)} minutes`,at:item.lastSeenAt});
+    for(const item of devices)if(!item.revokedAt&&Date.now()-Date.parse(item.lastSeenAt)>30*24*60*60*1000)healthAlerts.push({code:`stale_device:${item.id}`,level:"info",message:`${item.name} has not synced in over 30 days`,at:item.lastSeenAt});
     return { protocolVersion:PROTOCOL_VERSION,vaultId:device.vault_id,vaultName:vault.name,deviceId:device.id,deviceName:device.name,
       deviceCount:store.one<{count:number}>("SELECT COUNT(*) count FROM devices WHERE vault_id=? AND revoked_at IS NULL",device.vault_id)?.count ?? 0,
       snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?store.getSnapshot(vault.head_id):null,
       storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
       mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
-      mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id),externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error };
+      mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id),externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error,
+      safeguards:safeguards.state(device.vault_id,device.id),healthAlerts,devices };
   });
 
   app.post("/v1/external/scan",async(request)=>{
@@ -209,6 +221,59 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   const entrySchema=z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
+  const policySchema=z.object({mode:z.enum(["strict","balanced","custom"]),deletionCount:z.number().int().min(1).max(100000),smallVaultDeletionCount:z.number().int().min(1).max(100000),
+    smallVaultDeletionPercent:z.number().min(1).max(100),changedCount:z.number().int().min(1).max(200000),changedPercent:z.number().min(1).max(100),
+    folderImpactCount:z.number().int().min(1).max(200000),fileGrowthBytes:z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER),
+    fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
+
+  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[]):Promise<Snapshot|null>{
+    const current=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(current!==parentId)return null;
+    const snapshot:Snapshot={id:randomUUID(),vaultId,parentId,deviceId,deviceName,createdAt:new Date().toISOString(),message,entries:[...entries].sort((a,b)=>a.path.localeCompare(b.path))};
+    await storage.put(storageRow(vaultId),`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
+    store.db.exec("BEGIN IMMEDIATE");
+    try{
+      const latest=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(latest!==parentId){store.db.exec("ROLLBACK");return null;}
+      store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,parentId,deviceId,deviceName,snapshot.createdAt,message,JSON.stringify(snapshot));
+      store.run("UPDATE vaults SET head_id=? WHERE id=?",snapshot.id,vaultId);store.db.exec("COMMIT");
+    }catch(error){try{store.db.exec("ROLLBACK");}catch{}throw error;}
+    notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
+  }
+
+  app.get("/v1/safeguards",async(request)=>{const device=await authenticate(request);return safeguards.state(device.vault_id,device.id);});
+  app.put("/v1/safeguards/policy",async(request)=>{
+    const device=await authenticate(request),body=policySchema.parse(request.body) as SafeguardPolicy;
+    const policy=policyFor(body.mode,body);store.run("UPDATE vaults SET safeguard_policy=? WHERE id=?",JSON.stringify(policy),device.vault_id);return safeguards.state(device.vault_id,device.id);
+  });
+  app.post("/v1/safeguards/lock",async(request)=>{
+    const device=await authenticate(request),locked=z.object({locked:z.boolean()}).parse(request.body).locked,now=new Date().toISOString();
+    store.run("UPDATE vaults SET write_locked_at=?,write_locked_by=? WHERE id=?",locked?now:null,locked?device.name:null,device.vault_id);
+    safeguards.event(device.vault_id,locked?"write_lock_enabled":"write_lock_disabled","info",locked?`Remote writes frozen by ${device.name}`:`Remote writes resumed by ${device.name}`);
+    return safeguards.state(device.vault_id,device.id);
+  });
+  app.get("/v1/quarantines",async(request)=>{const device=await authenticate(request);return safeguards.list(device.vault_id);});
+  app.post("/v1/quarantines/:id/reject",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;
+    const row=store.one<{source:string;status:string}>("SELECT source,status FROM quarantines WHERE id=? AND vault_id=?",id,device.vault_id);if(!row)return reply.notFound();if(row.status!=="pending")return reply.conflict("Quarantine is no longer pending");
+    store.run("UPDATE quarantines SET status='rejected',resolved_at=?,resolved_by=? WHERE id=?",new Date().toISOString(),device.id,id);
+    if(row.source==="seafile"){store.run("UPDATE vaults SET mirror_head_id=NULL WHERE id=?",device.vault_id);skipExternalOnce.add(device.vault_id);scheduleMirror(device.vault_id,50);}
+    safeguards.event(device.vault_id,"quarantine_rejected","info",`Suspicious changes were rejected by ${device.name}`);return {ok:true};
+  });
+  app.post("/v1/quarantines/:id/approve",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id,body=z.object({trustMinutes:z.number().int().min(0).max(60).default(0)}).parse(request.body);
+    const row=store.one<{status:string;parent_id:string|null;device_id:string;device_name:string;message:string;manifest_json:string;expires_at:string}>("SELECT status,parent_id,device_id,device_name,message,manifest_json,expires_at FROM quarantines WHERE id=? AND vault_id=?",id,device.vault_id);
+    if(!row)return reply.notFound();if(row.status!=="pending")return reply.conflict("Quarantine is no longer pending");if(Date.parse(row.expires_at)<Date.now()){store.run("UPDATE quarantines SET status='stale' WHERE id=?",id);return reply.gone("Quarantine expired");}
+    const entries=z.array(entrySchema).max(200000).parse(JSON.parse(row.manifest_json)) as ManifestEntry[];
+    if(body.trustMinutes)store.run("UPDATE vaults SET trusted_until=?,trusted_device_id=? WHERE id=?",new Date(Date.now()+body.trustMinutes*60_000).toISOString(),row.device_id,device.vault_id);
+    const snapshot=await acceptSnapshot(device.vault_id,row.parent_id,row.device_id,row.device_name,`${row.message} (approved by ${device.name})`,entries);if(!snapshot){store.run("UPDATE quarantines SET status='stale' WHERE id=?",id);return reply.conflict("Vault changed after this proposal; review a new proposal");}
+    store.run("UPDATE quarantines SET status='approved',resolved_at=?,resolved_by=? WHERE id=?",new Date().toISOString(),device.id,id);
+    safeguards.event(device.vault_id,"quarantine_approved","info",`Suspicious changes were approved by ${device.name}`);return reply.code(201).send(snapshot);
+  });
+  app.post("/v1/devices/current/ready",async(request)=>{const device=await authenticate(request);store.run("UPDATE devices SET initial_sync_complete=1 WHERE id=?",device.id);return {ok:true};});
+  app.post("/v1/devices/:id/revoke",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;
+    const target=store.one<{id:string;name:string}>("SELECT id,name FROM devices WHERE id=? AND vault_id=? AND revoked_at IS NULL",id,device.vault_id);if(!target)return reply.notFound();
+    store.run("UPDATE devices SET revoked_at=? WHERE id=?",new Date().toISOString(),id);safeguards.event(device.vault_id,"device_revoked","warning",`${target.name} was revoked by ${device.name}`);return {ok:true};
+  });
   app.post("/v1/mirror/plan",async(request,reply)=>{
     const device=await authenticate(request);const body=z.object({snapshotId:z.string().uuid(),entries:z.array(entrySchema).max(200000)}).parse(request.body) as MirrorPlanRequest;
     await ingestExternalChanges(device.vault_id);
@@ -254,7 +319,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device = await authenticate(request);
     const limit = z.coerce.number().int().min(1).max(200).default(50).parse((request.query as Record<string,unknown>).limit);
     return store.all<{manifest_json:string}>("SELECT manifest_json FROM snapshots WHERE vault_id=? ORDER BY created_at DESC LIMIT ?", device.vault_id, limit)
-      .map(({manifest_json}) => { const s = JSON.parse(manifest_json) as Snapshot; return { id:s.id,parentId:s.parentId,deviceName:s.deviceName,createdAt:s.createdAt,message:s.message,fileCount:s.entries.length }; });
+      .map(({manifest_json}) => { const s = JSON.parse(manifest_json) as Snapshot; return { id:s.id,parentId:s.parentId,deviceName:s.deviceName,createdAt:s.createdAt,message:s.message,fileCount:s.entries.length,
+        bookmarked:Boolean(store.one("SELECT 1 FROM snapshot_bookmarks WHERE vault_id=? AND snapshot_id=?",device.vault_id,s.id)) }; });
+  });
+  app.put("/v1/bookmarks/:id",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id,label=z.object({label:z.string().min(1).max(100).default("Known good")}).parse(request.body).label;
+    const snapshot=store.getSnapshot(id);if(!snapshot||snapshot.vaultId!==device.vault_id)return reply.notFound();
+    store.run("INSERT INTO snapshot_bookmarks(vault_id,snapshot_id,label,created_at,created_by) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,snapshot_id) DO UPDATE SET label=excluded.label",device.vault_id,id,label,new Date().toISOString(),device.id);
+    return {ok:true,label};
+  });
+  app.delete("/v1/bookmarks/:id",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;const result=store.run("DELETE FROM snapshot_bookmarks WHERE vault_id=? AND snapshot_id=?",device.vault_id,id);if(!result.changes)return reply.notFound();return {ok:true};
   });
 
   app.get("/v1/blobs/:hash", async (request, reply) => {
@@ -288,31 +363,42 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   app.post("/v1/commit", async (request, reply) => {
     const device = await authenticate(request);
     await ingestExternalChanges(device.vault_id);
-    const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()})).max(200000) }).parse(request.body) as CommitRequest;
+    const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),
+      clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),vaultIdentity:z.string().max(500).optional()}).optional() }).parse(request.body) as CommitRequest;
+    if(body.clientTime){const skew=Date.parse(body.clientTime)-Date.now();store.run("UPDATE devices SET clock_skew_ms=? WHERE id=?",Number.isFinite(skew)?Math.round(skew):0,device.id);}
     const missing = body.entries.filter((entry) => !store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, entry.hash));
     if (missing.length) return reply.code(422).send({ error: "Missing blobs", hashes: missing.slice(0,100).map((e) => e.hash) });
-    const snapshot: Snapshot = { id: randomUUID(), vaultId: device.vault_id, parentId: body.parentId, deviceId: device.id, deviceName: device.name, createdAt: new Date().toISOString(), message: body.message, entries: [...body.entries].sort((a,b)=>a.path.localeCompare(b.path)) };
-    await storage.put(storageRow(device.vault_id), `snapshots/${snapshot.id}.json`, Buffer.from(JSON.stringify(snapshot)), "application/json");
-    store.db.exec("BEGIN IMMEDIATE");
-    try {
-      const current = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!.head_id;
-      if (current !== body.parentId) { store.db.exec("ROLLBACK"); return reply.code(409).send({ error: "Head moved", head: current ? store.getSnapshot(current) : null }); }
-      store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)", snapshot.id, snapshot.vaultId, snapshot.parentId, snapshot.deviceId, snapshot.deviceName, snapshot.createdAt, snapshot.message, JSON.stringify(snapshot));
-      store.run("UPDATE vaults SET head_id=? WHERE id=?", snapshot.id, device.vault_id); store.db.exec("COMMIT");
-    } catch (error) { try { store.db.exec("ROLLBACK"); } catch {} throw error; }
-    notifyVault(device.vault_id,snapshot.id);scheduleMirror(device.vault_id);return reply.code(201).send(snapshot);
+    const current = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!.head_id;
+    if(current!==body.parentId)return reply.code(409).send({error:"Head moved",head:current?store.getSnapshot(current):null});
+    const ready=store.one<{initial_sync_complete:number}>("SELECT initial_sync_complete FROM devices WHERE id=?",device.id)?.initial_sync_complete;
+    if(current&&!ready)return reply.code(428).send({error:"This newly paired device must complete its first download before it can upload changes"});
+    const decision=safeguards.propose({vaultId:device.vault_id,deviceId:device.id,deviceName:device.name,parentId:body.parentId,message:body.message,entries:body.entries,source:"device",signals:body.signals});
+    if(!decision.allowed){
+      if(decision.quarantine&&decision.created)safeguards.event(device.vault_id,"mass_change_quarantine","warning",`${device.name}'s changes were quarantined: ${decision.assessment.reasons.join("; ")}`);
+      return reply.code(423).send({error:decision.locked?"Remote writes are frozen for this vault":"Suspicious vault changes require approval",locked:decision.locked,quarantine:decision.quarantine,assessment:decision.assessment});
+    }
+    const snapshot=await acceptSnapshot(device.vault_id,body.parentId,device.id,device.name,body.message,body.entries);
+    if(!snapshot)return reply.code(409).send({error:"Head moved",head:store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)?.head_id});
+    return reply.code(201).send(snapshot);
   });
 
+  app.get("/v1/restore/:id/preview",async(request,reply)=>{
+    const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id,source=store.getSnapshot(id);if(!source||source.vaultId!==device.vault_id)return reply.notFound();
+    const headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!.head_id,current=headId?store.getSnapshot(headId)?.entries??[]:[];
+    const assessment=assessChanges(current,source.entries,safeguards.policy(device.vault_id)).assessment,expiresAt=new Date(Date.now()+5*60_000).toISOString();
+    const confirmToken=sealJson({vaultId:device.vault_id,deviceId:device.id,snapshotId:id,headId,expiresAt},config.GIBSYNC_SERVER_SECRET,`restore:${device.vault_id}:${id}`);
+    const preview:RestorePreview={snapshotId:id,snapshotCreatedAt:source.createdAt,snapshotDeviceName:source.deviceName,assessment,confirmToken,expiresAt};return preview;
+  });
   app.post("/v1/restore/:id", async (request, reply) => {
     const device = await authenticate(request);await ingestExternalChanges(device.vault_id); const id = z.object({id:z.string().uuid()}).parse(request.params).id;
     const source = store.getSnapshot(id); if (!source || source.vaultId !== device.vault_id) return reply.notFound();
-    const vault = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!;
-    const restored: Snapshot = { ...source, id: randomUUID(), parentId: vault.head_id, deviceId: device.id, deviceName: device.name, createdAt: new Date().toISOString(), message: `Restore ${id}` };
-    await storage.put(storageRow(device.vault_id), `snapshots/${restored.id}.json`, Buffer.from(JSON.stringify(restored)), "application/json");
-    store.db.exec("BEGIN IMMEDIATE");
-    try { store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)", restored.id,restored.vaultId,restored.parentId,restored.deviceId,restored.deviceName,restored.createdAt,restored.message,JSON.stringify(restored)); store.run("UPDATE vaults SET head_id=? WHERE id=?",restored.id,device.vault_id); store.db.exec("COMMIT"); }
-    catch(error){ store.db.exec("ROLLBACK"); throw error; }
-    notifyVault(device.vault_id,restored.id);scheduleMirror(device.vault_id);return reply.code(201).send(restored);
+    const token=z.object({confirmToken:z.string().min(1)}).parse(request.body).confirmToken;let intent:{vaultId:string;deviceId:string;snapshotId:string;headId:string|null;expiresAt:string};
+    try{intent=openJson(token,config.GIBSYNC_SERVER_SECRET,`restore:${device.vault_id}:${id}`);}catch{return reply.badRequest("Restore confirmation is invalid or expired");}
+    const vault=store.one<{head_id:string|null;write_locked_at:string|null}>("SELECT head_id,write_locked_at FROM vaults WHERE id=?",device.vault_id)!;
+    if(intent.vaultId!==device.vault_id||intent.deviceId!==device.id||intent.snapshotId!==id||intent.headId!==vault.head_id||Date.parse(intent.expiresAt)<Date.now())return reply.conflict("Vault changed after the restore preview; preview it again");
+    if(vault.write_locked_at)return reply.code(423).send({error:"Remote writes are frozen for this vault"});
+    const restored=await acceptSnapshot(device.vault_id,vault.head_id,device.id,device.name,`Restore ${id}`,source.entries);if(!restored)return reply.conflict("Vault changed during restore");
+    return reply.code(201).send(restored);
   });
 
   app.addHook("onReady",async()=>{

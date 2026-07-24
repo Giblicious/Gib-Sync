@@ -10,6 +10,23 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Per-vault Seafile routing: every person chooses an account, library, and folder while sharing one Gib Sync service.
 - Manual multi-device setup plus short-lived, one-time quick codes that are easy to type between devices.
 - Live phases, progress, timestamps, errors, remote inventory, mirror health, device counts, activity history, and secret-free diagnostics.
+- Server-enforced mass-change safeguards for both Obsidian devices and direct Seafile/WebDAV edits.
+
+## Safety center
+
+Gib Sync evaluates every proposed snapshot before it becomes the shared vault head. Suspicious changes are held in quarantine without modifying the accepted snapshot or the readable recovery tree. Connected devices are notified immediately and can inspect every affected path before choosing **Approve once**, **Approve and trust for 15 minutes**, or **Reject and restore accepted snapshot**.
+
+The built-in balanced and strict presets cover mass deletions, unusually broad changes, destructive folder operations, unexpected file growth, extension churn, high-entropy/ransomware-like content, protected-path deletion, and unexpectedly empty vaults. Every threshold and protected path can also be customized. Repeated copies of the same proposal reuse one quarantine item instead of creating alert spam.
+
+Additional recovery controls include:
+
+- A remote write lock that freezes device commits and direct Seafile imports while leaving downloads available.
+- First-sync protection that prevents a newly paired device with unrelated local files from replacing or merging into an existing shared vault.
+- Vault-location identity checks that pause sync if the configured vault name or filesystem location changes.
+- Safe previews before exclusion or `.obsidian` settings would remove files from the shared vault.
+- Device inventory, clock-skew and stale-device warnings, and immediate device revocation.
+- Preview-and-confirm restore with an expiring confirmation token.
+- Named known-good snapshot bookmarks retained in immutable history.
 
 ## Storage layout
 

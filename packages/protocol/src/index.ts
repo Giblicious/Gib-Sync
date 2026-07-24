@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export interface ManifestEntry {
   path: string;
@@ -89,6 +89,9 @@ export interface ServerStatus {
   externalScanAt: string | null;
   externalImportAt: string | null;
   externalError: string | null;
+  safeguards: SafeguardState;
+  healthAlerts: HealthAlert[];
+  devices: DeviceInfo[];
 }
 
 export interface MirrorPlanRequest {
@@ -118,12 +121,15 @@ export interface SyncState {
 export interface WatchResponse {
   changed: boolean;
   headId: string | null;
+  attention?: boolean;
 }
 
 export interface CommitRequest {
   parentId: string | null;
   message: string;
   entries: ManifestEntry[];
+  clientTime?: string;
+  signals?: ClientSafetySignals;
 }
 
 export interface HistoryItem {
@@ -133,4 +139,98 @@ export interface HistoryItem {
   createdAt: string;
   message: string;
   fileCount: number;
+  bookmarked: boolean;
+}
+
+export type SafeguardMode = "strict" | "balanced" | "custom";
+
+export interface SafeguardPolicy {
+  mode: SafeguardMode;
+  deletionCount: number;
+  smallVaultDeletionCount: number;
+  smallVaultDeletionPercent: number;
+  changedCount: number;
+  changedPercent: number;
+  folderImpactCount: number;
+  fileGrowthBytes: number;
+  fileGrowthPercent: number;
+  clockSkewMinutes: number;
+  protectedPaths: string[];
+}
+
+export interface ClientSafetySignals {
+  highEntropyPaths?: string[];
+  vaultIdentity?: string;
+}
+
+export interface ChangeItem {
+  path: string;
+  kind: "created" | "modified" | "deleted" | "moved";
+  previousPath?: string;
+  previousSize?: number;
+  size?: number;
+}
+
+export interface ChangeAssessment {
+  created: number;
+  modified: number;
+  deleted: number;
+  moved: number;
+  totalChanged: number;
+  affectedPercent: number;
+  bytesAdded: number;
+  bytesRemoved: number;
+  reasons: string[];
+  examples: ChangeItem[];
+}
+
+export interface QuarantineItem {
+  id: string;
+  proposalHash: string;
+  source: "device" | "seafile";
+  deviceId: string;
+  deviceName: string;
+  parentId: string | null;
+  createdAt: string;
+  expiresAt: string;
+  status: "pending" | "approved" | "rejected" | "stale";
+  message: string;
+  assessment: ChangeAssessment;
+  changes: ChangeItem[];
+}
+
+export interface SafeguardState {
+  policy: SafeguardPolicy;
+  writeLocked: boolean;
+  writeLockedAt: string | null;
+  writeLockedBy: string | null;
+  trustedUntil: string | null;
+  pendingQuarantines: number;
+}
+
+export interface DeviceInfo {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastSeenAt: string;
+  revokedAt: string | null;
+  ready: boolean;
+  clockSkewMs: number;
+  current: boolean;
+}
+
+export interface HealthAlert {
+  code: string;
+  level: "info" | "warning" | "error";
+  message: string;
+  at: string;
+}
+
+export interface RestorePreview {
+  snapshotId: string;
+  snapshotCreatedAt: string;
+  snapshotDeviceName: string;
+  assessment: ChangeAssessment;
+  confirmToken: string;
+  expiresAt: string;
 }

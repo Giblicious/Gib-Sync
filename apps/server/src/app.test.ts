@@ -67,7 +67,8 @@ describe("Gib Sync API", () => {
     expect(claim.statusCode).toBe(200);const claimed=claim.json();expect(claimed.envelope).toBeTypeOf("string");
     expect(openJson<any>(claimed.envelope,normalizeQuickCode(pairing.code),`pairing:${claimed.pairingId}`)).toMatchObject({vaultId:credentials.vaultId,deviceToken:expect.any(String)});
     expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pairing.code,deviceName:"Other"}})).statusCode).toBe(410);
-    expect((await app.inject({method:"POST",url:`/v1/restore/${commit.json().id}`,headers:auth,payload:{}})).statusCode).toBe(201);
+    const preview=(await app.inject({method:"GET",url:`/v1/restore/${commit.json().id}/preview`,headers:auth})).json();
+    expect((await app.inject({method:"POST",url:`/v1/restore/${commit.json().id}`,headers:auth,payload:{confirmToken:preview.confirmToken}})).statusCode).toBe(201);
     const status=await app.inject({method:"GET",url:"/v1/status",headers:auth});expect(status.statusCode).toBe(200);expect(status.json().deviceCount).toBe(3);expect(status.json().storage.basePath).toBe("/Obsidian/Test");expect(status.json().mirrorCurrent).toBe(false);
     await app.close();
   });
@@ -194,5 +195,55 @@ describe("Gib Sync API", () => {
     storage.files.set(`read:${setup.vaultId}:note.md`,clear);store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",commit.id,setup.vaultId);storage.files.delete(`${setup.vaultId}:blobs/${hash.slice(0,2)}/${hash}.gbs`);
     const response=await app.inject({method:"GET",url:`/v1/blobs/${hash}`,headers:auth});expect(response.statusCode).toBe(200);
     expect(storage.files.get(`${setup.vaultId}:blobs/${hash.slice(0,2)}/${hash}.gbs`)?.length).toBe(encrypted.length);await app.close();
+  });
+  it("quarantines, reviews, approves, and temporarily trusts a mass deletion",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
+    const clear=Buffer.from("shared\n"),hash=sha256(clear),key=Buffer.from(setup.vaultKey,"base64url");await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const entries=Array.from({length:20},(_,index)=>({path:`Folder/note-${index}.md`,hash,size:clear.length,mtime:1}));
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries}})).json();
+    const proposal=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Bulk delete",entries:entries.slice(0,10),clientTime:new Date().toISOString()}});
+    expect(proposal.statusCode).toBe(423);expect(proposal.json().quarantine.assessment).toMatchObject({deleted:10});
+    expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.id).toBe(first.id);
+    const held=(await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json();expect(held).toHaveLength(1);
+    const approved=await app.inject({method:"POST",url:`/v1/quarantines/${held[0].id}/approve`,headers:auth,payload:{trustMinutes:15}});
+    expect(approved.statusCode).toBe(201);expect(approved.json().entries).toHaveLength(10);
+    const trusted=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:approved.json().id,message:"Trusted delete",entries:[]}});
+    expect(trusted.statusCode).toBe(201);await app.close();
+  });
+  it("quarantines mass deletion from Seafile and wakes watchers for immediate review",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
+    const clear=Buffer.from("shared\n"),hash=sha256(clear),key=Buffer.from(setup.vaultKey,"base64url");await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const entries=Array.from({length:20},(_,index)=>({path:`Folder/note-${index}.md`,hash,size:clear.length,mtime:1}));
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries}})).json();
+    const now=new Date().toISOString();for(const entry of entries){storage.files.set(`read:${setup.vaultId}:${entry.path}`,clear);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",setup.vaultId,entry.path,hash,clear.length,now,`${entry.path}-id`,1);}
+    store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",first.id,setup.vaultId);for(const entry of entries.slice(0,10))storage.files.delete(`read:${setup.vaultId}:${entry.path}`);
+    const waiting=app.inject({method:"GET",url:`/v1/watch?head=${first.id}`,headers:auth});await new Promise((resolve)=>setTimeout(resolve,10));
+    const scan=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});expect(scan.json()).toMatchObject({snapshotId:null,deletedFiles:10,quarantineId:expect.any(String)});
+    expect((await waiting).json()).toEqual({changed:true,headId:first.id,attention:true});expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.id).toBe(first.id);
+    const held=(await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json();expect(held).toHaveLength(1);expect(held[0]).toMatchObject({source:"seafile",assessment:{deleted:10}});
+    await app.close();
+  });
+  it("supports write locks, protected paths, bookmarks, device restrictions, and revocation",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const owner=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Owner")})).json(),auth={authorization:`Bearer ${owner.deviceToken}`};
+    const clear=Buffer.from("safe\n"),hash=sha256(clear),key=Buffer.from(owner.vaultKey,"base64url");await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"Critical/note.md",hash,size:clear.length,mtime:1}]}})).json();
+    expect((await app.inject({method:"PUT",url:"/v1/bookmarks/"+first.id,headers:auth,payload:{label:"Known good"}})).statusCode).toBe(200);
+    expect((await app.inject({method:"GET",url:"/v1/history?limit=10",headers:auth})).json()[0].bookmarked).toBe(true);
+    const currentPolicy=(await app.inject({method:"GET",url:"/v1/safeguards",headers:auth})).json().policy;currentPolicy.protectedPaths=["Critical"];
+    await app.inject({method:"PUT",url:"/v1/safeguards/policy",headers:auth,payload:currentPolicy});
+    const protectedDelete=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Delete protected",entries:[]}});expect(protectedDelete.statusCode).toBe(423);
+    await app.inject({method:"POST",url:"/v1/quarantines/"+protectedDelete.json().quarantine.id+"/reject",headers:auth,payload:{}});
+    await app.inject({method:"POST",url:"/v1/safeguards/lock",headers:auth,payload:{locked:true}});
+    expect((await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Locked",entries:first.entries}})).statusCode).toBe(423);
+    await app.inject({method:"POST",url:"/v1/safeguards/lock",headers:auth,payload:{locked:false}});
+    const newcomer=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("New phone")})).json(),newAuth={authorization:`Bearer ${newcomer.deviceToken}`};
+    expect((await app.inject({method:"POST",url:"/v1/commit",headers:newAuth,payload:{parentId:first.id,message:"Too early",entries:first.entries}})).statusCode).toBe(428);
+    await app.inject({method:"POST",url:"/v1/devices/current/ready",headers:newAuth,payload:{}});
+    expect((await app.inject({method:"POST",url:`/v1/devices/${newcomer.deviceId}/revoke`,headers:auth,payload:{}})).statusCode).toBe(200);
+    expect((await app.inject({method:"GET",url:"/v1/status",headers:newAuth})).statusCode).toBe(401);
+    await app.close();
   });
 });

@@ -5,16 +5,17 @@ import { Store } from "./db.js";
 import { mergeText } from "./merge.js";
 import { decryptVaultBlob,encryptVaultBlob,openJson,sha256 } from "./security.js";
 import { SeafileStorage,type ReadableStorageEntry,type VaultStorageRow } from "./seafile.js";
+import { SafeguardService } from "./safeguards.js";
 
 type MirrorEntry={path:string;hash:string;size:number;storage_id:string|null;storage_mtime:number|null};
-export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;}
+export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;quarantineId?:string;locked?:boolean;}
 
 const textExtensions=new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder=new TextDecoder(),encoder=new TextEncoder();
 
 export class ExternalImporter{
   private readonly jobs=new Map<string,Promise<ExternalImportResult>>();
-  constructor(private readonly config:Config,private readonly store:Store,private readonly storage:SeafileStorage){}
+  constructor(private readonly config:Config,private readonly store:Store,private readonly storage:SeafileStorage,private readonly safeguards?:SafeguardService){}
   async settle():Promise<void>{await Promise.allSettled([...this.jobs.values()]);}
 
   scan(vaultId:string):Promise<ExternalImportResult>{
@@ -155,10 +156,17 @@ export class ExternalImporter{
       await this.storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,encryptVaultBlob(bytes,key,hash));
       this.store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",vaultId,hash,bytes.length,scannedAt);
     }
+    const entries=[...final.values()].sort((left,right)=>left.path.localeCompare(right.path));
+    const decision=this.safeguards?.propose({vaultId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",parentId:head?.id??null,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted)`,entries,source:"seafile"});
+    if(decision&&!decision.allowed){
+      this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
+      if(decision.quarantine&&decision.created)this.safeguards?.event(vaultId,"external_quarantine","warning",`Seafile changes were quarantined: ${decision.assessment.reasons.join("; ")}`);
+      return {snapshotId:null,changedFiles,deletedFiles,conflicts,quarantineId:decision.quarantine?.id,locked:decision.locked};
+    }
     const snapshot:Snapshot={
       id:randomUUID(),vaultId,parentId:head?.id??null,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",
       createdAt:scannedAt,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted${conflicts?`, ${conflicts} conflicts`:""})`,
-      entries:[...final.values()].sort((left,right)=>left.path.localeCompare(right.path))
+      entries
     };
     await this.storage.put(row,`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
     this.store.db.exec("BEGIN IMMEDIATE");

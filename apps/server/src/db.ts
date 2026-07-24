@@ -19,6 +19,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS blobs(vault_id TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(vault_id, hash));
       CREATE TABLE IF NOT EXISTS pairings(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, secret_hash TEXT NOT NULL, created_by_device TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT);
       CREATE TABLE IF NOT EXISTS mirror_entries(vault_id TEXT NOT NULL REFERENCES vaults(id), path TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(vault_id,path));
+      CREATE TABLE IF NOT EXISTS quarantines(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), proposal_hash TEXT NOT NULL, source TEXT NOT NULL,
+        device_id TEXT NOT NULL, device_name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL,
+        message TEXT NOT NULL, manifest_json TEXT NOT NULL, assessment_json TEXT NOT NULL, changes_json TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT);
+      CREATE INDEX IF NOT EXISTS quarantines_vault_status ON quarantines(vault_id,status,created_at DESC);
+      CREATE TABLE IF NOT EXISTS snapshot_bookmarks(vault_id TEXT NOT NULL REFERENCES vaults(id), snapshot_id TEXT NOT NULL REFERENCES snapshots(id),
+        label TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY(vault_id,snapshot_id));
+      CREATE TABLE IF NOT EXISTS health_events(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), code TEXT NOT NULL, level TEXT NOT NULL,
+        message TEXT NOT NULL, created_at TEXT NOT NULL, cleared_at TEXT);
     `);
     const columns = new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row) => row.name));
     for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT"})) {
@@ -35,6 +43,14 @@ export class Store {
     if(!currentVaultColumns.has("external_scan_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_scan_at TEXT");
     if(!currentVaultColumns.has("external_import_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_import_at TEXT");
     if(!currentVaultColumns.has("external_error"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_error TEXT");
+    if(!currentVaultColumns.has("safeguard_policy"))this.db.exec("ALTER TABLE vaults ADD COLUMN safeguard_policy TEXT");
+    if(!currentVaultColumns.has("write_locked_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_at TEXT");
+    if(!currentVaultColumns.has("write_locked_by"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_by TEXT");
+    if(!currentVaultColumns.has("trusted_until"))this.db.exec("ALTER TABLE vaults ADD COLUMN trusted_until TEXT");
+    if(!currentVaultColumns.has("trusted_device_id"))this.db.exec("ALTER TABLE vaults ADD COLUMN trusted_device_id TEXT");
+    const deviceColumns=new Set(this.all<{name:string}>("PRAGMA table_info(devices)").map((row)=>row.name));
+    if(!deviceColumns.has("initial_sync_complete")){this.db.exec("ALTER TABLE devices ADD COLUMN initial_sync_complete INTEGER NOT NULL DEFAULT 0");this.db.exec("UPDATE devices SET initial_sync_complete=1");}
+    if(!deviceColumns.has("clock_skew_ms"))this.db.exec("ALTER TABLE devices ADD COLUMN clock_skew_ms INTEGER NOT NULL DEFAULT 0");
   }
   one<T>(sql: string, ...params: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...params) as T | undefined; }
   all<T>(sql: string, ...params: SQLInputValue[]): T[] { return this.db.prepare(sql).all(...params) as T[]; }

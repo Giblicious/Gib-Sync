@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, QuickCodeClaim, QuickCodePairing, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState, WatchResponse } from "@gib-sync/protocol";
+import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, QuarantineItem, QuickCodeClaim, QuickCodePairing, RestorePreview, SafeguardPolicy, SafeguardState, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState, WatchResponse } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
@@ -26,7 +26,18 @@ export class GibSyncApi {
   snapshot(id: string) { return this.json<Snapshot>("GET", `/v1/snapshots/${id}`, undefined, this.settings().deviceToken); }
   history() { return this.json<HistoryItem[]>("GET", "/v1/history?limit=100", undefined, this.settings().deviceToken); }
   commit(body: CommitRequest) { return this.json<Snapshot>("POST", "/v1/commit", body, this.settings().deviceToken); }
-  restore(id: string) { return this.json<Snapshot>("POST", `/v1/restore/${id}`, {}, this.settings().deviceToken); }
+  restorePreview(id:string){return this.json<RestorePreview>("GET",`/v1/restore/${id}/preview`,undefined,this.settings().deviceToken);}
+  restore(id: string,confirmToken:string) { return this.json<Snapshot>("POST", `/v1/restore/${id}`, {confirmToken}, this.settings().deviceToken); }
+  safeguards(){return this.json<SafeguardState>("GET","/v1/safeguards",undefined,this.settings().deviceToken);}
+  updateSafeguardPolicy(policy:SafeguardPolicy){return this.json<SafeguardState>("PUT","/v1/safeguards/policy",policy,this.settings().deviceToken);}
+  setWriteLock(locked:boolean){return this.json<SafeguardState>("POST","/v1/safeguards/lock",{locked},this.settings().deviceToken);}
+  quarantines(){return this.json<QuarantineItem[]>("GET","/v1/quarantines",undefined,this.settings().deviceToken);}
+  approveQuarantine(id:string,trustMinutes=0){return this.json<Snapshot>("POST",`/v1/quarantines/${id}/approve`,{trustMinutes},this.settings().deviceToken);}
+  rejectQuarantine(id:string){return this.json<{ok:boolean}>("POST",`/v1/quarantines/${id}/reject`,{},this.settings().deviceToken);}
+  markDeviceReady(){return this.json<{ok:boolean}>("POST","/v1/devices/current/ready",{},this.settings().deviceToken);}
+  revokeDevice(id:string){return this.json<{ok:boolean}>("POST",`/v1/devices/${id}/revoke`,{},this.settings().deviceToken);}
+  bookmark(id:string,label="Known good"){return this.json<{ok:boolean;label:string}>("PUT",`/v1/bookmarks/${id}`,{label},this.settings().deviceToken);}
+  unbookmark(id:string){return this.json<{ok:boolean}>("DELETE",`/v1/bookmarks/${id}`,undefined,this.settings().deviceToken);}
   mirrorPlan(snapshotId:string,entries:ManifestEntry[]){return this.json<MirrorPlanResponse>("POST","/v1/mirror/plan",{snapshotId,entries},this.settings().deviceToken);}
   mirrorComplete(snapshotId:string){return this.json<MirrorCompleteResponse>("POST","/v1/mirror/complete",{snapshotId},this.settings().deviceToken);}
   createPairing() { return this.json<QuickCodePairing>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
