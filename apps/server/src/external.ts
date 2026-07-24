@@ -36,9 +36,46 @@ export class ExternalImporter{
     return decryptVaultBlob(await this.storage.get(row,`blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`),key,entry.hash);
   }
 
-  private conflictPath(path:string):string{
-    const index=path.lastIndexOf("."),slash=path.lastIndexOf("/"),stamp=new Date().toISOString().replace(/[:.]/g,"-"),suffix=` (conflict Obsidian ${stamp})`;
-    return index>slash?`${path.slice(0,index)}${suffix}${path.slice(index)}`:`${path}${suffix}`;
+  private conflictPath(path:string,deviceName:string,mtime:number,occupied:Set<string>):string{
+    const index=path.lastIndexOf("."),slash=path.lastIndexOf("/");
+    const device=deviceName.replace(/[\\/:*?"<>|\[\]#]/g,"-").replace(/\s+/g," ").trim().slice(0,40)||"Unknown device";
+    const date=new Date(Number.isFinite(mtime)&&mtime>0?mtime:Date.now());
+    const stamp=(Number.isNaN(date.getTime())?new Date():date).toISOString().replace("T"," ").replace(/\.\d{3}Z$/," UTC").replace(/:/g,"-");
+    const stem=index>slash?path.slice(0,index):path,extension=index>slash?path.slice(index):"";
+    let candidate=`${stem} (conflict - ${device} - ${stamp})${extension}`,sequence=2;
+    while(occupied.has(candidate))candidate=`${stem} (conflict - ${device} - ${stamp} - ${sequence++})${extension}`;
+    return candidate;
+  }
+
+  private wikiLink(path:string):string{
+    const target=path.toLowerCase().endsWith(".md")?path.slice(0,-3):path;
+    return `[[${target.replace(/\|/g," ")}|${path.slice(path.lastIndexOf("/")+1)}]]`;
+  }
+
+  private warning(text:string,devices:string[],otherPath:string):string{
+    return `> [!warning] Gib Sync conflict\n> Gib Sync preserved overlapping versions from **${devices.join("** and **")}**. No content was discarded.\n> Review the other version: ${this.wikiLink(otherPath)}\n\n${text}`;
+  }
+
+  private preserveDeletion(path:string,clear:Uint8Array,editor:string,deleter:string,final:Map<string,ManifestEntry>,newBytes:Map<string,Uint8Array>):void{
+    const preserved=path.toLowerCase().endsWith(".md")
+      ?encoder.encode(`> [!warning] Gib Sync deletion conflict\n> **${deleter}** deleted this note while **${editor}** modified it. Gib Sync kept the modified content here; delete this note if the deletion was intended.\n\n${decoder.decode(clear)}`)
+      :clear;
+    const hash=sha256(preserved);newBytes.set(hash,preserved);final.set(path,{path,hash,size:preserved.length,mtime:Date.now()});
+  }
+
+  private preservePair(path:string,current:ManifestEntry,currentBytes:Uint8Array,external:ManifestEntry,externalBytes:Uint8Array,currentName:string,final:Map<string,ManifestEntry>,newBytes:Map<string,Uint8Array>,occupied:Set<string>):void{
+    const currentIsNewer=current.mtime>external.mtime,loser=currentIsNewer?external:current;
+    const winnerBytes=currentIsNewer?currentBytes:externalBytes,loserBytes=currentIsNewer?externalBytes:currentBytes;
+    const loserName=currentIsNewer?"Seafile":currentName,copyPath=this.conflictPath(path,loserName,loser.mtime,occupied);occupied.add(copyPath);
+    let originalClear=winnerBytes,copyClear=loserBytes;
+    if(path.toLowerCase().endsWith(".md")){
+      const names=[currentName,"Seafile"];
+      originalClear=encoder.encode(this.warning(decoder.decode(winnerBytes),names,copyPath));
+      copyClear=encoder.encode(this.warning(decoder.decode(loserBytes),names,path));
+    }
+    const originalHash=sha256(originalClear),copyHash=sha256(copyClear);newBytes.set(originalHash,originalClear);newBytes.set(copyHash,copyClear);
+    final.set(path,{path,hash:originalHash,size:originalClear.length,mtime:Date.now()});
+    final.set(copyPath,{path:copyPath,hash:copyHash,size:copyClear.length,mtime:Date.now()});
   }
 
   private text(path:string):boolean{return textExtensions.has(path.split(".").pop()?.toLowerCase()??"");}
@@ -58,7 +95,7 @@ export class ExternalImporter{
 
     const vault=this.store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;
     const head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
-    const final=new Map((head?.entries??[]).map((entry)=>[entry.path,{...entry}]));
+    const final=new Map((head?.entries??[]).map((entry)=>[entry.path,{...entry}])),occupied=new Set(final.keys());
     const key=openJson<string>(vault.wrapped_key,this.config.GIBSYNC_SERVER_SECRET,vaultId);
     const downloaded=new Map<string,{metadata:ReadableStorageEntry;bytes:Uint8Array;hash:string}>();
     for(const metadata of candidates){
@@ -74,20 +111,37 @@ export class ExternalImporter{
       changedFiles++;
       const externalEntry:ManifestEntry={path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000};
       newBytes.set(item.hash,item.bytes);
-      if(!base||current?.hash===base.hash||!current){final.set(path,externalEntry);continue;}
+      if(!current){
+        if(base){conflicts++;this.preserveDeletion(path,item.bytes,"Seafile",head?.deviceName??"Obsidian",final,newBytes);}
+        else final.set(path,externalEntry);
+        occupied.add(path);continue;
+      }
+      if(!base){
+        conflicts++;const currentBytes=await this.clear(row,key,current);
+        this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);continue;
+      }
+      if(current.hash===base.hash){final.set(path,externalEntry);continue;}
       if(this.text(path)){
         const baseEntry:ManifestEntry={path,hash:base.hash,size:base.size,mtime:0};
-        const merged=mergeText(decoder.decode(await this.clear(row,key,baseEntry)),decoder.decode(await this.clear(row,key,current)),decoder.decode(item.bytes));
+        const currentBytes=await this.clear(row,key,current);
+        const merged=mergeText(decoder.decode(await this.clear(row,key,baseEntry)),decoder.decode(currentBytes),decoder.decode(item.bytes),externalEntry.mtime>=current.mtime?"external":"current");
+        if(merged.kind==="large-conflict"){
+          conflicts++;this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);continue;
+        }
         const bytes=encoder.encode(merged.text),hash=sha256(bytes);newBytes.set(hash,bytes);
-        final.set(path,{path,hash,size:bytes.length,mtime:Date.now()});if(merged.conflicted)conflicts++;continue;
+        final.set(path,{path,hash,size:bytes.length,mtime:Date.now()});continue;
       }
       conflicts++;
-      const copyPath=this.conflictPath(path);final.set(copyPath,{...current,path:copyPath,mtime:Date.now()});final.set(path,externalEntry);
+      const currentBytes=await this.clear(row,key,current);
+      this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);
     }
     for(const missing of deleted){
       const current=final.get(missing.path);if(!current)continue;
       if(current.hash===missing.hash){final.delete(missing.path);deletedFiles++;}
-      else conflicts++;
+      else{
+        conflicts++;changedFiles++;
+        this.preserveDeletion(missing.path,await this.clear(row,key,current),head?.deviceName??"Obsidian","Seafile",final,newBytes);
+      }
     }
 
     if(!changedFiles&&!deletedFiles){

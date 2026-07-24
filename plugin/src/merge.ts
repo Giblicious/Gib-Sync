@@ -1,38 +1,90 @@
 import { diffArrays } from "diff";
 
-type Hunk = { start: number; remove: number; add: string[] };
+type Side = "local" | "remote";
+type Hunk = { start: number; remove: number; add: string[]; side: Side };
+export type MergeKind = "merged" | "small-overlap" | "large-conflict";
+export type MergeResult = { text: string; conflicted: boolean; kind: MergeKind; overlapWords: number; overlapLines: number };
 
-function hunks(base: string[], changed: string[]): Hunk[] {
+const word = /[\p{L}\p{N}_]/u;
+const tokenize = (value: string): string[] => value.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) ?? [];
+
+function hunks(base: string[], changed: string[], side: Side): Hunk[] {
   const parts = diffArrays(base, changed); const output: Hunk[] = []; let baseIndex = 0;
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
     if (!part.added && !part.removed) { baseIndex += part.value.length; continue; }
-    const hunk: Hunk = { start: baseIndex, remove: 0, add: [] };
-    while (i < parts.length && (parts[i].added || parts[i].removed)) {
-      const current = parts[i];
+    const hunk: Hunk = { start: baseIndex, remove: 0, add: [], side };
+    while (index < parts.length && (parts[index].added || parts[index].removed)) {
+      const current = parts[index];
       if (current.removed) { hunk.remove += current.value.length; baseIndex += current.value.length; }
       if (current.added) hunk.add.push(...current.value);
-      i++;
+      index++;
     }
-    i--; output.push(hunk);
+    index--; output.push(hunk);
   }
   return output;
 }
 
-function overlaps(a: Hunk, b: Hunk): boolean {
-  const aEnd = a.start + a.remove, bEnd = b.start + b.remove;
-  if (a.remove === 0 && b.remove === 0) return a.start === b.start;
-  return (a.start < bEnd && b.start < aEnd) || (a.remove === 0 && a.start >= b.start && a.start <= bEnd) || (b.remove === 0 && b.start >= a.start && b.start <= aEnd);
+function overlaps(first: Hunk, second: Hunk): boolean {
+  const firstEnd = first.start + first.remove, secondEnd = second.start + second.remove;
+  if (first.remove === 0 && second.remove === 0) return first.start === second.start;
+  return (first.start < secondEnd && second.start < firstEnd)
+    || (first.remove === 0 && first.start >= second.start && first.start <= secondEnd)
+    || (second.remove === 0 && second.start >= first.start && second.start <= firstEnd);
 }
 
-export function mergeText(baseText: string, localText: string, remoteText: string, localName: string, remoteName: string): { text: string; conflicted: boolean } {
-  if (localText === remoteText) return { text: localText, conflicted: false };
-  if (localText === baseText) return { text: remoteText, conflicted: false };
-  if (remoteText === baseText) return { text: localText, conflicted: false };
-  const trailing = baseText.endsWith("\n"); const split = (v: string) => v.replace(/\n$/, "").split("\n");
-  const base = split(baseText), local = hunks(base, split(localText)), remote = hunks(base, split(remoteText));
-  if (local.some((l) => remote.some((r) => overlaps(l, r)))) return { text: `<<<<<<< ${localName}\n${localText}\n=======\n${remoteText}\n>>>>>>> ${remoteName}\n`, conflicted: true };
+function components(hunks: Hunk[]): Hunk[][] {
+  const remaining = new Set(hunks), output: Hunk[][] = [];
+  while (remaining.size) {
+    const first = remaining.values().next().value as Hunk; remaining.delete(first);
+    const component = [first];
+    for (let index = 0; index < component.length; index++) {
+      for (const candidate of [...remaining]) if (overlaps(component[index], candidate)) {
+        remaining.delete(candidate); component.push(candidate);
+      }
+    }
+    output.push(component);
+  }
+  return output;
+}
+
+function scale(base: string[], component: Hunk[]): { words: number; lines: number } {
+  const start = Math.min(...component.map((hunk) => hunk.start));
+  const end = Math.max(...component.map((hunk) => hunk.start + hunk.remove));
+  const samples = [base.slice(start, end), ...component.map((hunk) => hunk.add)];
+  return {
+    words: Math.max(...samples.map((tokens) => tokens.filter((token) => word.test(token)).length)),
+    lines: Math.max(...samples.map((tokens) => tokens.join("").split("\n").length))
+  };
+}
+
+function affectedLines(base:string[],component:Hunk[]):Set<number>{
+  const start=Math.min(...component.map((hunk)=>hunk.start));
+  const startLine=(base.slice(0,start).join("").match(/\n/g)?.length??0)+1;
+  const size=scale(base,component),lines=new Set<number>();
+  for(let offset=0;offset<size.lines;offset++)lines.add(startLine+offset);
+  return lines;
+}
+
+export function mergeText(baseText: string, localText: string, remoteText: string, preferred: Side): MergeResult {
+  const done = (text: string): MergeResult => ({ text, conflicted: false, kind: "merged", overlapWords: 0, overlapLines: 0 });
+  if (localText === remoteText) return done(localText);
+  if (localText === baseText) return done(remoteText);
+  if (remoteText === baseText) return done(localText);
+
+  const base = tokenize(baseText), all = [...hunks(base, tokenize(localText), "local"), ...hunks(base, tokenize(remoteText), "remote")];
+  const groups=components(all),mixedGroups=groups.filter((component)=>component.some((hunk)=>hunk.side==="local")&&component.some((hunk)=>hunk.side==="remote"));
+  const overlapWords=mixedGroups.reduce((total,component)=>total+scale(base,component).words,0),lines=new Set<number>();
+  for(const component of mixedGroups)for(const line of affectedLines(base,component))lines.add(line);
+  const overlapLines=lines.size;
+  if(overlapWords>20||overlapLines>2)return {text:preferred==="local"?localText:remoteText,conflicted:true,kind:"large-conflict",overlapWords,overlapLines};
+  const selected: Hunk[] = []; let smallOverlap = false;
+  for (const component of groups) {
+    const mixed = component.some((hunk) => hunk.side === "local") && component.some((hunk) => hunk.side === "remote");
+    if (!mixed) { selected.push(...component); continue; }
+    smallOverlap = true; selected.push(...component.filter((hunk) => hunk.side === preferred));
+  }
   const result = [...base];
-  for (const h of [...local, ...remote].sort((a,b) => b.start - a.start)) result.splice(h.start, h.remove, ...h.add);
-  return { text: result.join("\n") + (trailing ? "\n" : ""), conflicted: false };
+  for (const hunk of selected.sort((left, right) => right.start - left.start)) result.splice(hunk.start, hunk.remove, ...hunk.add);
+  return { text: result.join(""), conflicted: false, kind: smallOverlap ? "small-overlap" : "merged", overlapWords, overlapLines };
 }

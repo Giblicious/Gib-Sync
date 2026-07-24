@@ -91,7 +91,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 

@@ -72,4 +72,26 @@ describe("SyncEngine", () => {
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},async()=>{});const result=await engine.sync();const finalEntry=api.head!.entries[0];
     expect(new TextDecoder().decode(await decryptBlob(api.blobs.get(finalEntry.hash)!,config.vaultKey,finalEntry.hash))).toBe("A\nb\nC\n");expect(result.conflicts).toBe(0);expect(api.head?.parentId).toBe("00000000-0000-4000-8000-000000000402");
   });
+  it("bifurcates independently created same-path notes with linked warnings",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.deviceName="Desktop";
+    const local=new TextEncoder().encode("# Desktop draft\n"),remote=new TextEncoder().encode("# Mobile draft\n"),remoteHash=await hashBytes(remote);
+    adapter.files.set("Project.md",local);api.blobs.set(remoteHash,await encryptBlob(remote,config.vaultKey,remoteHash));
+    api.head={id:"00000000-0000-4000-8000-000000000501",vaultId:"vault",parentId:null,deviceId:"mobile",deviceName:"Mobile",createdAt:new Date().toISOString(),message:"Offline create",entries:[{path:"Project.md",hash:remoteHash,size:remote.length,mtime:2}]};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    const result=await engine.sync(),paths=api.head!.entries.map((entry)=>entry.path);
+    expect(result.conflicts).toBe(1);expect(paths).toHaveLength(2);expect(paths).toContain("Project.md");
+    const copyPath=paths.find((path)=>path!=="Project.md")!;expect(copyPath).toContain("conflict - Desktop");
+    const original=new TextDecoder().decode(adapter.files.get("Project.md")),copy=new TextDecoder().decode(adapter.files.get(copyPath));
+    expect(original).toContain("[!warning] Gib Sync conflict");expect(original).toContain(`[[${copyPath.slice(0,-3)}`);
+    expect(copy).toContain("# Desktop draft");expect(copy).toContain("[[Project|Project.md]]");
+  });
+  it("keeps an edited note with a warning when another device deleted it",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;
+    const baseBytes=new TextEncoder().encode("base\n"),baseHash=await hashBytes(baseBytes),editedBytes=new TextEncoder().encode("mobile edit\n"),editedHash=await hashBytes(editedBytes);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000601",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"Delete.md",hash:baseHash,size:baseBytes.length,mtime:1}]};
+    const remote:Snapshot={...base,id:"00000000-0000-4000-8000-000000000602",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:[{path:"Delete.md",hash:editedHash,size:editedBytes.length,mtime:2}]};
+    api.snapshots.set(base.id,base);api.head=remote;api.blobs.set(editedHash,await encryptBlob(editedBytes,config.vaultKey,editedHash));config.lastSnapshotId=base.id;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(1);expect(new TextDecoder().decode(adapter.files.get("Delete.md"))).toContain("[!warning] Gib Sync deletion conflict");
+  });
 });
