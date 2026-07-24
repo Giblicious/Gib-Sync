@@ -29,6 +29,9 @@ export default class GibSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("rename", (file,oldPath) => this.scheduleFileChangeSync(file.path,oldPath)));
+    this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+      if (info.file) this.scheduleFileChangeSync(info.file.path);
+    }));
     this.configureTimer();
     if (this.settings.deviceToken && this.settings.autoSync) this.app.workspace.onLayoutReady(() => this.scheduleSync(2500));
   }
