@@ -112,6 +112,11 @@ export interface SyncState {
   head: Snapshot | null;
 }
 
+export interface WatchResponse {
+  changed: boolean;
+  headId: string | null;
+}
+
 export interface CommitRequest {
   parentId: string | null;
   message: string;

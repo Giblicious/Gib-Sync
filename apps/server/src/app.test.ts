@@ -78,6 +78,17 @@ describe("Gib Sync API", () => {
     const stale = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Stale",entries:[]}}); expect(stale.statusCode).toBe(409);
     await app.close();
   });
+  it("returns stale watches immediately and wakes current watches when the vault head changes",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`};
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"One",entries:[]}})).json();
+    const stale=await app.inject({method:"GET",url:"/v1/watch?head=",headers:auth});expect(stale.json()).toEqual({changed:true,headId:first.id});
+    const waiting=app.inject({method:"GET",url:`/v1/watch?head=${first.id}`,headers:auth});
+    await new Promise((resolve)=>setTimeout(resolve,10));
+    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Two",entries:[]}})).json();
+    const notified=await waiting;expect(notified.statusCode).toBe(200);expect(notified.json()).toEqual({changed:true,headId:second.id});
+    await app.close();
+  });
   it("expires rolling codes after 60 seconds and throttles five-digit guesses",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`};

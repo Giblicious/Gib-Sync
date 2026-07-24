@@ -13,14 +13,14 @@ export interface LiveSyncStatus {
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
-  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; syncOnFileChange: boolean;
+  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean;
   syncIntervalSeconds: number; syncObsidianConfig: boolean; exclusions: string[];
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 

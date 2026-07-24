@@ -10,6 +10,7 @@ export default class GibSyncPlugin extends Plugin {
   private statusEl!: HTMLElement; private timer: number | null = null; private debounce: number | null = null;
   private debounceKind: "automatic"|"file-change"|null = null;
   private fileChangePending = false;
+  private watchGeneration = 0;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
 
@@ -33,10 +34,11 @@ export default class GibSyncPlugin extends Plugin {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
     this.configureTimer();
+    this.configureWatch();
     if (this.settings.deviceToken && this.settings.autoSync) this.app.workspace.onLayoutReady(() => this.scheduleSync(2500));
   }
 
-  onunload() { if (this.timer !== null) window.clearInterval(this.timer); if (this.debounce !== null) window.clearTimeout(this.debounce); }
+  onunload() { this.watchGeneration++; if (this.timer !== null) window.clearInterval(this.timer); if (this.debounce !== null) window.clearTimeout(this.debounce); }
   private updateStatusBar() { const text = `Gib Sync: ${this.liveStatus.message}`; this.statusEl?.setText(text); this.statusEl?.setAttr("aria-label", text); }
   private emitStatus() { this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
@@ -53,7 +55,7 @@ export default class GibSyncPlugin extends Plugin {
   async saveSettings() { await this.saveData(this.settings); }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false });
-    this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); void this.refreshServerStatus();
+    this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
   async runSync() {
@@ -101,5 +103,28 @@ export default class GibSyncPlugin extends Plugin {
     if (this.timer !== null) window.clearInterval(this.timer); this.timer = null;
     if (this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
     else { this.liveStatus.nextSyncAt=null;this.emitStatus(); }
+  }
+  configureWatch() {
+    const generation=++this.watchGeneration;
+    if(this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
+  }
+  private async watchLoop(generation:number) {
+    let failures=0;
+    while(generation===this.watchGeneration&&this.settings.instantReceive&&this.settings.deviceToken){
+      try{
+        const result=await this.api.watch(this.settings.lastSnapshotId);
+        if(generation!==this.watchGeneration)return;
+        failures=0;
+        if(result.changed&&result.headId!==this.settings.lastSnapshotId){
+          this.report("scheduled","Remote change detected; syncing now","info");
+          await this.runSync();
+        }
+      }catch(error){
+        if(generation!==this.watchGeneration)return;
+        failures++;
+        if(failures===1)this.report("scheduled","Instant incoming sync reconnecting; periodic sync remains active","warning");
+        await new Promise<void>((resolve)=>window.setTimeout(resolve,Math.min(10_000,1000*2**Math.min(failures-1,3))));
+      }
+    }
   }
 }
