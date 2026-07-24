@@ -1,6 +1,6 @@
 import { webcrypto } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { normalizeQuickCode,openPairingEnvelope, toBase64Url } from "./crypto";
+import { decryptBlob,encryptBlob,hashBytes,normalizeQuickCode,openPairingEnvelope, toBase64Url } from "./crypto";
 
 describe("pairing envelope", () => {
   it("normalizes a typed quick code",()=>{expect(normalizeQuickCode(" 01234 ")).toBe("01234");expect(()=>normalizeQuickCode("1234")).toThrow();});
@@ -12,5 +12,11 @@ describe("pairing envelope", () => {
     const iv = webcrypto.getRandomValues(new Uint8Array(12)); const encrypted = new Uint8Array(await webcrypto.subtle.encrypt({name:"AES-GCM",iv},key,encoder.encode(JSON.stringify({ok:true}))));
     const ciphertext = encrypted.slice(0,-16), tag = encrypted.slice(-16); const packed = new Uint8Array(12+16+ciphertext.length); packed.set(iv); packed.set(tag,12); packed.set(ciphertext,28);
     await expect(openPairingEnvelope(toBase64Url(packed), secret, id)).resolves.toEqual({ok:true});
+  });
+  it("accepts the 29-byte encrypted representation of an empty file",async()=>{
+    Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
+    const clear=new Uint8Array();const hash=await hashBytes(clear);const key=toBase64Url(webcrypto.getRandomValues(new Uint8Array(32)));
+    const encrypted=await encryptBlob(clear,key,hash);expect(encrypted).toHaveLength(29);
+    await expect(decryptBlob(encrypted,key,hash)).resolves.toEqual(clear);
   });
 });

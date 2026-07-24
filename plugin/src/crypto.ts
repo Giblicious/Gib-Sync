@@ -36,7 +36,7 @@ export async function encryptBlob(bytes: Uint8Array, key: string, hash: string):
 }
 
 export async function decryptBlob(payload: Uint8Array, key: string, hash: string): Promise<Uint8Array> {
-  if (payload[0] !== 1 || payload.length < 30) throw new Error("Unsupported or invalid encrypted blob");
+  if (payload[0] !== 1 || payload.length < 29) throw new Error("Unsupported or invalid encrypted blob");
   const result = await crypto.subtle.decrypt({ name: "AES-GCM", iv: payload.slice(1, 13), additionalData: encoder.encode(hash) }, await importKey(key), payload.slice(13) as BufferSource);
   const bytes = new Uint8Array(result);
   if (await hashBytes(bytes) !== hash) throw new Error(`Integrity check failed for ${hash}`);
