@@ -6,7 +6,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 - A complete, readable 1:1 recovery copy of the synchronized vault in Seafile.
 - Encrypted content-addressed history, immutable snapshots, and point-in-time restore in a hidden `.gib-sync` sidecar.
-- Compare-and-swap commits, three-way text merging, and binary conflict-copy preservation.
+- Compare-and-swap commits with word-aware merging and lossless conflict-note preservation.
 - Per-vault Seafile routing: every person chooses an account, library, and folder while sharing one Gib Sync service.
 - Manual multi-device setup plus short-lived, one-time quick codes that are easy to type between devices.
 - Live phases, progress, timestamps, errors, remote inventory, mirror health, device counts, activity history, and secret-free diagnostics.
@@ -24,7 +24,15 @@ Selected Seafile library and folder
     └── snapshots/              # immutable manifests
 ```
 
-The readable tree is bidirectional. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Direct changes from Seafile's web editor, WebDAV, desktop sync client, or another external source are detected, committed into Gib Sync history, and pushed to connected Obsidian devices. Simultaneous edits use three-way text merging; overlapping text edits receive conflict markers and binary versions are both preserved.
+The readable tree is bidirectional. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Direct changes from Seafile's web editor, WebDAV, desktop sync client, or another external source are detected, committed into Gib Sync history, and pushed to connected Obsidian devices.
+
+Simultaneous edits use a lossless three-way policy:
+
+- Changes that do not overlap are all merged, including separate word edits on the same line.
+- Small overlaps affecting at most 20 words across at most two lines use the most recently saved whole-word change only in the overlap.
+- Larger rewrites and independently created same-path notes keep the newest version at the intended path and create device-and-time-stamped alternatives. Markdown versions receive reciprocal warning callouts and Obsidian links.
+- Edit-versus-delete conflicts retain the edited note with a warning so a deletion never silently destroys concurrent work.
+- Binary conflicts preserve both files.
 
 The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
 

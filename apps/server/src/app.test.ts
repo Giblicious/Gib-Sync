@@ -121,6 +121,38 @@ describe("Gib Sync API", () => {
     expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,entry.hash)).toString()).toBe("A\nb\nC\n");
     await app.close();
   });
+  it("bifurcates large Obsidian and Seafile rewrites with reciprocal warning links",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
+    const base=Buffer.from("one\ntwo\nthree\n"),baseHash=sha256(base);
+    await app.inject({method:"PUT",url:`/v1/blobs/${baseHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(base,key,baseHash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Base",entries:[{path:"Rewrite.md",hash:baseHash,size:base.length,mtime:1}]}})).json();
+    storage.files.set(`read:${credentials.vaultId}:Rewrite.md`,base);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",credentials.vaultId,"Rewrite.md",baseHash,base.length,new Date().toISOString(),sha256(base),1);
+    const desktop=Buffer.from("desktop one\ndesktop two\ndesktop three\n"),desktopHash=sha256(desktop);
+    await app.inject({method:"PUT",url:`/v1/blobs/${desktopHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(desktop,key,desktopHash)});
+    await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Desktop rewrite",entries:[{path:"Rewrite.md",hash:desktopHash,size:desktop.length,mtime:2}]}});
+    storage.files.set(`read:${credentials.vaultId}:Rewrite.md`,Buffer.from("seafile one\nseafile two\nseafile three\n"));
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported.conflicts).toBe(1);
+    const entries=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.entries;expect(entries).toHaveLength(2);
+    const original=entries.find((entry:any)=>entry.path==="Rewrite.md"),copy=entries.find((entry:any)=>entry.path!=="Rewrite.md");expect(copy.path).toContain("conflict - Desktop");
+    const clear=async(entry:any)=>Buffer.from(decryptVaultBlob(storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!,credentials.vaultKey,entry.hash)).toString();
+    expect(await clear(original)).toContain(`[[${copy.path.slice(0,-3)}`);expect(await clear(copy)).toContain("[[Rewrite|Rewrite.md]]");
+    await app.close();
+  });
+  it("preserves an Obsidian edit with a warning when Seafile deletes the same note",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
+    const base=Buffer.from("base\n"),baseHash=sha256(base);await app.inject({method:"PUT",url:`/v1/blobs/${baseHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(base,key,baseHash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Base",entries:[{path:"Delete.md",hash:baseHash,size:base.length,mtime:1}]}})).json();
+    storage.files.set(`read:${credentials.vaultId}:Delete.md`,base);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",credentials.vaultId,"Delete.md",baseHash,base.length,new Date().toISOString(),sha256(base),1);
+    const edited=Buffer.from("desktop edit\n"),editedHash=sha256(edited);await app.inject({method:"PUT",url:`/v1/blobs/${editedHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(edited,key,editedHash)});
+    await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Edit",entries:[{path:"Delete.md",hash:editedHash,size:edited.length,mtime:2}]}});
+    storage.files.delete(`read:${credentials.vaultId}:Delete.md`);
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported.conflicts).toBe(1);
+    const entry=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.entries[0],clear=Buffer.from(decryptVaultBlob(storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!,credentials.vaultKey,entry.hash)).toString();
+    expect(clear).toContain("[!warning] Gib Sync deletion conflict");expect(clear).toContain("desktop edit");
+    await app.close();
+  });
   it("expires rolling codes after 60 seconds and throttles five-digit guesses",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`};

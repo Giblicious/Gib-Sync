@@ -68,9 +68,46 @@ export class SyncEngine {
   }
 
   private text(path: string): boolean { return TEXT_EXTENSIONS.has(path.split(".").pop()?.toLowerCase() ?? ""); }
-  private conflictPath(path: string): string {
-    const index = path.lastIndexOf("."); const stamp = new Date().toISOString().replace(/[:.]/g, "-"); const suffix = ` (conflict ${this.getSettings().deviceName} ${stamp})`;
-    return index > path.lastIndexOf("/") ? `${path.slice(0,index)}${suffix}${path.slice(index)}` : `${path}${suffix}`;
+  private conflictPath(path: string, deviceName: string, mtime: number, occupied: Set<string>): string {
+    const index = path.lastIndexOf("."), slash = path.lastIndexOf("/");
+    const device = deviceName.replace(/[\\/:*?"<>|\[\]#]/g, "-").replace(/\s+/g, " ").trim().slice(0, 40) || "Unknown device";
+    const date = new Date(Number.isFinite(mtime) && mtime > 0 ? mtime : Date.now());
+    const stamp = (Number.isNaN(date.getTime()) ? new Date() : date).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC").replace(/:/g, "-");
+    const stem = index > slash ? path.slice(0, index) : path, extension = index > slash ? path.slice(index) : "";
+    let candidate = `${stem} (conflict - ${device} - ${stamp})${extension}`, sequence = 2;
+    while (occupied.has(candidate)) candidate = `${stem} (conflict - ${device} - ${stamp} - ${sequence++})${extension}`;
+    return candidate;
+  }
+  private wikiLink(path:string):string {
+    const target=path.toLowerCase().endsWith(".md")?path.slice(0,-3):path;
+    return `[[${target.replace(/\|/g," ")}|${path.slice(path.lastIndexOf("/")+1)}]]`;
+  }
+  private warning(text:string, devices:string[], otherPath:string):string {
+    return `> [!warning] Gib Sync conflict\n> Gib Sync preserved overlapping versions from **${devices.join("** and **")}**. No content was discarded.\n> Review the other version: ${this.wikiLink(otherPath)}\n\n${text}`;
+  }
+  private deletionWarning(text:string,editor:string,deleter:string):string {
+    return `> [!warning] Gib Sync deletion conflict\n> **${deleter}** deleted this note while **${editor}** modified it. Gib Sync kept the modified content here; delete this note if the deletion was intended.\n\n${text}`;
+  }
+  private async preserveDeletion(path:string,clear:Uint8Array,editor:string,deleter:string,final:Map<string,FileState>,bytes:Map<string,Uint8Array>):Promise<void>{
+    const preserved=path.toLowerCase().endsWith(".md")?encoder.encode(this.deletionWarning(decoder.decode(clear),editor,deleter)):clear;
+    const hash=await hashBytes(preserved);bytes.set(hash,preserved);final.set(path,{path,hash,size:preserved.length,mtime:Date.now(),bytes:preserved});
+  }
+  private async preservePair(path:string,local:FileState,remote:FileState,localName:string,remoteName:string,final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,occupied:Set<string>):Promise<void>{
+    const localBytes=local.bytes!,remoteBytes=await this.remoteBytes(remote,remoteCache);
+    const localIsNewer=local.mtime>=remote.mtime;
+    const loser=localIsNewer?remote:local;
+    const winnerBytes=localIsNewer?localBytes:remoteBytes,loserBytes=localIsNewer?remoteBytes:localBytes;
+    const loserName=localIsNewer?remoteName:localName;
+    const copyPath=this.conflictPath(path,loserName,loser.mtime,occupied);occupied.add(copyPath);
+    let originalClear=winnerBytes,copyClear=loserBytes;
+    if(path.toLowerCase().endsWith(".md")){
+      const names=[localName,remoteName];
+      originalClear=encoder.encode(this.warning(decoder.decode(winnerBytes),names,copyPath));
+      copyClear=encoder.encode(this.warning(decoder.decode(loserBytes),names,path));
+    }
+    const originalHash=await hashBytes(originalClear),copyHash=await hashBytes(copyClear);bytes.set(originalHash,originalClear);bytes.set(copyHash,copyClear);
+    final.set(path,{path,hash:originalHash,size:originalClear.length,mtime:Date.now(),bytes:originalClear});
+    final.set(copyPath,{path:copyPath,hash:copyHash,size:copyClear.length,mtime:Date.now(),bytes:copyClear});
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
   private async convergeAfterConflict(attempt:number,reason:string):Promise<SyncResult>{
@@ -96,7 +133,7 @@ export class SyncEngine {
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     for (const entry of local.values()) if (entry.bytes) bytes.set(entry.hash, entry.bytes);
-    const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+    const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths`});
     for (const path of [...paths].sort()) {
       const b = base.get(path), l = local.get(path), r = remote.get(path);
@@ -107,19 +144,30 @@ export class SyncEngine {
       if (!b && l && !r) { final.set(path, l); continue; }
       if (!b && !l && r) { final.set(path, r); continue; }
       if (!l && !r) continue;
-      if (l && r && this.text(path)) {
-        const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
-        const localText = decoder.decode(l.bytes!); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
-        const merged = mergeText(baseText, localText, remoteText, settings.deviceName, r.path);
-        const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
-        final.set(path, { path, hash, size: mergedBytes.length, mtime: Date.now(), bytes: mergedBytes });
-        if (merged.conflicted) conflicts++;
+      if(b&&(!l||!r)){
+        conflicts++;
+        if(l)await this.preserveDeletion(path,l.bytes!,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes);
+        else if(r)await this.preserveDeletion(path,await this.remoteBytes(r,remoteCache),remoteSnapshot?.deviceName??"Remote device",settings.deviceName,final,bytes);
         continue;
       }
-      // A binary conflict never destroys either side: remote keeps the original path and local gets a conflict copy.
+      if (l && r && this.text(path)) {
+        if(!b){
+          conflicts++;await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+        }
+        const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
+        const localText = decoder.decode(l.bytes!); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
+        const preferred=l.mtime>=r.mtime?"local":"remote";
+        const merged = mergeText(baseText, localText, remoteText, preferred);
+        if(merged.kind==="large-conflict"){
+          conflicts++;await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+        }
+        const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
+        final.set(path, { path, hash, size: mergedBytes.length, mtime: Date.now(), bytes: mergedBytes });
+        continue;
+      }
+      // A binary conflict never destroys either side; the newest stays at the intended path.
       conflicts++;
-      if (r) final.set(path, r);
-      if (l) { const copyPath = this.conflictPath(path); final.set(copyPath, { ...l, path: copyPath, mtime: Date.now() }); }
+      if(l&&r)await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);
     }
 
     let downloaded = 0, deleted = 0;
