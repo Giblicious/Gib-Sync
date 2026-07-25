@@ -45,4 +45,10 @@ describe("Seafile directories",()=>{
       {path:"Note.md",id:"note-id",mtime:123,size:9}
     ]);
   });
+  it("treats a missing readable folder as an empty first-run mirror",async()=>{
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response("missing",{status:404})));
+    const storage=new SeafileStorage(config);const id="11111111-1111-4111-8111-111111111111";
+    const row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/New/Vault",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/New/Vault",mirror_head_id:null};
+    expect(await storage.listReadable(row)).toEqual([]);
+  });
 });

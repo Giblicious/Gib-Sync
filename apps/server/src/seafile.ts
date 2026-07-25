@@ -176,6 +176,7 @@ export class SeafileStorage {
   async listReadable(row:VaultStorageRow):Promise<ReadableStorageEntry[]>{
     const root=this.readableRoot(row)||"/",credentials=this.credentials(row);
     const response=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(root)}&recursive=1`);
+    if(response.status===404)return [];
     if(!response.ok)throw new Error(`Seafile readable listing failed (${response.status})`);
     const body=await response.json() as SeafileDirEntry[]|"uptodate";
     if(!Array.isArray(body))throw new Error("Seafile returned an unexpected readable listing");
