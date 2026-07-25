@@ -33,3 +33,66 @@
 .gib-sync-health-alert { margin-top: .35rem; padding: .45rem .6rem; border-radius: 6px; background: var(--background-primary-alt); font-size: var(--font-ui-smaller); }
 .gib-sync-health-alert.is-warning { color: var(--color-orange); }
 .gib-sync-health-alert.is-error { color: var(--text-error); }
+
+@media (max-width: 600px) {
+  .gib-sync-modal-content .setting-item,
+  .gib-sync-settings .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: .55rem;
+  }
+  .gib-sync-modal-content .setting-item-control,
+  .gib-sync-settings .setting-item-control {
+    align-items: stretch;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    width: 100%;
+  }
+  .gib-sync-modal-content input,
+  .gib-sync-modal-content select,
+  .gib-sync-modal-content textarea,
+  .gib-sync-settings input,
+  .gib-sync-settings select,
+  .gib-sync-settings textarea {
+    max-width: none;
+    width: 100%;
+  }
+  .gib-sync-modal-content button,
+  .gib-sync-settings button {
+    min-height: 44px;
+    white-space: normal;
+  }
+  .gib-sync-history-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .gib-sync-row-actions {
+    justify-content: stretch;
+    width: 100%;
+  }
+  .gib-sync-row-actions button {
+    flex: 1 1 100%;
+  }
+  .gib-sync-status-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .gib-sync-activity-title {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .gib-sync-activity-title > div {
+    display: flex;
+    gap: .4rem;
+    width: 100%;
+  }
+  .gib-sync-activity-title button {
+    flex: 1 1 0;
+    margin-left: 0;
+    min-height: 44px;
+  }
+  .gib-sync-activity-row {
+    grid-template-columns: 70px minmax(0, 1fr);
+  }
+  .gib-sync-change-list {
+    padding-inline-start: 1.25rem;
+  }
+}

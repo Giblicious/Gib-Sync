@@ -55,7 +55,9 @@ The mirror is crash-recoverable: the server records the hash of each successfull
 
 `.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes themes, snippets, hotkeys, and other settings. **Sync installed plugins** independently includes community plugin folders and `community-plugins.json`, while always excluding Gib Sync's own directory so the running synchronizer cannot overwrite itself. Plugin `data.json` files can contain API keys and are copied to the readable Seafile tree when plugin sync is enabled. Explicit exclusions are omitted from both representations.
 
-**Excluded path prefixes** is the ignore list. A prefix ignores that file or complete directory subtree in both device synchronization and the readable Seafile recovery copy.
+**Excluded path prefixes** is the device-local ignore list. A prefix ignores that file or complete directory subtree on that device while preserving the accepted remote version and the copies used by other devices.
+
+On mobile, Gib Sync uses Obsidian's mobile-safe request and vault-adapter APIs, browser WebCrypto, numeric quick-code keyboards, touch-sized responsive controls, and foreground-resume reconciliation. It does not require Node.js, Electron, camera access, or filesystem paths. Mobile devices can omit plugin synchronization without deleting plugins used by desktop devices; Obsidian itself ignores any synchronized plugin marked desktop-only.
 
 ## Deployment
 

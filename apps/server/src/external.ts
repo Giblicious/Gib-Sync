@@ -18,8 +18,8 @@ export class ExternalImporter{
   constructor(private readonly config:Config,private readonly store:Store,private readonly storage:SeafileStorage,private readonly safeguards?:SafeguardService){}
   async settle():Promise<void>{await Promise.allSettled([...this.jobs.values()]);}
 
-  scan(vaultId:string):Promise<ExternalImportResult>{
-    const active=this.jobs.get(vaultId);if(active)return active;
+  scan(vaultId:string,fresh=false):Promise<ExternalImportResult>{
+    const active=this.jobs.get(vaultId);if(active)return fresh?active.then(()=>this.scan(vaultId)):active;
     const job=this.run(vaultId).catch((error)=>{
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=? WHERE id=?",new Date().toISOString(),error instanceof Error?error.message:String(error),vaultId);
       throw error;

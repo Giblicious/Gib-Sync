@@ -56,7 +56,9 @@ export class SyncEngine {
     const paths = await this.listFiles(); let current = 0;
     for (const path of paths) {
       const bytes = new Uint8Array(await this.adapter.readBinary(path)); const stat = await this.adapter.stat(path);
-      output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now(), bytes });
+      // Retain metadata rather than every file body. Mobile WebViews have much
+      // tighter memory limits, so changed content is read lazily when required.
+      output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now() });
       current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:`Scanning local vault (${current}/${paths.length})`,current,total:paths.length});
     }
     return output;
@@ -64,6 +66,12 @@ export class SyncEngine {
 
   private map(snapshot: Snapshot | null): Map<string, FileState> {
     return new Map((snapshot?.entries ?? []).filter((entry) => this.include(entry.path)).map((entry) => [entry.path, { ...entry }]));
+  }
+  private async localBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>):Promise<Uint8Array>{
+    const cached=cache.get(entry.hash);if(cached)return cached;
+    const clear=new Uint8Array(await this.adapter.readBinary(path));
+    if(await hashBytes(clear)!==entry.hash)throw new Error(`${path} changed while Gib Sync was reading it. It was not uploaded; sync will retry with the newer saved version.`);
+    cache.set(entry.hash,clear);return clear;
   }
 
   private async remoteBytes(entry: FileState, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
@@ -102,8 +110,8 @@ export class SyncEngine {
     const preserved=path.toLowerCase().endsWith(".md")?encoder.encode(this.deletionWarning(decoder.decode(clear),editor,deleter)):clear;
     const hash=await hashBytes(preserved);bytes.set(hash,preserved);final.set(path,{path,hash,size:preserved.length,mtime:Date.now(),bytes:preserved});
   }
-  private async preservePair(path:string,local:FileState,remote:FileState,localName:string,remoteName:string,final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,occupied:Set<string>):Promise<void>{
-    const localBytes=local.bytes!,remoteBytes=await this.remoteBytes(remote,remoteCache);
+  private async preservePair(path:string,local:FileState,localBytes:Uint8Array,remote:FileState,localName:string,remoteName:string,final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,occupied:Set<string>):Promise<void>{
+    const remoteBytes=await this.remoteBytes(remote,remoteCache);
     const localIsNewer=local.mtime>=remote.mtime;
     const loser=localIsNewer?remote:local;
     const winnerBytes=localIsNewer?localBytes:remoteBytes,loserBytes=localIsNewer?remoteBytes:localBytes;
@@ -147,7 +155,6 @@ export class SyncEngine {
     const baseSnapshot = settings.lastSnapshotId ? await this.api.snapshot(settings.lastSnapshotId).catch(() => null) : null;
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
-    for (const entry of local.values()) if (entry.bytes) bytes.set(entry.hash, entry.bytes);
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths`});
     for (const path of [...paths].sort()) {
@@ -161,20 +168,20 @@ export class SyncEngine {
       if (!l && !r) continue;
       if(b&&(!l||!r)){
         conflicts++;
-        if(l)await this.preserveDeletion(path,l.bytes!,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes);
+        if(l)await this.preserveDeletion(path,await this.localBytes(path,l,bytes),settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes);
         else if(r)await this.preserveDeletion(path,await this.remoteBytes(r,remoteCache),remoteSnapshot?.deviceName??"Remote device",settings.deviceName,final,bytes);
         continue;
       }
       if (l && r && this.text(path)) {
         if(!b){
-          conflicts++;await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+          conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
         }
         const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
-        const localText = decoder.decode(l.bytes!); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
+        const localText = decoder.decode(await this.localBytes(path,l,bytes)); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
         const preferred=l.mtime>=r.mtime?"local":"remote";
         const merged = mergeText(baseText, localText, remoteText, preferred);
         if(merged.kind==="large-conflict"){
-          conflicts++;await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+          conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
         }
         const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
         final.set(path, { path, hash, size: mergedBytes.length, mtime: Date.now(), bytes: mergedBytes });
@@ -182,7 +189,7 @@ export class SyncEngine {
       }
       // A binary conflict never destroys either side; the newest stays at the intended path.
       conflicts++;
-      if(l&&r)await this.preservePair(path,l,r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);
+      if(l&&r)await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);
     }
 
     let downloaded = 0, deleted = 0;
@@ -194,12 +201,17 @@ export class SyncEngine {
     }
     for (const path of local.keys()) if (!final.has(path) && this.include(path)) { await this.adapter.remove(path); deleted++; }
 
-    const entries = [...final.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
-    const remoteEntries = [...remote.values()].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
+    // An ignored path is device-local: keep its accepted remote manifest entry
+    // even though this device neither reads nor writes the file. This is
+    // essential when phones intentionally omit desktop-only plugins.
+    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path));
+    const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
+    const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
+    const clientCanMirrorAll=!preservedIgnored.length;
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
       settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();let mirrored=0;
-      try{mirrored=remoteSnapshot?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
+      try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
       return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
@@ -207,7 +219,8 @@ export class SyncEngine {
 
     this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;
     for (const entry of entries) {
-      const clear = bytes.get(entry.hash); if (!clear || remoteEntries.some((remoteEntry) => remoteEntry.hash === entry.hash)) continue;
+      if(remoteEntries.some((remoteEntry)=>remoteEntry.hash===entry.hash))continue;
+      const localEntry=local.get(entry.path);const clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(entry.path,localEntry,bytes):undefined);if(!clear)throw new Error(`Unable to prepare changed file ${entry.path}`);
       await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
       this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
     }
@@ -219,7 +232,7 @@ export class SyncEngine {
       clientTime:new Date().toISOString(),signals:{highEntropyPaths,vaultIdentity:settings.vaultIdentity} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
     settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
-    try{mirrored=await this.mirror(snapshot.id,entries,final,bytes,remoteCache);}
+    try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
     return { uploaded, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };

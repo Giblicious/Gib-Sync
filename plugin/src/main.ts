@@ -35,6 +35,14 @@ export default class GibSyncPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
+    this.registerDomEvent(document,"visibilitychange",()=>{
+      if(document.visibilityState!=="visible"||!this.settings.deviceToken)return;
+      // Mobile operating systems suspend timers and long polls while Obsidian is
+      // backgrounded. Recreate the incoming watch and reconcile immediately.
+      this.configureWatch();
+      if(this.liveStatus.running)this.fileChangePending=true;
+      else if(this.settings.autoSync||this.settings.instantReceive)this.queueSync(750,"App returned to foreground","automatic");
+    });
     this.configureTimer();
     this.configureWatch();
     if (this.settings.deviceToken && this.settings.autoSync) this.app.workspace.onLayoutReady(() => this.scheduleSync(2500));

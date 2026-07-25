@@ -71,6 +71,33 @@ describe("SyncEngine", () => {
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
     await expect(engine.restoreAcceptedSnapshot()).resolves.toEqual({downloaded:1,deleted:1});expect(adapter.files.get("note.md")).toEqual(accepted);expect(adapter.files.has("extra.md")).toBe(false);expect(config.lastSnapshotId).toBe(api.head.id);
   });
+  it("lets mobile ignore desktop plugins without deleting their remote copies",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=false;
+    const baseNote=new TextEncoder().encode("base\n"),editedNote=new TextEncoder().encode("mobile edit\n"),pluginBytes=new TextEncoder().encode("desktop plugin\n");
+    const baseHash=await hashBytes(baseNote),pluginHash=await hashBytes(pluginBytes);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000203",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Desktop with plugins",entries:[
+      {path:"note.md",hash:baseHash,size:baseNote.length,mtime:1},{path:".obsidian/plugins/desktop-tool/main.js",hash:pluginHash,size:pluginBytes.length,mtime:1}
+    ]};
+    config.lastSnapshotId=base.id;api.head=base;api.snapshots.set(base.id,base);api.blobs.set(baseHash,await encryptBlob(baseNote,config.vaultKey,baseHash));api.blobs.set(pluginHash,await encryptBlob(pluginBytes,config.vaultKey,pluginHash));adapter.files.set("note.md",editedNote);
+    await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(api.head?.entries.map((entry)=>entry.path).sort()).toEqual([".obsidian/plugins/desktop-tool/main.js","note.md"]);expect(adapter.files.has(".obsidian/plugins/desktop-tool/main.js")).toBe(false);
+  });
+  it("downloads mobile-compatible plugin files after plugin sync is enabled",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;config.lastSnapshotId=null;
+    const pluginBytes=new TextEncoder().encode("mobile plugin\n"),workspaceBytes=new TextEncoder().encode("{}"),pluginHash=await hashBytes(pluginBytes),workspaceHash=await hashBytes(workspaceBytes);
+    api.blobs.set(pluginHash,await encryptBlob(pluginBytes,config.vaultKey,pluginHash));api.blobs.set(workspaceHash,await encryptBlob(workspaceBytes,config.vaultKey,workspaceHash));
+    api.head={id:"00000000-0000-4000-8000-000000000204",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Plugins",entries:[
+      {path:".obsidian/plugins/calendar/main.js",hash:pluginHash,size:pluginBytes.length,mtime:1},{path:".obsidian/workspace.json",hash:workspaceHash,size:workspaceBytes.length,mtime:1}
+    ]};
+    await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(adapter.files.get(".obsidian/plugins/calendar/main.js")).toEqual(pluginBytes);expect(adapter.files.has(".obsidian/workspace.json")).toBe(false);
+  });
+  it("never uploads a stale body when a file changes during a low-memory scan",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),before=new TextEncoder().encode("before\n"),after=new TextEncoder().encode("after\n");adapter.files.set("note.md",before);
+    const originalRead=adapter.readBinary.bind(adapter);let reads=0;adapter.readBinary=async(path:string)=>{reads++;if(reads===2)adapter.files.set(path,after);return originalRead(path);};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    await expect(engine.sync()).rejects.toThrow("changed while Gib Sync was reading it");expect(api.commits).toBe(0);
+  });
   it("retries mirror supersession without reporting a committed sync as failed",async()=>{
     const adapter=new MemoryAdapter();const api=new MemoryApi();const config=settings();const clear=new TextEncoder().encode("current\n");const hash=await hashBytes(clear);adapter.files.set("note.md",clear);
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000321",vaultId:"vault",parentId:null,deviceId:"other",deviceName:"Mobile",createdAt:new Date().toISOString(),message:"Current",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]};

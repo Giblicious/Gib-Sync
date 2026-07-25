@@ -63,8 +63,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
 
   const mirrorJobs=new Map<string,Promise<void>>();const mirrorTimers=new Set<NodeJS.Timeout>();
-  async function ingestExternalChanges(vaultId:string){
-    const result=await externalImporter.scan(vaultId);
+  async function ingestExternalChanges(vaultId:string,fresh=false){
+    const result=await externalImporter.scan(vaultId,fresh);
     if(result.snapshotId){notifyVault(vaultId,result.snapshotId);scheduleMirror(vaultId,50);app.log.info({vaultId,...result},"Imported external Seafile changes");}
     else if(result.quarantineId){const headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id??null;notifyVault(vaultId,headId,true);}
     return result;
@@ -217,7 +217,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.post("/v1/external/scan",async(request)=>{
-    const device=await authenticate(request);return ingestExternalChanges(device.vault_id);
+    const device=await authenticate(request);return ingestExternalChanges(device.vault_id,true);
   });
 
   const entrySchema=z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
