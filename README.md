@@ -59,6 +59,10 @@ The mirror is crash-recoverable: the server records the hash of each successfull
 
 On mobile, Gib Sync uses Obsidian's mobile-safe request and vault-adapter APIs, browser WebCrypto, numeric quick-code keyboards, touch-sized responsive controls, and foreground-resume reconciliation. It does not require Node.js, Electron, camera access, or filesystem paths. Mobile devices can omit plugin synchronization without deleting plugins used by desktop devices; Obsidian itself ignores any synchronized plugin marked desktop-only.
 
+Status indicators are independently configurable. Desktop can show an icon, a short state word, both, or neither. Mobile can show a tappable icon in the right-sidebar status area, a compact dot immediately before the view-mode control, or both. Every surface opens the same live status panel with progress, recent activity, attention counts, Sync now, and pause/resume actions. Long-pressing a mobile indicator requests an immediate sync.
+
+Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. If it is, Gib Sync stops its timers and incoming watch and refuses new sync runs until Obsidian Sync is disabled. This mutual-exclusion safeguard prevents two synchronization engines from concurrently changing the same vault. `.obsidian/core-plugins.json` is always device-local so configuration sync cannot re-enable Obsidian Sync elsewhere.
+
 ## Deployment
 
 1. Copy `.env.example` to `.env` and replace every secret.

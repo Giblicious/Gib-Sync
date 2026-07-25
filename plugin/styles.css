@@ -33,8 +33,78 @@
 .gib-sync-health-alert { margin-top: .35rem; padding: .45rem .6rem; border-radius: 6px; background: var(--background-primary-alt); font-size: var(--font-ui-smaller); }
 .gib-sync-health-alert.is-warning { color: var(--color-orange); }
 .gib-sync-health-alert.is-error { color: var(--text-error); }
+.gib-sync-desktop-status { position: relative; display: inline-flex; align-items: center; gap: .35rem; cursor: pointer; }
+.gib-sync-desktop-status.is-hidden { display: none; }
+.gib-sync-indicator-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; color: var(--text-muted); }
+.gib-sync-indicator-icon svg { width: 16px; height: 16px; stroke-width: 2.25; }
+.gib-sync-desktop-status.is-success .gib-sync-indicator-icon, .gib-sync-indicator.is-success .gib-sync-indicator-icon { color: var(--color-green); }
+.gib-sync-desktop-status.is-active .gib-sync-indicator-icon, .gib-sync-indicator.is-active .gib-sync-indicator-icon { color: var(--interactive-accent); }
+.gib-sync-desktop-status.is-warning .gib-sync-indicator-icon, .gib-sync-indicator.is-warning .gib-sync-indicator-icon { color: var(--color-orange); }
+.gib-sync-desktop-status.is-error .gib-sync-indicator-icon, .gib-sync-indicator.is-error .gib-sync-indicator-icon { color: var(--color-red); }
+.gib-sync-desktop-status.is-animated .gib-sync-indicator-icon, .gib-sync-indicator.is-animated .gib-sync-indicator-icon { animation: gib-sync-spin 1.2s linear infinite; }
+.gib-sync-indicator-badge { position: absolute; top: -5px; right: -7px; min-width: 14px; height: 14px; padding: 0 3px; border: 2px solid var(--background-primary); border-radius: 8px; background: var(--color-orange); color: white; font-size: 9px; font-weight: 700; line-height: 10px; text-align: center; }
+.gib-sync-status-short-text { line-height: 1; }
+.gib-sync-indicator { position: relative; align-items: center; justify-content: center; margin: 0; border: 0; background: transparent; color: var(--text-normal); box-shadow: none; cursor: pointer; }
+.gib-sync-mobile-sidebar-indicator { display: inline-flex; width: 34px; height: 34px; padding: 8px; border-radius: 8px; }
+.gib-sync-mobile-sidebar-indicator.is-drawer-fallback { position: absolute; right: max(10px, env(safe-area-inset-right)); bottom: max(10px, env(safe-area-inset-bottom)); z-index: var(--layer-popover); background: var(--background-secondary); box-shadow: var(--shadow-s); }
+.gib-sync-mobile-top-indicator { display: inline-flex; flex: 0 0 30px; width: 30px; height: 30px; padding: 9px; }
+.gib-sync-indicator-dot { width: 10px; height: 10px; border: 2px solid var(--text-muted); border-radius: 50%; background: transparent; box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-muted) 12%, transparent); }
+.gib-sync-indicator.is-success .gib-sync-indicator-dot { border-color: var(--color-green); background: var(--color-green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-green) 15%, transparent); }
+.gib-sync-indicator.is-active .gib-sync-indicator-dot { border-color: var(--interactive-accent); background: var(--interactive-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--interactive-accent) 15%, transparent); }
+.gib-sync-indicator.is-warning .gib-sync-indicator-dot { border-color: var(--color-orange); background: var(--color-orange); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-orange) 15%, transparent); }
+.gib-sync-indicator.is-warning .gib-sync-indicator-dot { border-radius: 2px; transform: rotate(45deg); }
+.gib-sync-indicator.is-error .gib-sync-indicator-dot { border-color: var(--color-red); border-radius: 2px; background: var(--color-red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-red) 15%, transparent); }
+.gib-sync-indicator.is-animated .gib-sync-indicator-dot { animation: gib-sync-pulse 1.2s ease-in-out infinite; }
+@keyframes gib-sync-spin { to { transform: rotate(360deg); } }
+.gib-sync-status-modal { width: min(620px, calc(100vw - 32px)); }
+.gib-sync-status-overview { display: flex; align-items: center; gap: .75rem; padding: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px 12px 0 0; background: var(--background-secondary); }
+.gib-sync-status-overview-icon { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 50%; background: var(--background-primary-alt); color: var(--text-muted); }
+.gib-sync-status-overview-icon svg { width: 22px; height: 22px; }
+.gib-sync-status-overview.is-success .gib-sync-status-overview-icon { color: var(--color-green); }
+.gib-sync-status-overview.is-active .gib-sync-status-overview-icon { color: var(--interactive-accent); }
+.gib-sync-status-overview.is-warning .gib-sync-status-overview-icon { color: var(--color-orange); }
+.gib-sync-status-overview.is-error .gib-sync-status-overview-icon { color: var(--color-red); }
+.gib-sync-status-overview-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; margin-top: 1px; background: var(--background-modifier-border); }
+.gib-sync-status-overview-grid > div { min-width: 0; padding: .65rem .8rem; background: var(--background-secondary); }
+.gib-sync-status-overview-grid span { display: block; margin-bottom: .15rem; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.gib-sync-status-overview-grid strong { display: block; overflow-wrap: anywhere; font-size: var(--font-ui-small); }
+.gib-sync-status-overview-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }
+.gib-sync-status-overview-activity { max-height: 220px; overflow: auto; padding: .75rem; border: 1px solid var(--background-modifier-border); border-radius: 10px; background: var(--background-secondary); }
+.gib-sync-status-overview-activity > strong { display: block; margin-bottom: .55rem; }
+.gib-sync-native-sync-warning { margin: .75rem 0; padding: .8rem; border-left: 4px solid var(--color-orange); border-radius: 8px; background: var(--background-secondary); }
+.gib-sync-native-sync-warning p { margin: .35rem 0 .65rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  .gib-sync-desktop-status.is-animated .gib-sync-indicator-icon,
+  .gib-sync-indicator.is-animated .gib-sync-indicator-icon,
+  .gib-sync-indicator.is-animated .gib-sync-indicator-dot,
+  .gib-sync-status-head .gib-sync-status-dot { animation: none; }
+}
+
+body.is-mobile .gib-sync-status-modal {
+  align-self: flex-end;
+  width: 100%;
+  max-width: none;
+  max-height: min(88vh, 760px);
+  margin: 0;
+  border-radius: 16px 16px 0 0;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+}
+body.is-mobile .gib-sync-status-overview-grid { grid-template-columns: minmax(0,1fr); }
+body.is-mobile .gib-sync-status-overview-actions button { flex: 1 1 calc(50% - .25rem); min-height: 44px; }
 
 @media (max-width: 600px) {
+  .gib-sync-status-modal {
+    align-self: flex-end;
+    width: 100%;
+    max-width: none;
+    max-height: min(88vh, 760px);
+    margin: 0;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+  .gib-sync-status-overview-grid { grid-template-columns: minmax(0,1fr); }
+  .gib-sync-status-overview-actions button { flex: 1 1 calc(50% - .25rem); min-height: 44px; }
   .gib-sync-modal-content .setting-item,
   .gib-sync-settings .setting-item {
     align-items: stretch;

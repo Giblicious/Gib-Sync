@@ -1,9 +1,10 @@
-import { Notice, Plugin } from "obsidian";
+import { Menu, Notice, Platform, Plugin, normalizePath, setIcon } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
-import { GibSyncSettingTab, HistoryModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, claimQuickCodeSetup } from "./ui";
+import { deriveIndicatorState } from "./status";
+import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
@@ -14,14 +15,22 @@ export default class GibSyncPlugin extends Plugin {
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
+  private nativeSyncBlocked=false;
+  private nativeSyncNoticeShown=false;
+  private mobileSidebarEl:HTMLButtonElement|null=null;
+  private mobileTopEl:HTMLButtonElement|null=null;
+  private mobileObserver:MutationObserver|null=null;
+  private mobileMountScheduled=false;
 
   async onload() {
     this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
-    this.statusEl = this.addStatusBarItem(); this.updateStatusBar();
+    this.statusEl = this.addStatusBarItem();
     this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,"info",progress.current,progress.total));
-    this.addRibbonIcon("refresh-cw", "Gib Sync now", () => void this.runSync());
+    const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
+    ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
+    this.addCommand({id:"open-status",name:"Open sync status",callback:()=>this.openStatusOverview()});
     this.addCommand({ id: "desktop-setup", name: "Set up first device", callback: () => new SetupModal(this.app, this).open() });
     this.addCommand({ id: "show-quick-code", name: "Show temporary mobile setup code", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new QuickCodeDisplayModal(this.app, this).open(); return true; } });
     this.addCommand({ id: "enter-quick-code", name: "Enter temporary setup code", callback: () => new QuickCodeEntryModal(this.app, this).open() });
@@ -43,13 +52,104 @@ export default class GibSyncPlugin extends Plugin {
       if(this.liveStatus.running)this.fileChangePending=true;
       else if(this.settings.autoSync||this.settings.instantReceive)this.queueSync(750,"App returned to foreground","automatic");
     });
+    this.configureStatusSurfaces();
+    this.registerInterval(window.setInterval(()=>void this.checkObsidianSyncProtection(),5000));
+    void this.checkObsidianSyncProtection();
     this.configureTimer();
     this.configureWatch();
-    if (this.settings.deviceToken && this.settings.autoSync) this.app.workspace.onLayoutReady(() => this.scheduleSync(2500));
+    this.app.workspace.onLayoutReady(()=>{
+      this.configureStatusSurfaces();
+      void this.checkObsidianSyncProtection();
+      if(this.settings.deviceToken&&this.settings.autoSync)this.scheduleSync(2500);
+    });
   }
 
-  onunload() { this.watchGeneration++; if (this.timer !== null) window.clearInterval(this.timer); if (this.debounce !== null) window.clearTimeout(this.debounce); }
-  private updateStatusBar() { const text = `Gib Sync: ${this.liveStatus.message}`; this.statusEl?.setText(text); this.statusEl?.setAttr("aria-label", text); }
+  onunload() {
+    this.watchGeneration++;
+    if(this.timer!==null)window.clearInterval(this.timer);
+    if(this.debounce!==null)window.clearTimeout(this.debounce);
+    this.mobileObserver?.disconnect();this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();
+  }
+  private attentionCount():number{return this.serverStatus?.safeguards.pendingQuarantines??0;}
+  indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount());}
+  isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
+  private renderIndicator(element:HTMLElement,dotOnly=false) {
+    const state=this.indicatorState(),animate=this.settings.animateStatusIndicator&&state.animated;
+    const kind=element.dataset.gibSyncIndicatorKind;
+    const placement=kind?` gib-sync-mobile-${kind}-indicator`:"";
+    const fallback=element.dataset.gibSyncDrawerFallback==="true"?" is-drawer-fallback":"";
+    element.className=`gib-sync-indicator${placement} is-${state.tone} is-${state.key}${animate?" is-animated":""}${dotOnly?" is-dot-only":""}${fallback}`;
+    element.empty();
+    if(dotOnly)element.createSpan({cls:"gib-sync-indicator-dot"});
+    else{
+      const icon=element.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);
+      if(this.settings.showAttentionBadge&&state.attentionCount>0)element.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});
+    }
+    element.setAttr("aria-label",`${state.label}. ${state.description}`);
+    element.setAttr("data-tooltip-position","top");
+  }
+  private updateStatusBar() {
+    if(!this.statusEl)return;
+    const state=this.indicatorState(),show=!Platform.isMobile&&(this.settings.desktopStatusIcon||this.settings.desktopStatusText);
+    this.statusEl.toggleClass("is-hidden",!show);this.statusEl.className=`status-bar-item gib-sync-desktop-status is-${state.tone} is-${state.key}${this.settings.animateStatusIndicator&&state.animated?" is-animated":""}${show?"":" is-hidden"}`;
+    this.statusEl.empty();
+    if(this.settings.desktopStatusIcon){const icon=this.statusEl.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);if(this.settings.showAttentionBadge&&state.attentionCount>0)this.statusEl.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});}
+    if(this.settings.desktopStatusText)this.statusEl.createSpan({cls:"gib-sync-status-short-text",text:state.label});
+    this.statusEl.setAttr("aria-label",`${state.label}. ${state.description}`);
+    this.statusEl.onclick=()=>this.openStatusOverview();
+    this.statusEl.oncontextmenu=(event)=>{
+      event.preventDefault();const menu=new Menu();
+      menu.addItem((item)=>item.setTitle("Sync now").setIcon("refresh-cw").onClick(()=>void this.runSync()));
+      menu.addItem((item)=>item.setTitle(this.settings.paused?"Resume":"Pause").setIcon(this.settings.paused?"play":"pause").onClick(()=>void this.setPaused(!this.settings.paused)));
+      menu.addItem((item)=>item.setTitle("Open status").setIcon("activity").onClick(()=>this.openStatusOverview()));
+      menu.showAtMouseEvent(event);
+    };
+    this.scheduleMobileMount();
+  }
+  openStatusOverview(){new StatusOverviewModal(this.app,this).open();}
+  configureStatusSurfaces(){
+    this.updateStatusBar();
+    if(!Platform.isMobile){this.mobileObserver?.disconnect();this.mobileObserver=null;this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();return;}
+    if(!this.mobileObserver){
+      this.mobileObserver=new MutationObserver(()=>this.scheduleMobileMount());
+      this.mobileObserver.observe(document.body,{childList:true,subtree:true});
+    }
+    this.scheduleMobileMount();
+  }
+  private mobileButton(kind:"sidebar"|"top"):HTMLButtonElement{
+    const key=kind==="sidebar"?"mobileSidebarEl":"mobileTopEl";let element=this[key];
+    if(!element){
+      element=document.createElement("button");element.type="button";element.dataset.gibSyncIndicatorKind=kind;
+      let timer:number|null=null,longPressed=false;
+      const cancel=()=>{if(timer!==null)window.clearTimeout(timer);timer=null;};
+      element.addEventListener("pointerdown",()=>{longPressed=false;timer=window.setTimeout(()=>{longPressed=true;void this.runSync();new Notice("Sync requested");},650);});
+      element.addEventListener("pointerup",cancel);element.addEventListener("pointercancel",cancel);element.addEventListener("pointerleave",cancel);
+      element.addEventListener("click",(event)=>{if(longPressed){event.preventDefault();longPressed=false;return;}this.openStatusOverview();});
+      this[key]=element;
+    }
+    this.renderIndicator(element,kind==="top");return element;
+  }
+  private scheduleMobileMount(){
+    if(!Platform.isMobile||this.mobileMountScheduled)return;
+    this.mobileMountScheduled=true;window.requestAnimationFrame(()=>{this.mobileMountScheduled=false;this.mountMobileIndicators();});
+  }
+  private mountMobileIndicators(){
+    if(!Platform.isMobile)return;
+    if(this.settings.mobileSidebarIndicator){
+      const element=this.mobileButton("sidebar");
+      const nativeSlot=document.querySelector<HTMLElement>(".workspace-drawer.mod-right .status-bar, .workspace-drawer.mod-right .workspace-drawer-footer, .mod-right.workspace-drawer .status-bar");
+      const drawer=document.querySelector<HTMLElement>(".workspace-drawer.mod-right, .mod-right.workspace-drawer");
+      const host=nativeSlot??drawer;
+      if(host&&element.parentElement!==host){element.dataset.gibSyncDrawerFallback=String(!nativeSlot);this.renderIndicator(element);host.appendChild(element);}
+    }else this.mobileSidebarEl?.remove();
+    if(this.settings.mobileTopIndicator){
+      const element=this.mobileButton("top");
+      const actions=Array.from(document.querySelectorAll<HTMLElement>(".mobile-navbar-action, .view-action, .view-header-icon"));
+      const mode=actions.find((item)=>/reading view|editing mode|live preview|source mode|view mode|preview/i.test(`${item.getAttribute("aria-label")??""} ${item.getAttribute("data-tooltip")??""}`));
+      const host=mode?.parentElement??document.querySelector<HTMLElement>(".mobile-navbar-actions, .workspace-leaf.mod-active .view-actions, .view-header .view-actions");
+      if(host&&(element.parentElement!==host||mode&&element.nextElementSibling!==mode))host.insertBefore(element,mode??host.firstChild);
+    }else this.mobileTopEl?.remove();
+  }
   private emitStatus() { this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
   report(phase:SyncPhase,message:string,level:ActivityLevel="info",current?:number,total?:number) {
@@ -74,8 +174,63 @@ export default class GibSyncPlugin extends Plugin {
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
+  private runtimeObsidianSyncState():boolean|null{
+    type Entry={enabled?:boolean;instance?:unknown};
+    type Manager={getPluginById?:(id:string)=>Entry|undefined;getEnabledPluginById?:(id:string)=>unknown;plugins?:Record<string,Entry>};
+    const manager=(this.app as unknown as {internalPlugins?:Manager}).internalPlugins;if(!manager)return null;
+    const enabled=manager.getEnabledPluginById?.("sync");if(enabled)return true;
+    const entry=manager.getPluginById?.("sync")??manager.plugins?.sync;
+    return entry?Boolean(entry.enabled??entry.instance):null;
+  }
+  private async obsidianSyncEnabled():Promise<boolean>{
+    const runtime=this.runtimeObsidianSyncState();if(runtime!==null)return runtime;
+    try{
+      const path=normalizePath(`${this.app.vault.configDir}/core-plugins.json`),adapter=this.app.vault.adapter;
+      if(!await adapter.exists(path))return false;
+      const stored=JSON.parse(await adapter.read(path)) as unknown;
+      if(Array.isArray(stored))return stored.includes("sync");
+      if(stored&&typeof stored==="object")return Boolean((stored as Record<string,unknown>).sync);
+    }catch{}
+    return false;
+  }
+  async checkObsidianSyncProtection(showDialog=false):Promise<boolean>{
+    const enabled=await this.obsidianSyncEnabled();
+    if(enabled){
+      if(!this.nativeSyncBlocked){
+        this.nativeSyncBlocked=true;this.watchGeneration++;
+        if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;
+        if(this.debounce!==null)window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;
+        this.report("blocked","Obsidian Sync is enabled; Gib Sync is paused","warning");
+      }else this.emitStatus();
+      if(!this.nativeSyncNoticeShown){this.nativeSyncNoticeShown=true;new Notice("Gib Sync is paused until the Obsidian Sync core plugin is disabled.",12000);}
+      if(showDialog)new NativeSyncConflictModal(this.app,this).open();
+      return true;
+    }
+    if(this.nativeSyncBlocked){
+      this.nativeSyncBlocked=false;this.nativeSyncNoticeShown=false;this.report("idle","Obsidian Sync disabled; Gib Sync resumed","success");
+      this.configureTimer();this.configureWatch();if(this.settings.deviceToken&&!this.settings.paused)this.queueSync(750,"Safety check passed","automatic");
+    }
+    return false;
+  }
+  openCorePluginSettings(){
+    const setting=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;
+    setting?.open?.();window.setTimeout(()=>setting?.openTabById?.("core-plugins"),50);
+  }
+  async setPaused(paused:boolean){
+    this.settings.paused=paused;await this.saveSettings();
+    if(paused){
+      this.watchGeneration++;if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;
+      if(this.debounce!==null)window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;
+      this.report("blocked","Synchronization paused","warning");
+    }else{
+      this.report("idle","Synchronization resumed","success");this.configureTimer();this.configureWatch();
+      if(this.settings.deviceToken&&!await this.checkObsidianSyncProtection())this.queueSync(500,"Manual resume","automatic");
+    }
+  }
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
+    if(this.settings.paused){this.openStatusOverview();return;}
+    if(await this.checkObsidianSyncProtection(true))return;
     if (this.liveStatus.running) return;
     const identity=this.currentVaultIdentity();
     if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
@@ -118,20 +273,21 @@ export default class GibSyncPlugin extends Plugin {
     this.scheduleNextSyncLabel();
   }
   private queueSync(delay:number,reason:string,kind:"automatic"|"file-change"="file-change") {
+    if(this.nativeSyncBlocked||this.settings.paused)return;
     if (this.debounce !== null) window.clearTimeout(this.debounce);
     this.debounceKind=kind;
     this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`${reason}; sync in ${Math.max(1,Math.round(delay/1000))}s`);
     this.debounce = window.setTimeout(() => { this.debounce = null;this.debounceKind=null;void this.runSync(); }, delay);
   }
-  private scheduleNextSyncLabel() { if (this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } }
+  private scheduleNextSyncLabel() { if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } else {this.liveStatus.nextSyncAt=null;this.emitStatus();} }
   configureTimer() {
     if (this.timer !== null) window.clearInterval(this.timer); this.timer = null;
-    if (this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
+    if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
     else { this.liveStatus.nextSyncAt=null;this.emitStatus(); }
   }
   configureWatch() {
     const generation=++this.watchGeneration;
-    if(this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
+    if(!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
   }
   private async watchLoop(generation:number) {
     let failures=0;

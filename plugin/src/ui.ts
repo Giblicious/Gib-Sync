@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, Platform, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, QuarantineItem, SafeguardPolicy, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
@@ -181,6 +181,48 @@ export class SafeguardSettingsModal extends Modal{
   onClose(){this.contentEl.empty();}
 }
 
+export class NativeSyncConflictModal extends Modal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  onOpen(){
+    mobileContent(this.contentEl);this.modalEl.addClass("gib-sync-native-sync-modal");this.setTitle("Obsidian Sync must be disabled");
+    this.contentEl.createEl("p",{text:"Gib Sync has paused all scheduled and incoming synchronization because the Obsidian Sync core plugin is enabled. Running two sync engines against the same vault can create duplicate, conflicting, or deleted files."});
+    this.contentEl.createEl("p",{text:"Disable Sync under Core plugins, then return here and check again. Gib Sync will also detect the change automatically."});
+    new Setting(this.contentEl)
+      .addButton((button)=>button.setCta().setButtonText("Open Core plugins").onClick(()=>this.plugin.openCorePluginSettings()))
+      .addButton((button)=>button.setButtonText("Check again").onClick(async()=>{button.setDisabled(true);if(!await this.plugin.checkObsidianSyncProtection()){this.close();new Notice("Obsidian Sync is disabled; Gib Sync resumed.");}else button.setDisabled(false);}));
+  }
+  onClose(){this.contentEl.empty();}
+}
+
+export class StatusOverviewModal extends Modal{
+  private unsubscribe:(()=>void)|null=null;
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  onOpen(){
+    mobileContent(this.contentEl);this.modalEl.addClass("gib-sync-status-modal");this.setTitle("Sync status");
+    this.render();this.unsubscribe=this.plugin.subscribeStatus(()=>this.render());
+    if(this.plugin.settings.deviceToken)void this.plugin.refreshServerStatus();
+  }
+  private render(){
+    const root=this.contentEl;root.empty();const live=this.plugin.liveStatus,state=this.plugin.indicatorState(),server=this.plugin.serverStatus;
+    const hero=root.createDiv({cls:`gib-sync-status-overview is-${state.tone}`});const icon=hero.createSpan({cls:"gib-sync-status-overview-icon"});setIcon(icon,state.icon);
+    const copy=hero.createDiv();copy.createEl("strong",{text:state.label});copy.createEl("div",{text:state.description,cls:"gib-sync-muted"});
+    if(live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
+    const facts=root.createDiv({cls:"gib-sync-status-overview-grid"});const fact=(label:string,value:string)=>{const item=facts.createDiv();item.createEl("span",{text:label});item.createEl("strong",{text:value});};
+    fact("Current operation",live.message);fact("Last successful sync",when(live.lastSuccessAt));fact("Last result",live.lastResult||"No completed sync yet");fact("Next check",when(live.nextSyncAt));
+    if(server){fact("Remote inventory",`${server.snapshotCount} snapshots · ${server.mirrorFileCount} readable files`);fact("Held changes",String(server.safeguards.pendingQuarantines));}
+    const actions=root.createDiv({cls:"gib-sync-status-overview-actions"});
+    const sync=actions.createEl("button",{text:"Sync now",cls:"mod-cta"});sync.disabled=live.running||this.plugin.settings.paused||this.plugin.isNativeSyncBlocking();sync.onclick=()=>{this.close();void this.plugin.runSync();};
+    const pause=actions.createEl("button",{text:this.plugin.settings.paused?"Resume":"Pause"});pause.onclick=async()=>{pause.disabled=true;await this.plugin.setPaused(!this.plugin.settings.paused);this.render();};
+    if(state.attentionCount>0){const review=actions.createEl("button",{text:"Review held changes"});review.onclick=()=>{this.close();this.plugin.openSafeguards();};}
+    const settings=actions.createEl("button",{text:"Settings"});settings.onclick=()=>{this.close();const control=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;control?.open?.();window.setTimeout(()=>control?.openTabById?.("gib-sync"),50);};
+    if(this.plugin.isNativeSyncBlocking()){const warning=root.createDiv({cls:"gib-sync-native-sync-warning"});warning.createEl("strong",{text:"Obsidian Sync is enabled"});warning.createEl("p",{text:"Gib Sync is safely paused until the core Sync plugin is disabled."});const button=warning.createEl("button",{text:"Resolve"});button.onclick=()=>new NativeSyncConflictModal(this.app,this.plugin).open();}
+    const activity=root.createDiv({cls:"gib-sync-status-overview-activity"});activity.createEl("strong",{text:"Recent activity"});
+    for(const entry of [...live.activities].reverse().slice(0,8)){const row=activity.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}
+    if(!live.activities.length)activity.createDiv({cls:"gib-sync-muted",text:"No activity yet."});
+  }
+  onClose(){this.unsubscribe?.();this.unsubscribe=null;this.contentEl.empty();}
+}
+
 export class GibSyncSettingTab extends PluginSettingTab {
   private unsubscribe:(()=>void)|null=null;private liveRoot:HTMLElement|null=null;
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
@@ -191,6 +233,15 @@ export class GibSyncSettingTab extends PluginSettingTab {
     if(configured)actions.addButton((button)=>button.setButtonText("Refresh status").onClick(()=>void this.plugin.refreshServerStatus()));
     if(!configured)actions.addButton((button)=>button.setButtonText("Enter quick code").onClick(()=>new QuickCodeEntryModal(this.app,this.plugin).open()));
     if(configured)new Setting(this.containerEl).setName("Add another device").setDesc("Show a five-digit code that changes every 60 seconds and works once.").addButton((button)=>button.setButtonText("Show quick code").onClick(()=>new QuickCodeDisplayModal(this.app,this.plugin).open())).addButton((button)=>button.setButtonText("Change manual connection").onClick(()=>new SetupModal(this.app,this.plugin).open()));
+    this.containerEl.createEl("h3",{text:"Status indicators"});
+    new Setting(this.containerEl).setName("Desktop status icon").setDesc("Show the current state as an icon in the desktop status bar.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.desktopStatusIcon).onChange(async(value)=>{this.plugin.settings.desktopStatusIcon=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    new Setting(this.containerEl).setName("Desktop short state").setDesc("Show only the short state word, such as Synced, Syncing, Attention, Paused, or Error.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.desktopStatusText).onChange(async(value)=>{this.plugin.settings.desktopStatusText=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    new Setting(this.containerEl).setName("Mobile right-sidebar indicator").setDesc("Place a tappable indicator in the bottom-right status area of the mobile right sidebar.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.mobileSidebarIndicator).onChange(async(value)=>{this.plugin.settings.mobileSidebarIndicator=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    new Setting(this.containerEl).setName("Mobile top-navigation dot").setDesc("Place a compact status dot immediately left of the mobile view-mode control.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.mobileTopIndicator).onChange(async(value)=>{this.plugin.settings.mobileTopIndicator=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    new Setting(this.containerEl).setName("Animate active synchronization").setDesc("Pulse or rotate the indicator only while work is active.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.animateStatusIndicator).onChange(async(value)=>{this.plugin.settings.animateStatusIndicator=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    new Setting(this.containerEl).setName("Attention badge count").setDesc("Show the number of quarantined change batches that need review.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.showAttentionBadge).onChange(async(value)=>{this.plugin.settings.showAttentionBadge=value;await this.plugin.saveSettings();this.plugin.configureStatusSurfaces();}));
+    const nativeProtection=new Setting(this.containerEl).setName("Obsidian Sync protection").setDesc(this.plugin.isNativeSyncBlocking()?"Obsidian Sync is enabled. Gib Sync is paused to prevent two sync engines from changing this vault.":"Gib Sync checks continuously and refuses to run while Obsidian Sync is enabled.");
+    nativeProtection.addButton((button)=>button.setButtonText("Open Core plugins").onClick(()=>this.plugin.openCorePluginSettings())).addButton((button)=>button.setButtonText("Check now").onClick(async()=>{button.setDisabled(true);const blocked=await this.plugin.checkObsidianSyncProtection(true);button.setDisabled(false);new Notice(blocked?"Obsidian Sync is still enabled.":"Protection check passed.");this.display();}));
     new Setting(this.containerEl).setName("Periodic sync").setDesc("Checks for remote changes on a timer.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.autoSync).onChange(async(value)=>{this.plugin.settings.autoSync=value;await this.plugin.saveSettings();this.plugin.configureTimer();}));
     new Setting(this.containerEl).setName("Instant incoming sync").setDesc("The server notifies this device when another device changes the vault. The periodic interval remains a safety check.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.instantReceive).onChange(async(value)=>{this.plugin.settings.instantReceive=value;await this.plugin.saveSettings();this.plugin.configureWatch();}));
     new Setting(this.containerEl).setName("Sync interval").setDesc("Seconds between periodic checks (minimum 15).").addText((text)=>text.setValue(String(this.plugin.settings.syncIntervalSeconds)).onChange(async(value)=>{const parsed=Number(value);if(Number.isFinite(parsed)){this.plugin.settings.syncIntervalSeconds=Math.max(15,Math.round(parsed));await this.plugin.saveSettings();this.plugin.configureTimer();}}));

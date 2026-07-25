@@ -20,6 +20,7 @@ describe("file-change sync filtering",()=>{
   it("separates Obsidian configuration from installed plugins",()=>{
     const settings={...DEFAULT_SETTINGS,syncObsidianConfig:true};
     expect(shouldSyncChangedPath(".obsidian/themes/theme.css",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/core-plugins.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(false);
   });
@@ -38,5 +39,13 @@ describe("file-change sync filtering",()=>{
   it("preserves legacy plugin inclusion when upgrading an existing config-sync user",async()=>{
     const plugin={loadData:async()=>({syncObsidianConfig:true})} as unknown as Plugin;
     await expect(loadSettings(plugin)).resolves.toMatchObject({syncObsidianConfig:true,syncPlugins:true});
+  });
+
+  it("adds non-destructive indicator defaults to existing settings",async()=>{
+    const plugin={loadData:async()=>({deviceName:"Existing device"})} as unknown as Plugin;
+    await expect(loadSettings(plugin)).resolves.toMatchObject({
+      deviceName:"Existing device",desktopStatusIcon:true,desktopStatusText:true,
+      mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false
+    });
   });
 });

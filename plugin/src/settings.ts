@@ -1,7 +1,7 @@
 import type { Plugin } from "obsidian";
 import type { StorageLocation } from "@gib-sync/protocol";
 
-export type SyncPhase = "not-configured"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
+export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
 export interface SyncActivity { at:string; phase:SyncPhase; level:ActivityLevel; message:string; current?:number; total?:number; }
 export interface LiveSyncStatus {
@@ -13,15 +13,18 @@ export interface LiveSyncStatus {
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
-  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean;
+  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean; paused:boolean;
   syncIntervalSeconds: number; syncObsidianConfig: boolean; syncPlugins: boolean; exclusions: string[];
+  desktopStatusIcon: boolean; desktopStatusText: boolean;
+  mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false, syncPlugins: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncObsidianConfig: false, syncPlugins: false,
+  desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -42,6 +45,7 @@ export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): 
   const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
   if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
+  if(normalized===".obsidian/core-plugins.json")return false;
   const obsidianRoot=normalized===".obsidian";
   const pluginPath=normalized===".obsidian/plugins"||normalized.startsWith(".obsidian/plugins/")||normalized===".obsidian/community-plugins.json";
   if(obsidianRoot&&!settings.syncObsidianConfig&&!settings.syncPlugins)return false;
