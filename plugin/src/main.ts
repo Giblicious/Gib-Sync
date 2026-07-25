@@ -17,7 +17,7 @@ export default class GibSyncPlugin extends Plugin {
   private safeguardModalOpen=false;
   private nativeSyncBlocked=false;
   private nativeSyncNoticeShown=false;
-  private mobileSidebarEl:HTMLButtonElement|null=null;
+  private mobileSidebarEl:HTMLElement|null=null;
   private mobileTopEl:HTMLButtonElement|null=null;
   private mobileObserver:MutationObserver|null=null;
   private mobileMountScheduled=false;
@@ -77,10 +77,17 @@ export default class GibSyncPlugin extends Plugin {
     const state=this.indicatorState(),animate=this.settings.animateStatusIndicator&&state.animated;
     const kind=element.dataset.gibSyncIndicatorKind;
     const placement=kind?` gib-sync-mobile-${kind}-indicator`:"";
-    const fallback=element.dataset.gibSyncDrawerFallback==="true"?" is-drawer-fallback":"";
-    element.className=`gib-sync-indicator${placement} is-${state.tone} is-${state.key}${animate?" is-animated":""}${dotOnly?" is-dot-only":""}${fallback}`;
+    const nativeSidebar=kind==="sidebar";
+    const nativeClasses=nativeSidebar
+      ?` clickable-icon workspace-drawer-header-icon mod-raised sync-status-icon${state.tone==="success"?" mod-success":state.tone==="active"?" mod-working":state.tone==="error"?" mod-error":""}${animate?" mod-spin":""}`
+      :"";
+    element.className=`gib-sync-indicator${placement}${nativeClasses} is-${state.tone} is-${state.key}${animate?" is-animated":""}${dotOnly?" is-dot-only":""}`;
     element.empty();
     if(dotOnly)element.createSpan({cls:"gib-sync-indicator-dot"});
+    else if(nativeSidebar){
+      setIcon(element,state.icon);
+      if(this.settings.showAttentionBadge&&state.attentionCount>0)element.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});
+    }
     else{
       const icon=element.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);
       if(this.settings.showAttentionBadge&&state.attentionCount>0)element.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});
@@ -104,6 +111,8 @@ export default class GibSyncPlugin extends Plugin {
       menu.addItem((item)=>item.setTitle("Open status").setIcon("activity").onClick(()=>this.openStatusOverview()));
       menu.showAtMouseEvent(event);
     };
+    if(this.mobileSidebarEl?.isConnected)this.renderIndicator(this.mobileSidebarEl);
+    if(this.mobileTopEl?.isConnected)this.renderIndicator(this.mobileTopEl,true);
     this.scheduleMobileMount();
   }
   openStatusOverview(){new StatusOverviewModal(this.app,this).open();}
@@ -116,18 +125,30 @@ export default class GibSyncPlugin extends Plugin {
     }
     this.scheduleMobileMount();
   }
-  private mobileButton(kind:"sidebar"|"top"):HTMLButtonElement{
-    const key=kind==="sidebar"?"mobileSidebarEl":"mobileTopEl";let element=this[key];
+  private mobileButton():HTMLButtonElement{
+    let element=this.mobileTopEl;
     if(!element){
-      element=document.createElement("button");element.type="button";element.dataset.gibSyncIndicatorKind=kind;
+      element=document.createElement("button");element.type="button";element.dataset.gibSyncIndicatorKind="top";
       let timer:number|null=null,longPressed=false;
       const cancel=()=>{if(timer!==null)window.clearTimeout(timer);timer=null;};
       element.addEventListener("pointerdown",()=>{longPressed=false;timer=window.setTimeout(()=>{longPressed=true;void this.runSync();new Notice("Sync requested");},650);});
       element.addEventListener("pointerup",cancel);element.addEventListener("pointercancel",cancel);element.addEventListener("pointerleave",cancel);
       element.addEventListener("click",(event)=>{if(longPressed){event.preventDefault();longPressed=false;return;}this.openStatusOverview();});
-      this[key]=element;
+      this.mobileTopEl=element;
     }
-    this.renderIndicator(element,kind==="top");return element;
+    this.renderIndicator(element,true);return element;
+  }
+  private mountNativeMobileSidebarIndicator():HTMLElement|null{
+    if(this.mobileSidebarEl?.isConnected)return this.mobileSidebarEl;
+    this.mobileSidebarEl?.remove();this.mobileSidebarEl=null;
+    const rightSplit=(this.app.workspace as unknown as {rightSplit?:{addHeaderButton?:(icon:string,onClick:(event:MouseEvent)=>void)=>HTMLElement}}).rightSplit;
+    if(!rightSplit?.addHeaderButton)return null;
+    const element=rightSplit.addHeaderButton("sync-small",()=>this.openStatusOverview());
+    element.dataset.gibSyncIndicatorKind="sidebar";
+    element.addEventListener("contextmenu",(event)=>{event.preventDefault();void this.runSync();});
+    this.mobileSidebarEl=element;
+    this.renderIndicator(element);
+    return element;
   }
   private scheduleMobileMount(){
     if(!Platform.isMobile||this.mobileMountScheduled)return;
@@ -136,14 +157,10 @@ export default class GibSyncPlugin extends Plugin {
   private mountMobileIndicators(){
     if(!Platform.isMobile)return;
     if(this.settings.mobileSidebarIndicator){
-      const element=this.mobileButton("sidebar");
-      const nativeSlot=document.querySelector<HTMLElement>(".workspace-drawer.mod-right .status-bar, .workspace-drawer.mod-right .workspace-drawer-footer, .mod-right.workspace-drawer .status-bar");
-      const drawer=document.querySelector<HTMLElement>(".workspace-drawer.mod-right, .mod-right.workspace-drawer");
-      const host=nativeSlot??drawer;
-      if(host&&element.parentElement!==host){element.dataset.gibSyncDrawerFallback=String(!nativeSlot);this.renderIndicator(element);host.appendChild(element);}
-    }else this.mobileSidebarEl?.remove();
+      this.mountNativeMobileSidebarIndicator();
+    }else{this.mobileSidebarEl?.remove();this.mobileSidebarEl=null;}
     if(this.settings.mobileTopIndicator){
-      const element=this.mobileButton("top");
+      const element=this.mobileTopEl??this.mobileButton();
       const actions=Array.from(document.querySelectorAll<HTMLElement>(".mobile-navbar-action, .view-action, .view-header-icon"));
       const mode=actions.find((item)=>/reading view|editing mode|live preview|source mode|view mode|preview/i.test(`${item.getAttribute("aria-label")??""} ${item.getAttribute("data-tooltip")??""}`));
       const host=mode?.parentElement??document.querySelector<HTMLElement>(".mobile-navbar-actions, .workspace-leaf.mod-active .view-actions, .view-header .view-actions");

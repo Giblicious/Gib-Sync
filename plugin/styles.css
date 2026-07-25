@@ -44,12 +44,9 @@
 .gib-sync-desktop-status.is-animated .gib-sync-indicator-icon, .gib-sync-indicator.is-animated .gib-sync-indicator-icon { animation: gib-sync-spin 1.2s linear infinite; }
 .gib-sync-indicator-badge { position: absolute; top: -5px; right: -7px; min-width: 14px; height: 14px; padding: 0 3px; border: 2px solid var(--background-primary); border-radius: 8px; background: var(--color-orange); color: white; font-size: 9px; font-weight: 700; line-height: 10px; text-align: center; }
 .gib-sync-status-short-text { line-height: 1; }
-.gib-sync-indicator { position: relative; align-items: center; justify-content: center; appearance: none; min-width: 0; min-height: 0; margin: 0; border: 0; background: transparent; color: var(--text-normal); box-shadow: none; line-height: 1; vertical-align: middle; cursor: pointer; }
-.gib-sync-mobile-sidebar-indicator { display: inline-flex; flex: 0 0 24px; align-self: center; width: 24px; height: 24px; margin: 0 var(--size-2-1, 2px); padding: 4px; border-radius: 50%; box-sizing: border-box; }
-.gib-sync-mobile-sidebar-indicator:hover, .gib-sync-mobile-sidebar-indicator:focus-visible { background: var(--background-modifier-hover); }
-.gib-sync-mobile-sidebar-indicator:active { background: var(--background-modifier-active-hover); }
-.gib-sync-mobile-sidebar-indicator.is-drawer-fallback { position: absolute; right: max(var(--size-4-3, 12px), env(safe-area-inset-right)); bottom: max(var(--size-4-3, 12px), env(safe-area-inset-bottom)); z-index: var(--layer-popover); width: 32px; height: 32px; padding: 8px; border-radius: 50%; background: var(--background-secondary); box-shadow: var(--shadow-s); }
-.gib-sync-mobile-top-indicator { display: inline-flex; flex: 0 0 30px; width: 30px; height: 30px; padding: 9px; }
+.gib-sync-indicator:not(.gib-sync-mobile-sidebar-indicator) { position: relative; align-items: center; justify-content: center; cursor: pointer; }
+.gib-sync-mobile-sidebar-indicator.is-warning { color: var(--color-orange); }
+.gib-sync-mobile-top-indicator { display: inline-flex; appearance: none; flex: 0 0 30px; width: 30px; height: 30px; min-width: 0; min-height: 0; margin: 0; padding: 9px; border: 0; background: transparent; box-shadow: none; line-height: 1; vertical-align: middle; }
 .gib-sync-indicator-dot { width: 10px; height: 10px; border: 2px solid var(--text-muted); border-radius: 50%; background: transparent; box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-muted) 12%, transparent); }
 .gib-sync-indicator.is-success .gib-sync-indicator-dot { border-color: var(--color-green); background: var(--color-green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-green) 15%, transparent); }
 .gib-sync-indicator.is-active .gib-sync-indicator-dot { border-color: var(--interactive-accent); background: var(--interactive-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--interactive-accent) 15%, transparent); }
