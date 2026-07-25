@@ -21,6 +21,7 @@ export default class GibSyncPlugin extends Plugin {
   private mobileTopEl:HTMLButtonElement|null=null;
   private mobileObserver:MutationObserver|null=null;
   private mobileMountScheduled=false;
+  private mobileLayoutReady=!Platform.isMobile;
 
   async onload() {
     this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
@@ -58,6 +59,7 @@ export default class GibSyncPlugin extends Plugin {
     this.configureTimer();
     this.configureWatch();
     this.app.workspace.onLayoutReady(()=>{
+      this.mobileLayoutReady=true;
       this.configureStatusSurfaces();
       void this.checkObsidianSyncProtection();
       if(this.settings.deviceToken&&this.settings.autoSync)this.scheduleSync(2500);
@@ -69,6 +71,7 @@ export default class GibSyncPlugin extends Plugin {
     if(this.timer!==null)window.clearInterval(this.timer);
     if(this.debounce!==null)window.clearTimeout(this.debounce);
     this.mobileObserver?.disconnect();this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();
+    this.removeStaleMobileSidebarIndicators();
   }
   private attentionCount():number{return this.serverStatus?.safeguards.pendingQuarantines??0;}
   indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount());}
@@ -119,6 +122,7 @@ export default class GibSyncPlugin extends Plugin {
   configureStatusSurfaces(){
     this.updateStatusBar();
     if(!Platform.isMobile){this.mobileObserver?.disconnect();this.mobileObserver=null;this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();return;}
+    if(!this.mobileLayoutReady){this.removeStaleMobileSidebarIndicators();return;}
     if(!this.mobileObserver){
       this.mobileObserver=new MutationObserver(()=>this.scheduleMobileMount());
       this.mobileObserver.observe(document.body,{childList:true,subtree:true});
@@ -139,8 +143,12 @@ export default class GibSyncPlugin extends Plugin {
     this.renderIndicator(element,true);return element;
   }
   private mountNativeMobileSidebarIndicator():HTMLElement|null{
-    if(this.mobileSidebarEl?.isConnected)return this.mobileSidebarEl;
+    if(this.mobileSidebarEl?.isConnected){
+      this.removeStaleMobileSidebarIndicators(this.mobileSidebarEl);
+      return this.mobileSidebarEl;
+    }
     this.mobileSidebarEl?.remove();this.mobileSidebarEl=null;
+    this.removeStaleMobileSidebarIndicators();
     const rightSplit=(this.app.workspace as unknown as {rightSplit?:{addHeaderButton?:(icon:string,onClick:(event:MouseEvent)=>void)=>HTMLElement}}).rightSplit;
     if(!rightSplit?.addHeaderButton)return null;
     const element=rightSplit.addHeaderButton("sync-small",()=>this.openStatusOverview());
@@ -148,17 +156,22 @@ export default class GibSyncPlugin extends Plugin {
     element.addEventListener("contextmenu",(event)=>{event.preventDefault();void this.runSync();});
     this.mobileSidebarEl=element;
     this.renderIndicator(element);
+    this.removeStaleMobileSidebarIndicators(element);
     return element;
   }
+  private removeStaleMobileSidebarIndicators(keep?:HTMLElement){
+    document.querySelectorAll<HTMLElement>(".gib-sync-mobile-sidebar-indicator, [data-gib-sync-indicator-kind='sidebar']")
+      .forEach((element)=>{if(element!==keep)element.remove();});
+  }
   private scheduleMobileMount(){
-    if(!Platform.isMobile||this.mobileMountScheduled)return;
+    if(!Platform.isMobile||!this.mobileLayoutReady||this.mobileMountScheduled)return;
     this.mobileMountScheduled=true;window.requestAnimationFrame(()=>{this.mobileMountScheduled=false;this.mountMobileIndicators();});
   }
   private mountMobileIndicators(){
     if(!Platform.isMobile)return;
     if(this.settings.mobileSidebarIndicator){
       this.mountNativeMobileSidebarIndicator();
-    }else{this.mobileSidebarEl?.remove();this.mobileSidebarEl=null;}
+    }else{this.mobileSidebarEl?.remove();this.mobileSidebarEl=null;this.removeStaleMobileSidebarIndicators();}
     if(this.settings.mobileTopIndicator){
       const element=this.mobileTopEl??this.mobileButton();
       const actions=Array.from(document.querySelectorAll<HTMLElement>(".mobile-navbar-action, .view-action, .view-header-icon"));
