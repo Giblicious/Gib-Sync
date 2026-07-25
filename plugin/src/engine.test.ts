@@ -26,13 +26,13 @@ class MemoryAdapter {
 }
 
 class MemoryApi {
-  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;
+  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;lastCommitBody:any=null;
   async state() { return {head:this.head}; }
   async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new Error("missing");return snapshot; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
   async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"]}) {
-    this.commits++; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries};this.snapshots.set(this.head.id,this.head);return this.head;
+    this.commits++;this.lastCommitBody=body; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries};this.snapshots.set(this.head.id,this.head);return this.head;
   }
   async mirrorPlan(_snapshotId:string,entries:Snapshot["entries"]){return {uploadPaths:entries.filter((entry)=>!this.mirror.has(entry.path)).map((entry)=>entry.path),deletePaths:[],alreadyCurrent:false};}
   async putMirrorFile(_snapshotId:string,path:string,_hash:string,bytes:Uint8Array){this.mirror.set(path,bytes.slice());}
@@ -62,7 +62,28 @@ describe("SyncEngine", () => {
     adapter.files.set("note.md",local);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
     api.head={id:"00000000-0000-4000-8000-000000000201",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Shared",entries:[{path:"note.md",hash,size:remote.length,mtime:1}]};
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
-    await expect(engine.sync()).rejects.toThrow("New-device protection paused");expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(local);
+    await expect(engine.sync()).rejects.toThrow("Onboarding protection paused");expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(local);
+  });
+  it("blocks a returning device with local files when its verified baseline is unavailable",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("local\n"),remote=new TextEncoder().encode("remote\n"),hash=await hashBytes(remote);
+    config.initialized=true;config.lastSnapshotId="00000000-0000-4000-8000-000000000299";adapter.files.set("note.md",local);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
+    api.head={id:"00000000-0000-4000-8000-000000000300",vaultId:"vault",parentId:null,deviceId:"other",deviceName:"Other",createdAt:new Date().toISOString(),message:"Current",entries:[{path:"note.md",hash,size:remote.length,mtime:1}]};
+    await expect(new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync()).rejects.toThrow("last verified server snapshot is unavailable");
+    expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(local);
+  });
+  it("pulls safely when a returning device is empty even if its old baseline is unavailable",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),remote=new TextEncoder().encode("safe\n"),hash=await hashBytes(remote);
+    config.initialized=true;config.lastSnapshotId="00000000-0000-4000-8000-000000000298";api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
+    api.head={id:"00000000-0000-4000-8000-000000000301",vaultId:"vault",parentId:null,deviceId:"other",deviceName:"Other",createdAt:new Date().toISOString(),message:"Current",entries:[{path:"note.md",hash,size:remote.length,mtime:1}]};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.downloaded).toBe(1);expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(remote);
+  });
+  it("marks deletions made from an older verified baseline as stale",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),keep=new TextEncoder().encode("keep\n"),deleted=new TextEncoder().encode("delete\n"),added=new TextEncoder().encode("remote\n");
+    const keepHash=await hashBytes(keep),deletedHash=await hashBytes(deleted),addedHash=await hashBytes(added);const base:Snapshot={id:"00000000-0000-4000-8000-000000000302",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"keep.md",hash:keepHash,size:keep.length,mtime:1},{path:"deleted.md",hash:deletedHash,size:deleted.length,mtime:1}]};
+    api.head={...base,id:"00000000-0000-4000-8000-000000000303",parentId:base.id,entries:[...base.entries,{path:"remote.md",hash:addedHash,size:added.length,mtime:2}]};api.snapshots.set(base.id,base);api.blobs.set(keepHash,await encryptBlob(keep,config.vaultKey,keepHash));api.blobs.set(addedHash,await encryptBlob(added,config.vaultKey,addedHash));config.initialized=true;config.lastSnapshotId=base.id;adapter.files.set("keep.md",keep);
+    await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(api.lastCommitBody.signals.staleBaseline).toBe(true);expect(api.head?.entries.some((entry)=>entry.path==="deleted.md")).toBe(false);
   });
   it("restores the last accepted snapshot exactly after rejecting quarantined local changes",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),accepted=new TextEncoder().encode("accepted\n"),hash=await hashBytes(accepted);

@@ -46,8 +46,9 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
   const extensionChanges=moved.filter((item)=>extension(item.path)!==extension(item.previousPath??""));
   if(extensionChanges.length>=5)reasons.push(`${extensionChanges.length} files changed extension`);
   if(signals?.highEntropyPaths?.length)reasons.push(`${signals.highEntropyPaths.length} files resemble encrypted or high-entropy content`);
+  if(signals?.staleBaseline&&deleted.length)reasons.push(`A stale device would delete ${deleted.length} file${deleted.length===1?"":"s"}`);
   for(const protectedPath of policy.protectedPaths)if(changes.some((item)=>item.kind==="deleted"&&(item.path===protectedPath||item.path.startsWith(`${protectedPath}/`))))reasons.push(`Protected path ${protectedPath} would be deleted`);
-  if(previous.length>=5&&next.length===0)reasons.push("The device presented an unexpectedly empty vault");
+  if(previous.length&&next.length===0)reasons.push("A nonempty vault would become completely empty");
   return {assessment:{created:created.length,modified:modified.length,deleted:deleted.length,moved:moved.length,totalChanged,affectedPercent,bytesAdded,bytesRemoved,reasons:[...new Set(reasons)],examples:changes.slice(0,25)},changes};
 }
 

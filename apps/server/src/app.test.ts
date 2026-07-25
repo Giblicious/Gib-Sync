@@ -58,7 +58,8 @@ describe("Gib Sync API", () => {
     const mirrorPut=await app.inject({method:"PUT",url:"/v1/mirror/file?path=note.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":commit.json().id,"x-gib-sync-hash":hash},payload:readable});expect(mirrorPut.statusCode).toBe(204);
     const resumedPlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:commit.json().id,entries:commit.json().entries}});expect(resumedPlan.json()).toMatchObject({uploadPaths:[],alreadyCurrent:false});
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:commit.json().id}})).statusCode).toBe(200);
-    const emptyCommit=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.json().id,message:"Delete",entries:[]}});expect(emptyCommit.statusCode).toBe(201);
+    const emptyProposal=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.json().id,message:"Delete",entries:[]}});expect(emptyProposal.statusCode).toBe(423);
+    const emptyCommit=await app.inject({method:"POST",url:`/v1/quarantines/${emptyProposal.json().quarantine.id}/approve`,headers:auth,payload:{}});expect(emptyCommit.statusCode).toBe(201);
     const deletePlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:emptyCommit.json().id,entries:[]}});expect(deletePlan.json().deletePaths).toEqual(["note.md"]);
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:emptyCommit.json().id}})).statusCode).toBe(200);expect(storage.files.has(`read:${credentials.vaultId}:note.md`)).toBe(false);
     const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json();expect(pairing.code).toMatch(/^\d{5}$/);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
@@ -100,7 +101,9 @@ describe("Gib Sync API", () => {
     let state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.deviceName).toBe("Seafile");expect(state.head.entries).toMatchObject([{path:"external.md",hash:sha256(external)}]);
     storage.files.delete(`read:${credentials.vaultId}:external.md`);
     const deleted=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});
-    expect(deleted.json()).toMatchObject({snapshotId:expect.any(String),changedFiles:0,deletedFiles:1});
+    expect(deleted.json()).toMatchObject({snapshotId:null,changedFiles:0,deletedFiles:1,quarantineId:expect.any(String)});
+    state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.entries).toHaveLength(1);
+    expect((await app.inject({method:"POST",url:`/v1/quarantines/${deleted.json().quarantineId}/approve`,headers:auth,payload:{}})).statusCode).toBe(201);
     state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.entries).toEqual([]);
     await app.close();
   });
@@ -241,7 +244,8 @@ describe("Gib Sync API", () => {
     await app.inject({method:"POST",url:"/v1/safeguards/lock",headers:auth,payload:{locked:false}});
     const newcomer=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("New phone")})).json(),newAuth={authorization:`Bearer ${newcomer.deviceToken}`};
     expect((await app.inject({method:"POST",url:"/v1/commit",headers:newAuth,payload:{parentId:first.id,message:"Too early",entries:first.entries}})).statusCode).toBe(428);
-    await app.inject({method:"POST",url:"/v1/devices/current/ready",headers:newAuth,payload:{}});
+    expect((await app.inject({method:"POST",url:"/v1/devices/current/ready",headers:newAuth,payload:{headId:null}})).statusCode).toBe(409);
+    expect((await app.inject({method:"POST",url:"/v1/devices/current/ready",headers:newAuth,payload:{headId:first.id}})).statusCode).toBe(200);
     expect((await app.inject({method:"POST",url:`/v1/devices/${newcomer.deviceId}/revoke`,headers:auth,payload:{}})).statusCode).toBe(200);
     expect((await app.inject({method:"GET",url:"/v1/status",headers:newAuth})).statusCode).toBe(401);
     await app.close();

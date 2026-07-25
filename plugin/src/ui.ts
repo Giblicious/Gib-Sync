@@ -3,6 +3,7 @@ import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, 
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
 import { shouldSyncChangedPath } from "./settings";
+import { privacySafeDiagnostics } from "./diagnostics";
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -55,13 +56,13 @@ export class SetupModal extends Modal {
     mobileContent(this.contentEl);
     this.setTitle("Connect Gib Sync");
     this.contentEl.createEl("p",{text:"Choose the Seafile account, library, and folder for this vault. Using the same location on another device reconnects it manually. Your password is exchanged for a Seafile API token and is never saved in Obsidian."});
-    let server=this.plugin.settings.serverUrl||"https://sync.example.com";
-    let seafileUrl=this.plugin.settings.storage?.seafileUrl||"https://seafile.example.com";
+    let server=this.plugin.settings.serverUrl||"";
+    let seafileUrl=this.plugin.settings.storage?.seafileUrl||"";
     let username=this.plugin.settings.storage?.username||"";let password="";let vaultName=this.app.vault.getName();let deviceName=defaultDeviceName();
     let libraryId="";let libraryName="";let basePath=this.plugin.settings.storage?.basePath||`/Obsidian/${vaultName}`;let existingVaultId:string|undefined;let libraries:SeafileLibrary[]=[];let existingVaults:ExistingVaultLocation[]=[];
     let pathInput!:HTMLInputElement;let vaultInput!:HTMLInputElement;
-    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setValue(server).onChange((value)=>server=value.trim()));
-    new Setting(this.contentEl).setName("Seafile server").addText((text)=>text.setValue(seafileUrl).onChange((value)=>seafileUrl=value.trim()));
+    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setPlaceholder("https://sync.example.com").setValue(server).onChange((value)=>server=value.trim()));
+    new Setting(this.contentEl).setName("Seafile server").addText((text)=>text.setPlaceholder("https://seafile.example.com").setValue(seafileUrl).onChange((value)=>seafileUrl=value.trim()));
     new Setting(this.contentEl).setName("Seafile account").addText((text)=>text.setPlaceholder("you@example.com").setValue(username).onChange((value)=>username=value.trim()));
     new Setting(this.contentEl).setName("Seafile password").setDesc("Used only during this connection request.").addText((text)=>{text.inputEl.type="password";text.onChange((value)=>password=value);});
     const librarySetting=new Setting(this.contentEl).setName("Seafile library").setDesc("Load the libraries available to this account.");
@@ -105,9 +106,9 @@ export class QuickCodeDisplayModal extends Modal {
 
 export class QuickCodeEntryModal extends Modal {
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
-  onOpen(){mobileContent(this.contentEl);this.setTitle("Enter quick code");let server=this.plugin.settings.serverUrl||"https://sync.example.com";let code="";let deviceName=defaultDeviceName();
+  onOpen(){mobileContent(this.contentEl);this.setTitle("Enter quick code");let server=this.plugin.settings.serverUrl||"";let code="";let deviceName=defaultDeviceName();
     this.contentEl.createEl("p",{text:"On an already connected device, choose “Show quick code,” then type that temporary code here."});
-    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setValue(server).onChange((value)=>server=value.trim()));
+    new Setting(this.contentEl).setName("Gib Sync server").addText((text)=>text.setPlaceholder("https://sync.example.com").setValue(server).onChange((value)=>server=value.trim()));
     new Setting(this.contentEl).setName("Quick code").setDesc("Five numbers. The code changes every 60 seconds.").addText((text)=>{text.setPlaceholder("12345").onChange((value)=>code=value);text.inputEl.inputMode="numeric";text.inputEl.pattern="[0-9]*";text.inputEl.autocomplete="one-time-code";text.inputEl.maxLength=5;});
     new Setting(this.contentEl).setName("Device name").addText((text)=>text.setValue(deviceName).onChange((value)=>deviceName=value.trim()));
     new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Connect").onClick(async()=>{button.setDisabled(true).setButtonText("Connecting…");
@@ -248,17 +249,17 @@ export class GibSyncSettingTab extends PluginSettingTab {
     new Setting(this.containerEl).setName("Sync when files change").setDesc("Detects editor changes plus created, saved, renamed, and deleted files. After editing stops, waits two seconds for Obsidian to save and then syncs. Excluded paths do not trigger it.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncOnFileChange).onChange(async(value)=>{this.plugin.settings.syncOnFileChange=value;this.plugin.configureFileChangeSync();await this.plugin.saveSettings();}));
     new Setting(this.containerEl).setName("Sync Obsidian configuration").setDesc("Includes themes, snippets, hotkeys, and other .obsidian settings. Installed plugins are controlled separately. Disabling it previews which files this device will ignore.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async(value)=>{
       if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,value,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
-      this.plugin.settings.syncObsidianConfig=value;this.plugin.settings.lastSnapshotId=null;await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
+      this.plugin.settings.syncObsidianConfig=value;await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
     new Setting(this.containerEl).setName("Sync installed plugins").setDesc("Includes community plugin folders and the enabled-plugin list on every device, except Gib Sync itself. Desktop-only plugins are safely ignored by Obsidian mobile. Plugin data.json files may contain API keys and also appear in readable Seafile. Reload Obsidian after receiving plugin updates.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncPlugins).onChange(async(value)=>{
       if(!value&&this.plugin.settings.syncPlugins&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig,value)){toggle.setValue(true);return;}
-      this.plugin.settings.syncPlugins=value;this.plugin.settings.lastSnapshotId=null;await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
+      this.plugin.settings.syncPlugins=value;await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
     let proposedExclusions=this.plugin.settings.exclusions.join("\n");
     new Setting(this.containerEl).setName("Excluded path prefixes").setDesc("The device-local ignore list. Ignored remote files remain safe for other devices. Changes are previewed; use one prefix per line.")
       .addTextArea((area)=>area.setValue(proposedExclusions).onChange((value)=>proposedExclusions=value))
       .addButton((button)=>button.setButtonText("Preview and apply").onClick(async()=>{const next=proposedExclusions.split("\n").map((line)=>line.trim()).filter(Boolean);button.setDisabled(true);
-        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){this.plugin.settings.exclusions=next;this.plugin.settings.lastSnapshotId=null;await this.plugin.saveSettings();new Notice("Ignore list updated; ignored remote files remain safe for other devices");if(configured)void this.plugin.runSync();}}finally{button.setDisabled(false);}}));
+        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){this.plugin.settings.exclusions=next;await this.plugin.saveSettings();new Notice("Ignore list updated; ignored remote files remain safe for other devices");if(configured)void this.plugin.runSync();}}finally{button.setDisabled(false);}}));
     if(configured)new Setting(this.containerEl).setName("Safety center").setDesc("Review held changes, tune mass-change protection, manage devices, or freeze all remote writes.")
       .addButton((button)=>button.setButtonText("Review held changes").onClick(()=>this.plugin.openSafeguards()))
       .addButton((button)=>button.setButtonText("Safeguard settings").onClick(()=>new SafeguardSettingsModal(this.app,this.plugin).open()))
@@ -291,7 +292,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
       item("Mass-change protection",`${server.safeguards.policy.mode} · ${server.safeguards.pendingQuarantines} held`);item("Remote writes",server.safeguards.writeLocked?`Frozen by ${server.safeguards.writeLockedBy??"a device"}`:server.safeguards.trustedUntil?`Trusted until ${when(server.safeguards.trustedUntil)}`:"Protected");
       if(server.healthAlerts.length){const alerts=root.createDiv({cls:"gib-sync-health-alerts"});alerts.createEl("strong",{text:"Health notifications"});for(const alert of server.healthAlerts.slice(0,8))alerts.createDiv({cls:`gib-sync-health-alert is-${alert.level}`,text:alert.message});}
     }
-    const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();const copyButton=buttons.createEl("button",{text:"Copy diagnostics"});copyButton.onclick=async()=>{const copied=await copyText(JSON.stringify({generatedAt:new Date().toISOString(),live,server,connection:{serverUrl:this.plugin.settings.serverUrl,vaultId:this.plugin.settings.vaultId,deviceId:this.plugin.settings.deviceId,storage}},null,2));new Notice(copied?"Gib Sync diagnostics copied (no passwords, keys, or tokens)":"Clipboard access is unavailable on this device.",copied?4000:8000);};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
+    const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();const copyButton=buttons.createEl("button",{text:"Copy diagnostics"});copyButton.onclick=async()=>{const copied=await copyText(JSON.stringify(privacySafeDiagnostics(live,server,{configured:Boolean(this.plugin.settings.deviceToken),storageConfigured:Boolean(storage)}),null,2));new Notice(copied?"Privacy-safe Gib Sync diagnostics copied":"Clipboard access is unavailable on this device.",copied?4000:8000);};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
     const log=activity.createDiv({cls:"gib-sync-activity-log"});for(const entry of [...live.activities].reverse().slice(0,30)){const row=log.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}if(!live.activities.length)log.createEl("div",{cls:"gib-sync-muted",text:"Activity will appear here as Gib Sync works."});
   }
 }

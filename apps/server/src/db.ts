@@ -50,6 +50,7 @@ export class Store {
     if(!currentVaultColumns.has("trusted_device_id"))this.db.exec("ALTER TABLE vaults ADD COLUMN trusted_device_id TEXT");
     const deviceColumns=new Set(this.all<{name:string}>("PRAGMA table_info(devices)").map((row)=>row.name));
     if(!deviceColumns.has("initial_sync_complete")){this.db.exec("ALTER TABLE devices ADD COLUMN initial_sync_complete INTEGER NOT NULL DEFAULT 0");this.db.exec("UPDATE devices SET initial_sync_complete=1");}
+    if(!deviceColumns.has("initial_sync_head_id"))this.db.exec("ALTER TABLE devices ADD COLUMN initial_sync_head_id TEXT");
     if(!deviceColumns.has("clock_skew_ms"))this.db.exec("ALTER TABLE devices ADD COLUMN clock_skew_ms INTEGER NOT NULL DEFAULT 0");
   }
   one<T>(sql: string, ...params: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...params) as T | undefined; }

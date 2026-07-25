@@ -268,7 +268,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     store.run("UPDATE quarantines SET status='approved',resolved_at=?,resolved_by=? WHERE id=?",new Date().toISOString(),device.id,id);
     safeguards.event(device.vault_id,"quarantine_approved","info",`Suspicious changes were approved by ${device.name}`);return reply.code(201).send(snapshot);
   });
-  app.post("/v1/devices/current/ready",async(request)=>{const device=await authenticate(request);store.run("UPDATE devices SET initial_sync_complete=1 WHERE id=?",device.id);return {ok:true};});
+  app.post("/v1/devices/current/ready",async(request,reply)=>{
+    const device=await authenticate(request),headId=z.object({headId:z.string().uuid().nullable().optional()}).parse(request.body).headId;
+    const current=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!.head_id;
+    if(headId!==undefined&&current!==headId)return reply.conflict("Vault changed before this device finished verifying its first download");
+    store.run("UPDATE devices SET initial_sync_complete=1,initial_sync_head_id=? WHERE id=?",headId??current,device.id);return {ok:true};
+  });
   app.post("/v1/devices/:id/revoke",async(request,reply)=>{
     const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;
     const target=store.one<{id:string;name:string}>("SELECT id,name FROM devices WHERE id=? AND vault_id=? AND revoked_at IS NULL",id,device.vault_id);if(!target)return reply.notFound();
@@ -364,7 +369,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device = await authenticate(request);
     await ingestExternalChanges(device.vault_id);
     const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),
-      clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),vaultIdentity:z.string().max(500).optional()}).optional() }).parse(request.body) as CommitRequest;
+      clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),vaultIdentity:z.string().max(500).optional(),staleBaseline:z.boolean().optional()}).optional() }).parse(request.body) as CommitRequest;
     if(body.clientTime){const skew=Date.parse(body.clientTime)-Date.now();store.run("UPDATE devices SET clock_skew_ms=? WHERE id=?",Number.isFinite(skew)?Math.round(skew):0,device.id);}
     const missing = body.entries.filter((entry) => !store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, entry.hash));
     if (missing.length) return reply.code(422).send({ error: "Missing blobs", hashes: missing.slice(0,100).map((e) => e.hash) });

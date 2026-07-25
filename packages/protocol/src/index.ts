@@ -161,6 +161,7 @@ export interface SafeguardPolicy {
 export interface ClientSafetySignals {
   highEntropyPaths?: string[];
   vaultIdentity?: string;
+  staleBaseline?: boolean;
 }
 
 export interface ChangeItem {

@@ -12,7 +12,14 @@ describe("safeguard assessment",()=>{
   it("quarantines mass deletion and unexpectedly empty vaults",()=>{
     const before=Array.from({length:20},(_,index)=>entry(`note-${index}.md`,String(index%10)));
     const result=assessChanges(before,[],BALANCED_POLICY);
-    expect(result.assessment.deleted).toBe(20);expect(result.assessment.reasons.join(" ")).toContain("unexpectedly empty");
+    expect(result.assessment.deleted).toBe(20);expect(result.assessment.reasons).toContain("A nonempty vault would become completely empty");
+  });
+  it("quarantines complete deletion even for a one-file vault",()=>{
+    expect(assessChanges([entry("only.md","a")],[],BALANCED_POLICY).assessment.reasons).toContain("A nonempty vault would become completely empty");
+  });
+  it("flags even one deletion when it comes from a stale baseline",()=>{
+    const result=assessChanges([entry("keep.md","a"),entry("delete.md","b")],[entry("keep.md","a")],BALANCED_POLICY,{staleBaseline:true});
+    expect(result.assessment.reasons).toContain("A stale device would delete 1 file");
   });
   it("always flags deletion of a protected path",()=>{
     const policy=policyFor("balanced",{protectedPaths:["Critical"]});

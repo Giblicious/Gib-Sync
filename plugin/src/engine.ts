@@ -147,12 +147,16 @@ export class SyncEngine {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
     this.status({phase:"scanning",message:"Listing local vault files"}); const local = await this.scan();
     this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
-    if(!settings.initialized&&remoteSnapshot&&local.size){
+    const requestedBaseId=settings.lastSnapshotId;
+    const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
+    if(settings.initialized&&requestedBaseId&&!baseSnapshot&&local.size){
+      throw new Error("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
+    }
+    if(remoteSnapshot&&!baseSnapshot&&local.size){
       const remoteHashes=new Map(remoteSnapshot.entries.map((entry)=>[entry.path,entry.hash]));
       const unexpected=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)!==entry.hash);
-      if(unexpected.length)throw new Error(`New-device protection paused the first upload because this vault already contains ${unexpected.length} file${unexpected.length===1?"":"s"} that differ from the shared vault. Review the vault location before replacing or merging anything.`);
+      if(unexpected.length)throw new Error(`Onboarding protection paused sync because this server vault already has history and the local vault contains ${unexpected.length} unverified file${unexpected.length===1?"":"s"}. No files were uploaded or deleted. Verify that you opened the intended local and server vaults.`);
     }
-    const baseSnapshot = settings.lastSnapshotId ? await this.api.snapshot(settings.lastSnapshotId).catch(() => null) : null;
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
@@ -229,7 +233,7 @@ export class SyncEngine {
     const highEntropyPaths=entries.filter((entry)=>this.text(entry.path)&&!remoteEntries.some((remoteEntry)=>remoteEntry.path===entry.path&&remoteEntry.hash===entry.hash))
       .filter((entry)=>{const clear=bytes.get(entry.hash);return clear?this.entropy(clear)>7.2:false;}).map((entry)=>entry.path);
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,
-      clientTime:new Date().toISOString(),signals:{highEntropyPaths,vaultIdentity:settings.vaultIdentity} });}
+      clientTime:new Date().toISOString(),signals:{highEntropyPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
     settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
