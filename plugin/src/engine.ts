@@ -3,7 +3,7 @@ import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import type { GibSyncSettings, SyncPhase } from "./settings";
+import { shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
@@ -42,10 +42,7 @@ export class SyncEngine {
   }
 
   private include(path: string): boolean {
-    const settings = this.getSettings(); const normalized = normalizePath(path);
-    if(normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
-    if (!settings.syncObsidianConfig && (normalized === ".obsidian" || normalized.startsWith(".obsidian/"))) return false;
-    return !settings.exclusions.some((prefix) => normalized === prefix.replace(/\/$/, "") || normalized.startsWith(prefix));
+    return shouldSyncChangedPath(normalizePath(path),this.getSettings());
   }
 
   private async listFiles(path = ""): Promise<string[]> {

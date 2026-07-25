@@ -1,5 +1,6 @@
 import { describe,expect,it } from "vitest";
-import { DEFAULT_SETTINGS,shouldSyncChangedPath } from "./settings";
+import type { Plugin } from "obsidian";
+import { DEFAULT_SETTINGS,loadSettings,shouldSyncChangedPath } from "./settings";
 
 describe("file-change sync filtering",()=>{
   it("syncs ordinary vault files and normalizes Windows separators",()=>{
@@ -10,13 +11,32 @@ describe("file-change sync filtering",()=>{
   it("ignores Gib Sync data, Obsidian config, and excluded paths",()=>{
     expect(shouldSyncChangedPath(".gib-sync/state.json",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/workspace.json",DEFAULT_SETTINGS)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",DEFAULT_SETTINGS)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/community-plugins.json",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".trash/deleted.md",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".githubish/note.md",DEFAULT_SETTINGS)).toBe(true);
   });
 
-  it("allows Obsidian config except the plugin's own excluded directory when enabled",()=>{
+  it("separates Obsidian configuration from installed plugins",()=>{
     const settings={...DEFAULT_SETTINGS,syncObsidianConfig:true};
     expect(shouldSyncChangedPath(".obsidian/themes/theme.css",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(false);
+  });
+
+  it("syncs plugin code, settings, and enablement without other workspace state",()=>{
+    const settings={...DEFAULT_SETTINGS,syncPlugins:true};
+    expect(shouldSyncChangedPath(".obsidian",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/plugins",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/plugins/calendar/data.json",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/workspace.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/gib-sync/data.json",settings)).toBe(false);
+  });
+
+  it("preserves legacy plugin inclusion when upgrading an existing config-sync user",async()=>{
+    const plugin={loadData:async()=>({syncObsidianConfig:true})} as unknown as Plugin;
+    await expect(loadSettings(plugin)).resolves.toMatchObject({syncObsidianConfig:true,syncPlugins:true});
   });
 });

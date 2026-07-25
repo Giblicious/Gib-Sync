@@ -2,6 +2,7 @@ import { App, Modal, Notice, Platform, PluginSettingTab, Setting } from "obsidia
 import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, QuarantineItem, SafeguardPolicy, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
+import { shouldSyncChangedPath } from "./settings";
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -158,15 +159,19 @@ export class GibSyncSettingTab extends PluginSettingTab {
     new Setting(this.containerEl).setName("Instant incoming sync").setDesc("The server notifies this device when another device changes the vault. The periodic interval remains a safety check.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.instantReceive).onChange(async(value)=>{this.plugin.settings.instantReceive=value;await this.plugin.saveSettings();this.plugin.configureWatch();}));
     new Setting(this.containerEl).setName("Sync interval").setDesc("Seconds between periodic checks (minimum 15).").addText((text)=>text.setValue(String(this.plugin.settings.syncIntervalSeconds)).onChange(async(value)=>{const parsed=Number(value);if(Number.isFinite(parsed)){this.plugin.settings.syncIntervalSeconds=Math.max(15,Math.round(parsed));await this.plugin.saveSettings();this.plugin.configureTimer();}}));
     new Setting(this.containerEl).setName("Sync when files change").setDesc("Detects editor changes plus created, saved, renamed, and deleted files. After editing stops, waits two seconds for Obsidian to save and then syncs. Excluded paths do not trigger it.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncOnFileChange).onChange(async(value)=>{this.plugin.settings.syncOnFileChange=value;this.plugin.configureFileChangeSync();await this.plugin.saveSettings();}));
-    new Setting(this.containerEl).setName("Sync Obsidian configuration").setDesc("Includes .obsidian except Gib Sync's own directory. Disabling it previews any remote removals first.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async(value)=>{
-      if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,value)){toggle.setValue(true);return;}
+    new Setting(this.containerEl).setName("Sync Obsidian configuration").setDesc("Includes themes, snippets, hotkeys, and other .obsidian settings. Installed plugins are controlled separately. Disabling it previews remote removals first.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async(value)=>{
+      if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,value,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
       this.plugin.settings.syncObsidianConfig=value;await this.plugin.saveSettings();
+    }));
+    new Setting(this.containerEl).setName("Sync installed plugins").setDesc("Includes community plugin folders and the enabled-plugin list on every device, except Gib Sync itself. Plugin data.json files may contain API keys and will also appear in the readable Seafile copy. Disabling it previews remote removals first.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncPlugins).onChange(async(value)=>{
+      if(!value&&this.plugin.settings.syncPlugins&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig,value)){toggle.setValue(true);return;}
+      this.plugin.settings.syncPlugins=value;await this.plugin.saveSettings();
     }));
     let proposedExclusions=this.plugin.settings.exclusions.join("\n");
     new Setting(this.containerEl).setName("Excluded path prefixes").setDesc("Changes are previewed before they can remove files from the shared vault. One prefix per line.")
       .addTextArea((area)=>area.setValue(proposedExclusions).onChange((value)=>proposedExclusions=value))
       .addButton((button)=>button.setButtonText("Preview and apply").onClick(async()=>{const next=proposedExclusions.split("\n").map((line)=>line.trim()).filter(Boolean);button.setDisabled(true);
-        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncObsidianConfig)){this.plugin.settings.exclusions=next;await this.plugin.saveSettings();new Notice("Exclusions updated");}}finally{button.setDisabled(false);}}));
+        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){this.plugin.settings.exclusions=next;await this.plugin.saveSettings();new Notice("Exclusions updated");}}finally{button.setDisabled(false);}}));
     if(configured)new Setting(this.containerEl).setName("Safety center").setDesc("Review held changes, tune mass-change protection, manage devices, or freeze all remote writes.")
       .addButton((button)=>button.setButtonText("Review held changes").onClick(()=>this.plugin.openSafeguards()))
       .addButton((button)=>button.setButtonText("Safeguard settings").onClick(()=>new SafeguardSettingsModal(this.app,this.plugin).open()))
@@ -179,14 +184,12 @@ export class GibSyncSettingTab extends PluginSettingTab {
     if(configured)void this.plugin.refreshServerStatus();
   }
   hide(){this.unsubscribe?.();this.unsubscribe=null;}
-  private included(path:string,exclusions:string[],syncConfig:boolean):boolean{
-    const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");if(normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
-    if(!syncConfig&&(normalized===".obsidian"||normalized.startsWith(".obsidian/")))return false;
-    return !exclusions.some((prefix)=>{const value=prefix.replace(/\\/g,"/").replace(/^\/+/,"").replace(/\/+$/,"");return value&&(normalized===value||normalized.startsWith(`${value}/`));});
+  private included(path:string,exclusions:string[],syncConfig:boolean,syncPlugins:boolean):boolean{
+    return shouldSyncChangedPath(path,{...this.plugin.settings,exclusions,syncObsidianConfig:syncConfig,syncPlugins});
   }
-  private async confirmFilterChange(exclusions:string[],syncConfig:boolean):Promise<boolean>{
+  private async confirmFilterChange(exclusions:string[],syncConfig:boolean,syncPlugins:boolean):Promise<boolean>{
     if(!this.plugin.settings.deviceToken)return true;const head=(await this.plugin.api.state()).head;if(!head)return true;
-    const affected=head.entries.filter((entry)=>this.included(entry.path,this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig)&&!this.included(entry.path,exclusions,syncConfig));
+    const affected=head.entries.filter((entry)=>this.included(entry.path,this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)&&!this.included(entry.path,exclusions,syncConfig,syncPlugins));
     if(!affected.length)return true;const examples=affected.slice(0,10).map((entry)=>`- ${entry.path}`).join("\n");
     return confirm(`This filter change would remove ${affected.length} file${affected.length===1?"":"s"} from the shared vault on the next sync:\n\n${examples}${affected.length>10?`\n- …and ${affected.length-10} more`:""}\n\nMass-change protection may also quarantine the operation. Apply this filter?`);
   }

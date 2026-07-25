@@ -14,14 +14,14 @@ export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
   lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean;
-  syncIntervalSeconds: number; syncObsidianConfig: boolean; exclusions: string[];
+  syncIntervalSeconds: number; syncObsidianConfig: boolean; syncPlugins: boolean; exclusions: string[];
   vaultIdentity: string;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, syncIntervalSeconds: 60, syncObsidianConfig: false, syncPlugins: false,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -29,13 +29,24 @@ export const initialLiveStatus = (configured:boolean): LiveSyncStatus => ({ phas
   startedAt:null,completedAt:null,lastSuccessAt:null,lastErrorAt:null,lastError:"",lastResult:"",nextSyncAt:null,activities:[] });
 
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
-  return Object.assign({}, DEFAULT_SETTINGS, await plugin.loadData());
+  const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
+  const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
+  // Before this setting existed, enabling Obsidian configuration also included
+  // plugins. Preserve that behavior for existing users so an upgrade cannot
+  // silently remove their remotely synchronized plugin directories.
+  if(stored?.syncPlugins===undefined&&stored?.syncObsidianConfig===true)settings.syncPlugins=true;
+  return settings;
 }
 
 export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): boolean {
   const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
-  if(!settings.syncObsidianConfig&&(normalized===".obsidian"||normalized.startsWith(".obsidian/")))return false;
+  if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
+  const obsidianRoot=normalized===".obsidian";
+  const pluginPath=normalized===".obsidian/plugins"||normalized.startsWith(".obsidian/plugins/")||normalized===".obsidian/community-plugins.json";
+  if(obsidianRoot&&!settings.syncObsidianConfig&&!settings.syncPlugins)return false;
+  if(pluginPath&&!settings.syncPlugins)return false;
+  if(!pluginPath&&!obsidianRoot&&!settings.syncObsidianConfig&&normalized.startsWith(".obsidian/"))return false;
   return !settings.exclusions.some((prefix)=>{
     const excluded=prefix.replace(/\\/g,"/").replace(/^\/+/,"").replace(/\/+$/,"");
     return Boolean(excluded)&&(normalized===excluded||normalized.startsWith(`${excluded}/`));

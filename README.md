@@ -53,7 +53,9 @@ Simultaneous edits use a lossless three-way policy:
 
 The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
 
-`.obsidian` is excluded by default because workspace state is often device-specific. Enable **Sync Obsidian configuration** if it should be part of the synchronized and readable recovery tree. Explicit exclusions are omitted from both representations.
+`.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes themes, snippets, hotkeys, and other settings. **Sync installed plugins** independently includes community plugin folders and `community-plugins.json`, while always excluding Gib Sync's own directory so the running synchronizer cannot overwrite itself. Plugin `data.json` files can contain API keys and are copied to the readable Seafile tree when plugin sync is enabled. Explicit exclusions are omitted from both representations.
+
+**Excluded path prefixes** is the ignore list. A prefix ignores that file or complete directory subtree in both device synchronization and the readable Seafile recovery copy.
 
 ## Deployment
 
