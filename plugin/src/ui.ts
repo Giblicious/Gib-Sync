@@ -3,7 +3,7 @@ import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, 
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
 import { shouldSyncChangedPath } from "./settings";
-import { privacySafeDiagnostics } from "./diagnostics";
+import { detailedDiagnostics,privacySafeDiagnostics } from "./diagnostics";
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -293,7 +293,9 @@ export class GibSyncSettingTab extends PluginSettingTab {
       item("Mass-change protection",`${server.safeguards.policy.mode} · ${server.safeguards.pendingQuarantines} held`);item("Remote writes",server.safeguards.writeLocked?`Frozen by ${server.safeguards.writeLockedBy??"a device"}`:server.safeguards.trustedUntil?`Trusted until ${when(server.safeguards.trustedUntil)}`:"Protected");
       if(server.healthAlerts.length){const alerts=root.createDiv({cls:"gib-sync-health-alerts"});alerts.createEl("strong",{text:"Health notifications"});for(const alert of server.healthAlerts.slice(0,8))alerts.createDiv({cls:`gib-sync-health-alert is-${alert.level}`,text:alert.message});}
     }
-    const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();const copyButton=buttons.createEl("button",{text:"Copy diagnostics"});copyButton.onclick=async()=>{const copied=await copyText(JSON.stringify(privacySafeDiagnostics(live,server,{configured:Boolean(this.plugin.settings.deviceToken),storageConfigured:Boolean(storage)}),null,2));new Notice(copied?"Privacy-safe Gib Sync diagnostics copied":"Clipboard access is unavailable on this device.",copied?4000:8000);};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
+    const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();
+    const detailed=buttons.createEl("button",{text:"Copy detailed log",attr:{title:"Includes vault-relative file names, merge decisions, and errors; excludes credentials and server addresses"}});detailed.onclick=async()=>{const copied=await copyText(JSON.stringify(detailedDiagnostics(live,server,{configured:Boolean(this.plugin.settings.deviceToken),storageConfigured:Boolean(storage)}),null,2));new Notice(copied?"Detailed Gib Sync log copied; review vault-relative file names before sharing":"Clipboard access is unavailable on this device.",copied?6000:8000);};
+    const safe=buttons.createEl("button",{text:"Copy safe log",attr:{title:"Removes activity text and file names for public sharing"}});safe.onclick=async()=>{const copied=await copyText(JSON.stringify(privacySafeDiagnostics(live,server,{configured:Boolean(this.plugin.settings.deviceToken),storageConfigured:Boolean(storage)}),null,2));new Notice(copied?"Privacy-safe Gib Sync log copied":"Clipboard access is unavailable on this device.",copied?4000:8000);};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
     const log=activity.createDiv({cls:"gib-sync-activity-log"});for(const entry of [...live.activities].reverse().slice(0,30)){const row=log.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}if(!live.activities.length)log.createEl("div",{cls:"gib-sync-muted",text:"Activity will appear here as Gib Sync works."});log.scrollTop=wasAtTop?0:previousScroll;
   }
 }

@@ -1,7 +1,7 @@
 import { describe,expect,it } from "vitest";
 import type { ServerStatus } from "@gib-sync/protocol";
 import { initialLiveStatus } from "./settings";
-import { privacySafeDiagnostics } from "./diagnostics";
+import { detailedDiagnostics,privacySafeDiagnostics } from "./diagnostics";
 
 describe("privacy-safe diagnostics",()=>{
   it("does not copy personal endpoints, identities, paths, or activity text",()=>{
@@ -12,5 +12,10 @@ describe("privacy-safe diagnostics",()=>{
       healthAlerts:[{code:`stale_device:${secret}`,level:"warning",message:secret,at:new Date(0).toISOString()}],devices:[{id:secret,name:secret,createdAt:new Date(0).toISOString(),lastSeenAt:new Date(0).toISOString(),revokedAt:null,ready:true,clockSkewMs:0,current:true}]} as ServerStatus;
     const copied=JSON.stringify(privacySafeDiagnostics(live,server,{configured:true,storageConfigured:true}));
     expect(copied).not.toContain(secret);expect(copied).not.toContain("username");expect(copied).not.toContain("vaultId");expect(copied).not.toContain("deviceId");expect(copied).not.toContain("path");
+  });
+  it("offers a useful opt-in detailed log without connection secrets",()=>{
+    const live=initialLiveStatus(true);live.message="Merging Notes/example.md";live.lastError="RangeError from https://private.example/v1";live.activities=[{at:new Date(0).toISOString(),phase:"merging",level:"info",message:"Three-way merge · Notes/example.md"}];
+    const copied=JSON.stringify(detailedDiagnostics(live,null,{configured:true,storageConfigured:true}));
+    expect(copied).toContain("Notes/example.md");expect(copied).toContain("RangeError");expect(copied).toContain("vault-relative file names");expect(copied).not.toContain("private.example");
   });
 });

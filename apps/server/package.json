@@ -1,6 +1,6 @@
 {
   "name": "@gib-sync/server",
-  "version": "0.8.8",
+  "version": "0.8.9",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -14,7 +14,7 @@
     "@fastify/cors": "^11.1.0",
     "@fastify/multipart": "^9.2.1",
     "@fastify/sensible": "^6.0.3",
-    "@gib-sync/protocol": "0.8.8",
+    "@gib-sync/protocol": "0.8.9",
     "diff": "^8.0.2",
     "fastify": "^5.5.0",
     "zod": "^4.1.5"

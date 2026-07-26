@@ -3,7 +3,10 @@ import { diffArrays } from "diff";
 type Side = "local" | "remote";
 type Hunk = { start: number; remove: number; add: string[]; side: Side };
 export type MergeKind = "merged" | "small-overlap" | "large-conflict";
-export type MergeResult = { text: string; conflicted: boolean; kind: MergeKind; overlapWords: number; overlapLines: number };
+export type MergeResult = { text: string; conflicted: boolean; kind: MergeKind|"merge-fallback"; overlapWords: number; overlapLines: number; reason?:string };
+
+const MAX_AUTO_MERGE_CHARACTERS=4_000_000;
+const MAX_AUTO_MERGE_TOKENS=250_000;
 
 const word = /[\p{L}\p{N}_]/u;
 const tokenize = (value: string): string[] => value.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) ?? [];
@@ -68,23 +71,38 @@ function affectedLines(base:string[],component:Hunk[]):Set<number>{
 
 export function mergeText(baseText: string, localText: string, remoteText: string, preferred: Side): MergeResult {
   const done = (text: string): MergeResult => ({ text, conflicted: false, kind: "merged", overlapWords: 0, overlapLines: 0 });
+  const fallback = (reason:string):MergeResult => ({text:preferred==="local"?localText:remoteText,conflicted:true,kind:"merge-fallback",overlapWords:0,overlapLines:0,reason});
   if (localText === remoteText) return done(localText);
   if (localText === baseText) return done(remoteText);
   if (remoteText === baseText) return done(localText);
 
-  const base = tokenize(baseText), all = [...hunks(base, tokenize(localText), "local"), ...hunks(base, tokenize(remoteText), "remote")];
-  const groups=components(all),mixedGroups=groups.filter((component)=>component.some((hunk)=>hunk.side==="local")&&component.some((hunk)=>hunk.side==="remote"));
-  const overlapWords=mixedGroups.reduce((total,component)=>total+scale(base,component).words,0),lines=new Set<number>();
-  for(const component of mixedGroups)for(const line of affectedLines(base,component))lines.add(line);
-  const overlapLines=lines.size;
-  if(overlapWords>20||overlapLines>2)return {text:preferred==="local"?localText:remoteText,conflicted:true,kind:"large-conflict",overlapWords,overlapLines};
-  const selected: Hunk[] = []; let smallOverlap = false;
-  for (const component of groups) {
-    const mixed = component.some((hunk) => hunk.side === "local") && component.some((hunk) => hunk.side === "remote");
-    if (!mixed) { selected.push(...component); continue; }
-    smallOverlap = true; selected.push(...component.filter((hunk) => hunk.side === preferred));
+  if(baseText.length+localText.length+remoteText.length>MAX_AUTO_MERGE_CHARACTERS)return fallback("combined text is too large for a reliable automatic merge");
+  let base:string[],local:string[],remote:string[],all:Hunk[];
+  try{
+    base=tokenize(baseText);local=tokenize(localText);remote=tokenize(remoteText);
+    if(base.length+local.length+remote.length>MAX_AUTO_MERGE_TOKENS)return fallback("combined token count is too large for a reliable automatic merge");
+    all=[...hunks(base,local,"local"),...hunks(base,remote,"remote")];
+  }catch(error){
+    const reason=error instanceof Error?`${error.name}: ${error.message}`:String(error);
+    return fallback(`merge engine could not compare the versions (${reason})`);
   }
-  const result = [...base];
-  for (const hunk of selected.sort((left, right) => right.start - left.start)) result.splice(hunk.start, hunk.remove, ...hunk.add);
-  return { text: result.join(""), conflicted: false, kind: smallOverlap ? "small-overlap" : "merged", overlapWords, overlapLines };
+  try{
+    const groups=components(all),mixedGroups=groups.filter((component)=>component.some((hunk)=>hunk.side==="local")&&component.some((hunk)=>hunk.side==="remote"));
+    const overlapWords=mixedGroups.reduce((total,component)=>total+scale(base,component).words,0),lines=new Set<number>();
+    for(const component of mixedGroups)for(const line of affectedLines(base,component))lines.add(line);
+    const overlapLines=lines.size;
+    if(overlapWords>20||overlapLines>2)return {text:preferred==="local"?localText:remoteText,conflicted:true,kind:"large-conflict",overlapWords,overlapLines};
+    const selected: Hunk[] = []; let smallOverlap = false;
+    for (const component of groups) {
+      const mixed = component.some((hunk) => hunk.side === "local") && component.some((hunk) => hunk.side === "remote");
+      if (!mixed) { selected.push(...component); continue; }
+      smallOverlap = true; selected.push(...component.filter((hunk) => hunk.side === preferred));
+    }
+    const result = [...base];
+    for (const hunk of selected.sort((left, right) => right.start - left.start)) result.splice(hunk.start, hunk.remove, ...hunk.add);
+    return { text: result.join(""), conflicted: false, kind: smallOverlap ? "small-overlap" : "merged", overlapWords, overlapLines };
+  }catch(error){
+    const reason=error instanceof Error?`${error.name}: ${error.message}`:String(error);
+    return fallback(`merge engine could not safely assemble the result (${reason})`);
+  }
 }

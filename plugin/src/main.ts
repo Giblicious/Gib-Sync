@@ -31,7 +31,7 @@ export default class GibSyncPlugin extends Plugin {
     this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,"info",progress.current,progress.total));
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total));
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
@@ -188,7 +188,9 @@ export default class GibSyncPlugin extends Plugin {
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
   report(phase:SyncPhase,message:string,level:ActivityLevel="info",current?:number,total?:number) {
     this.liveStatus.phase=phase; this.liveStatus.message=message; this.liveStatus.current=current; this.liveStatus.total=total;
-    const previous=this.liveStatus.activities.at(-1); if (!previous || previous.message!==message) {
+    const previous=this.liveStatus.activities.at(-1); if(previous&&previous.phase===phase&&previous.message===message&&current!==undefined){
+      Object.assign(previous,{at:new Date().toISOString(),level,current,total});
+    }else if (!previous || previous.message!==message) {
       this.liveStatus.activities.push({at:new Date().toISOString(),phase,level,message,current,total});
       if (this.liveStatus.activities.length>100) this.liveStatus.activities.splice(0,this.liveStatus.activities.length-100);
     }
@@ -266,19 +268,19 @@ export default class GibSyncPlugin extends Plugin {
     }
   }
   async runSync() {
-    if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return; }
-    if(this.settings.paused){this.openStatusOverview();return;}
-    if(await this.checkObsidianSyncProtection(true))return;
-    if (this.liveStatus.running) return;
+    if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return false; }
+    if(this.settings.paused){this.openStatusOverview();return false;}
+    if(await this.checkObsidianSyncProtection(true))return false;
+    if (this.liveStatus.running) return false;
     const identity=this.currentVaultIdentity();
     if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
       const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
-      this.report("error",message,"error");this.notify("vault-location",message,10000,300_000);return;
+      this.report("error",message,"error");this.notify("vault-location",message,10000,300_000);return false;
     }
     if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
-    let changedDuringRead:FileChangedDuringReadError|null=null;
+    let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
@@ -288,6 +290,7 @@ export default class GibSyncPlugin extends Plugin {
       this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
       await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
+      runSucceeded=true;
     } catch (error) {
       const now=new Date().toISOString();this.liveStatus.running=false;this.liveStatus.completedAt=now;
       if(error instanceof FileChangedDuringReadError){
@@ -298,6 +301,7 @@ export default class GibSyncPlugin extends Plugin {
         this.report("scheduled",`${error.path} changed during sync; quietly retrying the saved version`,"info");
         if(failure.count>=3&&nowMs-failure.firstAt>=120_000)this.notify(`changing-file:${error.path}`,`Gib Sync has been unable to read ${error.path} consistently for over two minutes. Close anything continuously rewriting it, then sync again.`,8000,300_000);
       }else{
+        genericFailure=true;
         console.error("Gib Sync failed", error);const message=error instanceof Error?error.message:String(error);
         this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
         this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
@@ -307,9 +311,10 @@ export default class GibSyncPlugin extends Plugin {
       }
     } finally {
       if(changedDuringRead){this.fileChangePending=false;this.queueSync(2000,"File changed during sync; retrying");}
-      else if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
+      else if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(genericFailure?15_000:2000,genericFailure?"Files changed; retrying with error backoff":"Files changed during sync");}
       else this.scheduleNextSyncLabel();
     }
+    return runSucceeded;
   }
   scheduleSync(delay = 2000) {
     if (!this.settings.autoSync || !this.settings.deviceToken) return;
@@ -343,7 +348,7 @@ export default class GibSyncPlugin extends Plugin {
     if(!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
   }
   private async watchLoop(generation:number) {
-    let failures=0;
+    let failures=0,syncFailures=0;
     while(generation===this.watchGeneration&&this.settings.instantReceive&&this.settings.deviceToken){
       try{
         const result=await this.api.watch(this.settings.lastSnapshotId);
@@ -356,8 +361,11 @@ export default class GibSyncPlugin extends Plugin {
           this.notify("safeguard","Gib Sync quarantined suspicious remote changes. Review them in settings.",10000,60_000);
           this.openSafeguards();
         }else if(result.changed&&result.headId!==this.settings.lastSnapshotId){
+          if(this.safetyHold){await new Promise<void>((resolve)=>window.setTimeout(resolve,5000));continue;}
           this.report("scheduled","Remote change detected; syncing now","info");
-          await this.runSync();
+          const succeeded=await this.runSync();
+          if(succeeded)syncFailures=0;
+          else{syncFailures++;this.report("scheduled",`Incoming sync retry backed off after failure · attempt ${syncFailures}`,"warning");await new Promise<void>((resolve)=>window.setTimeout(resolve,Math.min(60_000,5000*2**Math.min(syncFailures-1,4))));}
         }
       }catch(error){
         if(generation!==this.watchGeneration)return;

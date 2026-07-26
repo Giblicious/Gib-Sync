@@ -10,7 +10,7 @@ const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; mirrored:number; snapshotId: string | null; }
-export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; }
+export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
   override readonly name="FileChangedDuringReadError";
@@ -64,7 +64,7 @@ export class SyncEngine {
       // Retain metadata rather than every file body. Mobile WebViews have much
       // tighter memory limits, so changed content is read lazily when required.
       output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now() });
-      current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:`Scanning local vault (${current}/${paths.length})`,current,total:paths.length});
+      current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:"Scanning local vault",current,total:paths.length});
     }
     return output;
   }
@@ -172,7 +172,7 @@ export class SyncEngine {
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
-    let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths`});
+    let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
     for (const path of [...paths].sort()) {
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
@@ -195,10 +195,15 @@ export class SyncEngine {
         const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
         const localText = decoder.decode(await this.localBytes(path,l,bytes)); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
         const preferred=l.mtime>=r.mtime?"local":"remote";
+        this.status({phase:"merging",message:`Three-way merge · ${path} · base ${b?.size??0} B · local ${l.size} B · remote ${r.size} B`});
         const merged = mergeText(baseText, localText, remoteText, preferred);
-        if(merged.kind==="large-conflict"){
+        if(merged.kind==="large-conflict"||merged.kind==="merge-fallback"){
+          const reason=merged.kind==="merge-fallback"?merged.reason??"merge engine fallback":`${merged.overlapWords} overlapping words across ${merged.overlapLines} lines`;
+          console.warn("Gib Sync preserved both versions after merge fallback",{path,reason,baseBytes:b?.size??0,localBytes:l.size,remoteBytes:r.size});
+          this.status({phase:"merging",message:`Preserving both · ${path} · ${reason}`,level:"warning"});
           conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
         }
+        this.status({phase:"merging",message:merged.kind==="small-overlap"?`Resolved small overlap · ${path} · preferred ${preferred} version`:`Merged non-overlapping edits · ${path}`,level:"success"});
         const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
         final.set(path, { path, hash, size: mergedBytes.length, mtime: Date.now(), bytes: mergedBytes });
         continue;

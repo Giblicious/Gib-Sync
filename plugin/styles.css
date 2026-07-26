@@ -153,14 +153,16 @@ body.is-mobile .gib-sync-status-overview-actions button { flex: 1 1 calc(50% - .
   }
   .gib-sync-activity-title > div {
     display: flex;
+    flex-wrap: wrap;
     gap: .4rem;
     width: 100%;
   }
   .gib-sync-activity-title button {
-    flex: 1 1 0;
+    flex: 1 1 calc(50% - .2rem);
     margin-left: 0;
     min-height: 44px;
   }
+  .gib-sync-activity-title button:first-child { flex-basis: 100%; }
   .gib-sync-activity-row {
     grid-template-columns: 70px minmax(0, 1fr);
   }

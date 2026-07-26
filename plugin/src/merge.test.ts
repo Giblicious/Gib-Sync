@@ -9,4 +9,8 @@ describe("mergeText", () => {
     const base=Array.from({length:25},(_,index)=>`word${index}`).join(" ");
     expect(mergeText(base,base.replaceAll("word","local"),base.replaceAll("word","remote"),"remote")).toMatchObject({text:base.replaceAll("word","remote"),kind:"large-conflict",conflicted:true});
   });
+  it("preserves both versions instead of deeply diffing oversized text",()=>{
+    const base="a".repeat(1_400_000),local=`L${base}`,remote=`R${base}`;
+    expect(mergeText(base,local,remote,"remote")).toMatchObject({text:remote,kind:"merge-fallback",conflicted:true,reason:expect.stringContaining("too large")});
+  });
 });
