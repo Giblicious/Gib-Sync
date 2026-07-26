@@ -8,9 +8,10 @@ export function privacySafeDiagnostics(live:LiveSyncStatus,server:ServerStatus|n
       activities:live.activities.map(({at,phase,level,current,total,repeats})=>({at,phase,level,current,total,repeats}))},
     server:server?{protocolVersion:server.protocolVersion,deviceCount:server.deviceCount,snapshotCount:server.snapshotCount,blobCount:server.blobCount,blobBytes:server.blobBytes,
       mirrorFileCount:server.mirrorFileCount,mirrorCurrent:server.mirrorCurrent,externalScanAt:server.externalScanAt,externalImportAt:server.externalImportAt,externalError:Boolean(server.externalError),
+      compatibility:server.compatibility?{clientVersion:server.compatibility.clientVersion,clientProtocol:server.compatibility.clientProtocol,minimumVersion:server.compatibility.minimumVersion,recommendedVersion:server.compatibility.recommendedVersion,serverProtocol:server.compatibility.serverProtocol,compatible:server.compatibility.compatible,updateAvailable:server.compatibility.updateAvailable}:null,
       safeguards:{mode:server.safeguards.policy.mode,writeLocked:server.safeguards.writeLocked,pendingQuarantines:server.safeguards.pendingQuarantines},
       healthAlerts:server.healthAlerts.map(({code,level,at})=>({code:code.includes(":")?code.slice(0,code.indexOf(":")):code,level,at})),
-      devices:server.devices.map(({ready,revokedAt,clockSkewMs,current})=>({ready,revoked:Boolean(revokedAt),clockSkewMs,current}))}:null,
+      devices:server.devices.map(({ready,revokedAt,clockSkewMs,current,clientVersion,clientProtocol,compatibility})=>({ready,revoked:Boolean(revokedAt),clockSkewMs,current,clientVersion,clientProtocol,compatibility}))}:null,
     connection
   };
 }

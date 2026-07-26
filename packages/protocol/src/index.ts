@@ -1,5 +1,16 @@
 export const PROTOCOL_VERSION = 5;
 
+export interface ClientCompatibility {
+  clientVersion: string | null;
+  clientProtocol: number | null;
+  minimumVersion: string;
+  recommendedVersion: string;
+  serverProtocol: number;
+  compatible: boolean;
+  updateAvailable: boolean;
+  reason: string | null;
+}
+
 export interface ManifestEntry {
   path: string;
   hash: string;
@@ -92,6 +103,7 @@ export interface ServerStatus {
   safeguards: SafeguardState;
   healthAlerts: HealthAlert[];
   devices: DeviceInfo[];
+  compatibility: ClientCompatibility;
 }
 
 export interface MirrorPlanRequest {
@@ -219,6 +231,9 @@ export interface DeviceInfo {
   ready: boolean;
   clockSkewMs: number;
   current: boolean;
+  clientVersion: string | null;
+  clientProtocol: number | null;
+  compatibility: "compatible"|"update-available"|"incompatible";
 }
 
 export interface HealthAlert {

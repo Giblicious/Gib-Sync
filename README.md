@@ -80,14 +80,15 @@ Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. I
 2. Set `PUBLIC_URL` to the TLS endpoint proxying port `8787`.
 3. Keep the legacy `SEAFILE_*` values for migrating pre-0.2 vaults.
 4. Set `SEAFILE_ALLOWED_HOSTS` to the public Seafile hostnames users may select.
-5. Run `docker compose up -d --build`.
-6. Verify `/healthz` reports `readableMirrors: true`.
+5. Set `GIBSYNC_MIN_CLIENT_VERSION` to the oldest plugin release allowed to sync and `GIBSYNC_RECOMMENDED_CLIENT_VERSION` to the current release. Incompatible clients are blocked before vault access and remain able to read compatibility status.
+6. Run `docker compose up -d --build`.
+7. Verify `/healthz` reports `readableMirrors: true` and the intended client-version policy.
 
 Persist and back up `/data`. Existing encrypted vaults migrate without moving their sidecar objects. Their readable recovery path is created automatically under `Obsidian/<vault name>` and materialized by the first v0.3 sync.
 
 ## Install and connect
 
-Build with `npm ci && npm run build`. Copy `plugin/main.js`, `plugin/manifest.json`, `plugin/styles.css`, and `plugin/versions.json` into `<vault>/.obsidian/plugins/gib-sync/`.
+Install and update Gib Sync through BRAT from the public `Giblicious/Gib-Sync` repository. Published releases include `main.js`, `manifest.json`, `styles.css`, and `versions.json`; do not replace BRAT-managed plugin files manually.
 
 Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafile addresses, authenticate, load accessible libraries, and select a library and folder. The Seafile password is exchanged for an API token and is not saved by the plugin or service.
 

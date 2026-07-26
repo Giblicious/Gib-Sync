@@ -11,6 +11,7 @@ import { ExternalImporter } from "./external.js";
 import { normalizeBasePath, SeafileStorage, type VaultStorageRow } from "./seafile.js";
 import { decryptVaultBlob, encryptVaultBlob, normalizeQuickCode, openJson, quickCode, randomToken, sealJson, sha256 } from "./security.js";
 import { assessChanges,policyFor,SafeguardService } from "./safeguards.js";
+import { clientCompatibility } from "./compatibility.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -45,14 +46,27 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
   await app.register(sensible);
+  app.setErrorHandler((error,_request,reply)=>{
+    const typed=error as Error & {statusCode?:number;compatibility?:unknown},compatibility=typed.compatibility;
+    if(typed.statusCode===426&&compatibility)return reply.code(426).send({error:typed.message,message:typed.message,compatibility});
+    return reply.send(error);
+  });
   app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: config.MAX_BLOB_BYTES }, (_request, body, done) => done(null, body));
 
-  async function authenticate(request: FastifyRequest): Promise<AuthDevice> {
+  const header=(request:FastifyRequest,name:string):string|null=>{const value=request.headers[name];return Array.isArray(value)?value[0]??null:value??null;};
+  const compatibilityFor=(request:FastifyRequest)=>{
+    const rawProtocol=header(request,"x-gib-sync-protocol"),parsedProtocol=rawProtocol===null?null:Number(rawProtocol);
+    return clientCompatibility({clientVersion:header(request,"x-gib-sync-client-version"),clientProtocol:Number.isInteger(parsedProtocol)?parsedProtocol:null,
+      minimumVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION,serverProtocol:PROTOCOL_VERSION});
+  };
+  async function authenticate(request: FastifyRequest,allowIncompatible=false): Promise<AuthDevice> {
     const raw = request.headers.authorization?.replace(/^Bearer\s+/i, "") ?? "";
     if (!raw) throw app.httpErrors.unauthorized();
     const device = store.one<AuthDevice & { revoked_at: string | null }>("SELECT id,vault_id,name,revoked_at FROM devices WHERE token_hash=?", sha256(raw));
     if (!device || device.revoked_at) throw app.httpErrors.unauthorized();
-    store.run("UPDATE devices SET last_seen_at=? WHERE id=?", new Date().toISOString(), device.id);
+    const compatibility=compatibilityFor(request);
+    store.run("UPDATE devices SET last_seen_at=?,client_version=?,client_protocol=? WHERE id=?", new Date().toISOString(),compatibility.clientVersion,compatibility.clientProtocol,device.id);
+    if(config.GIBSYNC_MIN_CLIENT_VERSION!=="0.0.0"&&!allowIncompatible&&!compatibility.compatible)throw Object.assign(new Error(`${compatibility.reason} Update Gib Sync through BRAT before syncing.`),{statusCode:426,compatibility});
     return device;
   }
 
@@ -96,7 +110,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION,minimumClientVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedClientVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   app.post("/v1/health/repair",async(request,reply)=>{
     const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
@@ -233,11 +247,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.get("/v1/status", async (request) => {
-    const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
+    const device = await authenticate(request,true); const compatibility=compatibilityFor(request),vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
     safeguards.clearResolvedQuarantineAlerts(device.vault_id);
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
-    const devices=store.all<{id:string;name:string;created_at:string;last_seen_at:string;revoked_at:string|null;initial_sync_complete:number;clock_skew_ms:number}>("SELECT id,name,created_at,last_seen_at,revoked_at,initial_sync_complete,clock_skew_ms FROM devices WHERE vault_id=? ORDER BY created_at",device.vault_id)
-      .map((item)=>({id:item.id,name:item.name,createdAt:item.created_at,lastSeenAt:item.last_seen_at,revokedAt:item.revoked_at,ready:Boolean(item.initial_sync_complete),clockSkewMs:item.clock_skew_ms,current:item.id===device.id}));
+    const devices=store.all<{id:string;name:string;created_at:string;last_seen_at:string;revoked_at:string|null;initial_sync_complete:number;clock_skew_ms:number;client_version:string|null;client_protocol:number|null}>("SELECT id,name,created_at,last_seen_at,revoked_at,initial_sync_complete,clock_skew_ms,client_version,client_protocol FROM devices WHERE vault_id=? ORDER BY created_at",device.vault_id)
+      .map((item)=>{const state=clientCompatibility({clientVersion:item.client_version,clientProtocol:item.client_protocol,minimumVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION,serverProtocol:PROTOCOL_VERSION});return {id:item.id,name:item.name,createdAt:item.created_at,lastSeenAt:item.last_seen_at,revokedAt:item.revoked_at,ready:Boolean(item.initial_sync_complete),clockSkewMs:item.clock_skew_ms,current:item.id===device.id,clientVersion:item.client_version,clientProtocol:item.client_protocol,compatibility:state.compatible?(state.updateAvailable?"update-available":"compatible"):"incompatible"};});
     const healthAlerts=store.all<{code:string;level:"info"|"warning"|"error";message:string;created_at:string}>("SELECT code,level,message,created_at FROM health_events WHERE vault_id=? AND cleared_at IS NULL ORDER BY created_at DESC LIMIT 20",device.vault_id)
       .map((item)=>({code:item.code,level:item.level,message:item.message,at:item.created_at}));
     if(vault.external_error)healthAlerts.unshift({code:"external_error",level:"error",message:`External Seafile scan: ${vault.external_error}`,at:vault.external_scan_at??new Date().toISOString()});
@@ -250,8 +264,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
       mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
       mirrorCurrent:Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id),externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error,
-      safeguards:safeguards.state(device.vault_id,device.id),healthAlerts,devices };
+      safeguards:safeguards.state(device.vault_id,device.id),healthAlerts,devices,compatibility };
   });
+
+  app.get("/v1/compatibility",async(request)=>{await authenticate(request,true);return compatibilityFor(request);});
 
   app.post("/v1/external/scan",async(request)=>{
     const device=await authenticate(request);return ingestExternalChanges(device.vault_id,true);

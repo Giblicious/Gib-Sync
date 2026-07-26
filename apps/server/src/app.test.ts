@@ -34,7 +34,8 @@ function fixture() {
   const config: Config = {
     HOST:"127.0.0.1", PORT:8787, PUBLIC_URL:"https://sync.example.test", DATA_DIR:root,
     GIBSYNC_SETUP_TOKEN:"setup-token-that-is-at-least-24-characters", GIBSYNC_SERVER_SECRET:"server-secret-that-is-at-least-thirty-two-characters",
-    SEAFILE_URL:"https://seafile.example.test", SEAFILE_PUBLIC_URL:"https://seafile.example.test", SEAFILE_USERNAME:"test@example.test", SEAFILE_PASSWORD:"password", SEAFILE_LIBRARY:"Gib Sync", SEAFILE_ALLOWED_HOSTS:"seafile.example.test", MAX_BLOB_BYTES:1024*1024
+    SEAFILE_URL:"https://seafile.example.test", SEAFILE_PUBLIC_URL:"https://seafile.example.test", SEAFILE_USERNAME:"test@example.test", SEAFILE_PASSWORD:"password", SEAFILE_LIBRARY:"Gib Sync", SEAFILE_ALLOWED_HOSTS:"seafile.example.test", MAX_BLOB_BYTES:1024*1024,
+    GIBSYNC_MIN_CLIENT_VERSION:"0.0.0",GIBSYNC_RECOMMENDED_CLIENT_VERSION:"0.8.19"
   };
   return { config, store:new Store(root), storage:new MemoryStorage() };
 }
@@ -43,6 +44,15 @@ function encryptedFixture(clear:Buffer,key:Buffer,hash:string):Buffer{const iv=r
 
 describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
+  it("blocks incompatible clients while preserving update guidance and status access",async()=>{
+    const {config,store,storage}=fixture();config.GIBSYNC_MIN_CLIENT_VERSION="0.8.19";config.GIBSYNC_RECOMMENDED_CLIENT_VERSION="0.8.20";const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"5"};
+    const blocked=await app.inject({method:"GET",url:"/v1/head",headers:legacy});expect(blocked.statusCode).toBe(426);expect(blocked.json().message).toContain("Update Gib Sync through BRAT");
+    const visible=await app.inject({method:"GET",url:"/v1/status",headers:legacy});expect(visible.statusCode).toBe(200);expect(visible.json().compatibility).toMatchObject({compatible:false,minimumVersion:"0.8.19"});
+    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true});
+    expect((await app.inject({method:"GET",url:"/v1/head",headers:current})).statusCode).toBe(200);
+    const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:5,compatibility:"update-available"});await app.close();
+  });
   it("enrolls, stores an encrypted blob, commits, pairs, and restores", async () => {
     const {config,store,storage} = fixture(); const app = await buildApp(config, store, storage as unknown as SeafileStorage);
     const discovery=await app.inject({method:"POST",url:"/v1/storage/discover",payload:{seafileUrl:"https://seafile.example.test",seafileUsername:"test@example.test",seafilePassword:"password"}});

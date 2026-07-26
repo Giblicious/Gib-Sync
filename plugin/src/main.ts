@@ -1,5 +1,5 @@
 import { Menu, Notice, Platform, Plugin, TFolder, normalizePath, setIcon } from "obsidian";
-import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
+import type { ClientCompatibility, ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
 import { FileChangedDuringReadError, SyncEngine, SyncSafetyError } from "./engine";
 import { NotificationGate } from "./notifications";
@@ -33,6 +33,8 @@ export default class GibSyncPlugin extends Plugin {
   private pathRevision=0;
   private journalSaveTimer:number|null=null;
   private readonly expectedLocalMutations=new Map<string,string|null>();
+  compatibility:ClientCompatibility|null=null;
+  private compatibilityBlocked=false;
 
   async onload() {
     this.settings = await loadSettings(this);this.settings.fullScanRequired=true;
@@ -70,6 +72,7 @@ export default class GibSyncPlugin extends Plugin {
     this.configureStatusSurfaces();
     this.registerInterval(window.setInterval(()=>void this.checkObsidianSyncProtection(),5000));
     void this.checkObsidianSyncProtection();
+    if(this.settings.deviceToken)await this.checkCompatibility(false);
     this.configureTimer();
     this.configureWatch();
     this.app.workspace.onLayoutReady(()=>{
@@ -91,7 +94,10 @@ export default class GibSyncPlugin extends Plugin {
   }
   private attentionCount():number{return this.serverStatus?.safeguards.pendingQuarantines??0;}
   private indicatorHealth(){const alerts=this.serverStatus?.healthAlerts??[],error=alerts.find((item)=>item.level==="error"),warning=alerts.find((item)=>item.level==="warning");return {errors:alerts.filter((item)=>item.level==="error").length,warnings:alerts.filter((item)=>item.level==="warning").length,description:error?.message??warning?.message};}
-  indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),this.indicatorHealth());}
+  indicatorState(){
+    if(this.compatibilityBlocked)return {key:"blocked" as const,label:"Update required",icon:"download",tone:"warning" as const,animated:false,attentionCount:0,description:this.compatibility?.reason??"This Gib Sync version is not compatible with the server"};
+    return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),this.indicatorHealth());
+  }
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
   private appendIndicatorVisual(host:HTMLElement,state= this.indicatorState(),dotOnly=false){
     if(state.key==="syncing"){
@@ -225,7 +231,17 @@ export default class GibSyncPlugin extends Plugin {
     if(visible)new Notice(visible,duration);
   }
   clearActivity() { this.liveStatus.activities=[]; this.emitStatus(); }
-  async refreshServerStatus() { if (!this.settings.deviceToken) return; try { const wasHeld=this.safetyHold;this.serverStatus=await this.api.status(); this.settings.storage=this.serverStatus.storage; if(!this.serverStatus.safeguards.pendingQuarantines&&!this.serverStatus.safeguards.writeLocked)this.safetyHold=false; await this.saveSettings(); if(wasHeld&&!this.safetyHold)this.scheduleNextSyncLabel();else this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
+  async refreshServerStatus() { if (!this.settings.deviceToken) return; try { const wasHeld=this.safetyHold;this.serverStatus=await this.api.status();if(this.serverStatus.compatibility)this.applyCompatibility(this.serverStatus.compatibility); this.settings.storage=this.serverStatus.storage; if(!this.serverStatus.safeguards.pendingQuarantines&&!this.serverStatus.safeguards.writeLocked)this.safetyHold=false; await this.saveSettings(); if(wasHeld&&!this.safetyHold)this.scheduleNextSyncLabel();else this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
+  private applyCompatibility(result:ClientCompatibility){
+    this.compatibility=result;const wasBlocked=this.compatibilityBlocked;this.compatibilityBlocked=!result.compatible;
+    if(this.compatibilityBlocked){this.watchGeneration++;if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;if(this.debounce!==null)window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;this.liveStatus.nextSyncAt=null;this.report("blocked",`${result.reason} Update through BRAT before syncing.`,"warning");}
+    else if(wasBlocked){this.report("idle","Client update accepted; synchronization can resume","success");this.configureTimer();this.configureWatch();}
+    if(result.compatible&&result.updateAvailable)this.notify("client-update",`Gib Sync ${result.recommendedVersion} is available through BRAT.`,7000,6*60*60*1000);
+  }
+  private async checkCompatibility(showNotice=true):Promise<boolean>{
+    try{const result=await this.api.compatibility();this.applyCompatibility(result);if(!result.compatible&&showNotice)this.notify("compatibility",`${result.reason} Update Gib Sync through BRAT before syncing.`,12000,60_000);return result.compatible;}
+    catch(error){if(error instanceof ApiError&&error.status===404){this.compatibilityBlocked=false;return true;}const message=error instanceof Error?error.message:String(error);this.report("error",`Compatibility check failed: ${message}`,"error");if(showNotice)this.notify("compatibility-check",`Gib Sync could not verify server compatibility: ${message}`,8000,60_000);return false;}
+  }
   async saveSettings() { await this.saveData(this.settings); }
   currentVaultIdentity():string {
     const adapter=this.app.vault.adapter as unknown as {getBasePath?:()=>string};
@@ -300,6 +316,7 @@ export default class GibSyncPlugin extends Plugin {
   async runSync() {
     if (!this.settings.deviceToken) { new SetupModal(this.app, this).open(); return false; }
     if(this.settings.paused){this.openStatusOverview();return false;}
+    if(!await this.checkCompatibility())return false;
     if(await this.checkObsidianSyncProtection(true))return false;
     if (this.liveStatus.running) return false;
     const settleWindow=Date.now()-this.lastVaultRenameAt<30_000?5000:2000,quietFor=Date.now()-this.lastRelevantVaultChangeAt;
@@ -395,21 +412,21 @@ export default class GibSyncPlugin extends Plugin {
     this.scheduleNextSyncLabel();
   }
   private queueSync(delay:number,reason:string,kind:"automatic"|"file-change"="file-change") {
-    if(this.nativeSyncBlocked||this.settings.paused||this.safetyHold)return;
+    if(this.nativeSyncBlocked||this.settings.paused||this.safetyHold||this.compatibilityBlocked)return;
     if (this.debounce !== null) window.clearTimeout(this.debounce);
     this.debounceKind=kind;
     this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`${reason}; sync in ${Math.max(1,Math.round(delay/1000))}s`);
     this.debounce = window.setTimeout(() => { this.debounce = null;this.debounceKind=null;void this.runSync(); }, delay);
   }
-  private scheduleNextSyncLabel() { if (!this.nativeSyncBlocked&&!this.settings.paused&&!this.safetyHold&&this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } else {this.liveStatus.nextSyncAt=null;this.emitStatus();} }
+  private scheduleNextSyncLabel() { if (!this.nativeSyncBlocked&&!this.settings.paused&&!this.safetyHold&&!this.compatibilityBlocked&&this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } else {this.liveStatus.nextSyncAt=null;this.emitStatus();} }
   configureTimer() {
     if (this.timer !== null) window.clearInterval(this.timer); this.timer = null;
-    if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => {if(!this.safetyHold)void this.runSync();}, Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
+    if (!this.nativeSyncBlocked&&!this.settings.paused&&!this.compatibilityBlocked&&this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => {if(!this.safetyHold)void this.runSync();}, Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
     else { this.liveStatus.nextSyncAt=null;this.emitStatus(); }
   }
   configureWatch() {
     const generation=++this.watchGeneration;
-    if(!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
+    if(!this.nativeSyncBlocked&&!this.settings.paused&&!this.compatibilityBlocked&&this.settings.instantReceive&&this.settings.deviceToken)void this.watchLoop(generation);
   }
   private async watchLoop(generation:number) {
     let failures=0,syncFailures=0;
@@ -433,6 +450,7 @@ export default class GibSyncPlugin extends Plugin {
         }
       }catch(error){
         if(generation!==this.watchGeneration)return;
+        if(error instanceof ApiError&&error.status===426){await this.checkCompatibility();return;}
         failures++;
         if(failures===1)this.report("scheduled","Instant incoming sync reconnecting; periodic sync remains active","warning");
         await new Promise<void>((resolve)=>window.setTimeout(resolve,Math.min(10_000,1000*2**Math.min(failures-1,3))));
