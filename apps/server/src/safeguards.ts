@@ -14,6 +14,13 @@ export const STRICT_POLICY:SafeguardPolicy={
 
 const normalize=(path:string)=>path.replace(/\\/g,"/").replace(/^\/+|\/+$/g,"");
 const extension=(path:string)=>{const name=path.slice(path.lastIndexOf("/")+1),index=name.lastIndexOf(".");return index<0?"":name.slice(index+1).toLowerCase();};
+const isDeviceLocalObsidianPath=(path:string)=>{
+  const value=normalize(path);
+  if(/^\.obsidian\/workspace(?:-[^/]+)?\.json$/i.test(value))return true;
+  const match=/^\.obsidian\/plugins\/[^/]+\/(.+)$/i.exec(value);if(!match)return false;
+  const generated=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","node_modules","search-index","temp","tmp"]);
+  return match[1].split("/").some((segment)=>generated.has(segment.toLowerCase()))||/\.(?:log|tmp)$/i.test(match[1]);
+};
 
 export function policyFor(mode:SafeguardPolicy["mode"],custom?:Partial<SafeguardPolicy>):SafeguardPolicy{
   const base=mode==="strict"?STRICT_POLICY:BALANCED_POLICY;
@@ -23,7 +30,10 @@ export function policyFor(mode:SafeguardPolicy["mode"],custom?:Partial<Safeguard
 
 export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],policy:SafeguardPolicy,signals?:ClientSafetySignals):{assessment:ChangeAssessment;changes:ChangeItem[]}{
   const before=new Map(previous.map((entry)=>[entry.path,entry])),after=new Map(next.map((entry)=>[entry.path,entry]));
-  const rawDeleted=[...before.values()].filter((entry)=>!after.has(entry.path)),rawCreated=[...after.values()].filter((entry)=>!before.has(entry.path));
+  const requestedCleanup=new Set((signals?.deviceLocalCleanupPaths??[]).map(normalize));
+  const trustedCleanup=(path:string)=>requestedCleanup.has(normalize(path))&&isDeviceLocalObsidianPath(path);
+  const allRawDeleted=[...before.values()].filter((entry)=>!after.has(entry.path));
+  const rawDeleted=allRawDeleted.filter((entry)=>!trustedCleanup(entry.path)),rawCreated=[...after.values()].filter((entry)=>!before.has(entry.path));
   const createdByHash=new Map<string,ManifestEntry[]>();for(const entry of rawCreated){const values=createdByHash.get(entry.hash)??[];values.push(entry);createdByHash.set(entry.hash,values);}
   const moved:ChangeItem[]=[],deleted:ChangeItem[]=[],usedCreated=new Set<string>();
   for(const entry of rawDeleted){const match=createdByHash.get(entry.hash)?.find((candidate)=>!usedCreated.has(candidate.path));if(match){usedCreated.add(match.path);moved.push({path:match.path,previousPath:entry.path,kind:"moved",previousSize:entry.size,size:match.size});}else deleted.push({path:entry.path,kind:"deleted",previousSize:entry.size});}
@@ -31,7 +41,7 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
   const modified=[...after.values()].filter((entry)=>before.has(entry.path)&&before.get(entry.path)!.hash!==entry.hash)
     .map<ChangeItem>((entry)=>({path:entry.path,kind:"modified",previousSize:before.get(entry.path)!.size,size:entry.size}));
   const changes=[...deleted,...created,...modified,...moved].sort((left,right)=>left.path.localeCompare(right.path));
-  const baseline=Math.max(1,previous.length),totalChanged=changes.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
+  const relevantPrevious=previous.length-(allRawDeleted.length-rawDeleted.length),baseline=Math.max(1,relevantPrevious),totalChanged=changes.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
   const bytesRemoved=deleted.reduce((sum,item)=>sum+(item.previousSize??0),0)+modified.reduce((sum,item)=>sum+Math.max(0,(item.previousSize??0)-(item.size??0)),0);
   const bytesAdded=created.reduce((sum,item)=>sum+(item.size??0),0)+modified.reduce((sum,item)=>sum+Math.max(0,(item.size??0)-(item.previousSize??0)),0);
   const reasons:string[]=[];
@@ -47,8 +57,8 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
   if(extensionChanges.length>=5)reasons.push(`${extensionChanges.length} files changed extension`);
   if(signals?.highEntropyPaths?.length)reasons.push(`${signals.highEntropyPaths.length} files resemble encrypted or high-entropy content`);
   if(signals?.staleBaseline&&deleted.length)reasons.push(`A stale device would delete ${deleted.length} file${deleted.length===1?"":"s"}`);
-  for(const protectedPath of policy.protectedPaths)if(changes.some((item)=>item.kind==="deleted"&&(item.path===protectedPath||item.path.startsWith(`${protectedPath}/`))))reasons.push(`Protected path ${protectedPath} would be deleted`);
-  if(previous.length&&next.length===0)reasons.push("A nonempty vault would become completely empty");
+  for(const protectedPath of policy.protectedPaths)if(allRawDeleted.some((item)=>item.path===protectedPath||item.path.startsWith(`${protectedPath}/`)))reasons.push(`Protected path ${protectedPath} would be deleted`);
+  if(relevantPrevious>0&&next.length===0)reasons.push("A nonempty vault would become completely empty");
   return {assessment:{created:created.length,modified:modified.length,deleted:deleted.length,moved:moved.length,totalChanged,affectedPercent,bytesAdded,bytesRemoved,reasons:[...new Set(reasons)],examples:changes.slice(0,25)},changes};
 }
 

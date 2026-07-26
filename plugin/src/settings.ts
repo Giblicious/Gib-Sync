@@ -46,13 +46,37 @@ export function isDeviceLocalWorkspacePath(path:string):boolean {
   return /^\.obsidian\/workspace(?:-[^/]+)?\.json$/i.test(normalized);
 }
 
+export function obsidianPluginPath(path:string):{id:string;relative:string}|null {
+  const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
+  const match=/^\.obsidian\/plugins\/([^/]+)(?:\/(.*))?$/i.exec(normalized);
+  return match?{id:match[1],relative:match[2]??""}:null;
+}
+
+export function isPluginDataPath(path:string):boolean {
+  return obsidianPluginPath(path)?.relative.toLowerCase()==="data.json";
+}
+
+export function isGeneratedPluginPath(path:string):boolean {
+  const plugin=obsidianPluginPath(path);if(!plugin)return false;
+  const generatedFolders=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","node_modules","search-index","temp","tmp"]);
+  return plugin.relative.split("/").some((segment)=>generatedFolders.has(segment.toLowerCase()))||/\.(?:log|tmp)$/i.test(plugin.relative);
+}
+
+export function isDeviceLocalObsidianPath(path:string):boolean {
+  return isDeviceLocalWorkspacePath(path)||isGeneratedPluginPath(path);
+}
+
+export function isObsidianSystemPath(path:string):boolean {
+  return path.replace(/\\/g,"/").replace(/^\/+/,"").toLowerCase().startsWith(".obsidian/");
+}
+
 export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): boolean {
   const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
   if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
   // Workspace files are rapidly rewritten UI state and differ between desktop
   // and mobile. They are always device-local, even when config sync is enabled.
-  if(isDeviceLocalWorkspacePath(normalized))return false;
+  if(isDeviceLocalObsidianPath(normalized))return false;
   if(normalized===".obsidian/core-plugins.json")return false;
   const obsidianRoot=normalized===".obsidian";
   const pluginPath=normalized===".obsidian/plugins"||normalized.startsWith(".obsidian/plugins/")||normalized===".obsidian/community-plugins.json";

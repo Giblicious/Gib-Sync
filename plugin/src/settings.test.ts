@@ -36,6 +36,9 @@ describe("file-change sync filtering",()=>{
     expect(shouldSyncChangedPath(".obsidian/plugins/calendar/data.json",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/workspace.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/plugins/gib-search/embeddings/model/index.meta.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/cache/index.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/data.json",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/plugins/gib-sync/data.json",settings)).toBe(false);
   });
 

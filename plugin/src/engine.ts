@@ -3,13 +3,14 @@ import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import { isDeviceLocalWorkspacePath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
+import { isDeviceLocalObsidianPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
+import { mergeSystemJson } from "./system-merge";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
-export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; mirrored:number; snapshotId: string | null; }
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
@@ -133,6 +134,14 @@ export class SyncEngine {
     final.set(copyPath,{path:copyPath,hash:copyHash,size:copyClear.length,mtime:Date.now(),bytes:copyClear});
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
+  private packageSame(left:Map<string,FileState>,right:Map<string,FileState>):boolean{return left.size===right.size&&[...left].every(([path,entry])=>right.get(path)?.hash===entry.hash);}
+  private packageMtime(entries:Map<string,FileState>):number{return Math.max(0,...[...entries.values()].map((entry)=>entry.mtime));}
+  private compareVersions(left:string|null,right:string|null):number{
+    if(left===right)return 0;if(!left)return -1;if(!right)return 1;
+    const parse=(value:string)=>{const [core,pre]=value.split("-",2);return {parts:core.split(".").map((part)=>Number.parseInt(part,10)||0),pre:pre??""};},a=parse(left),b=parse(right);
+    for(let index=0;index<Math.max(a.parts.length,b.parts.length);index++){const difference=(a.parts[index]??0)-(b.parts[index]??0);if(difference)return difference;}
+    if(!a.pre&&b.pre)return 1;if(a.pre&&!b.pre)return -1;return a.pre.localeCompare(b.pre);
+  }
   private async convergeAfterConflict(attempt:number,reason:string):Promise<SyncResult>{
     if(attempt>=7)throw new Error("The vault kept changing during eight convergence attempts. Gib Sync preserved every committed version; retry once editing settles.");
     const delay=Math.min(2000,100*(2**attempt))+Math.floor(Math.random()*250);
@@ -172,8 +181,43 @@ export class SyncEngine {
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
-    let conflicts = 0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
+    let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
+    const handledPluginPaths=new Set<string>();
+    if(settings.syncPlugins){
+      const pluginIds=new Set([...paths].map((path)=>obsidianPluginPath(path)?.id).filter((id):id is string=>Boolean(id)));
+      const packageFor=(source:Map<string,FileState>,id:string)=>new Map([...source].filter(([path])=>{const plugin=obsidianPluginPath(path);return plugin?.id===id&&!isPluginDataPath(path);}));
+      const versionFor=async(source:"local"|"remote",entries:Map<string,FileState>,id:string):Promise<string|null>=>{
+        const entry=entries.get(`.obsidian/plugins/${id}/manifest.json`);if(!entry)return null;
+        try{const clear=source==="local"?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);return (JSON.parse(decoder.decode(clear)) as {version?:unknown}).version as string??null;}catch{return null;}
+      };
+      for(const id of [...pluginIds].sort()){
+        const baseline=packageFor(base,id),localPackage=packageFor(local,id),remotePackage=packageFor(remote,id);
+        for(const path of new Set([...baseline.keys(),...localPackage.keys(),...remotePackage.keys()]))handledPluginPaths.add(path);
+        const localChanged=!this.packageSame(localPackage,baseline),remoteChanged=!this.packageSame(remotePackage,baseline);
+        let chosen=remotePackage,side:"local"|"remote"="remote",reason="both devices already agree";
+        const localVersion=await versionFor("local",localPackage,id),remoteVersion=await versionFor("remote",remotePackage,id);
+        if(this.packageSame(localPackage,remotePackage)){chosen=remotePackage;}
+        else if(!localPackage.size||!remotePackage.size){
+          if(localChanged&&!remoteChanged){chosen=localPackage;side="local";reason=localPackage.size?"this device installed the package":"this device removed the package";}
+          else if(!localChanged&&remoteChanged){reason=remotePackage.size?"the server installed the package":"the server removed the package";}
+          else{const useLocal=this.packageMtime(localPackage)>this.packageMtime(remotePackage);side=useLocal?"local":"remote";chosen=useLocal?localPackage:remotePackage;reason=`concurrent install/removal used the later ${side} package`;resolved++;}
+        }else{
+          const localComplete=localPackage.has(`.obsidian/plugins/${id}/manifest.json`)&&localPackage.has(`.obsidian/plugins/${id}/main.js`),remoteComplete=remotePackage.has(`.obsidian/plugins/${id}/manifest.json`)&&remotePackage.has(`.obsidian/plugins/${id}/main.js`);
+          const versionOrder=this.compareVersions(localVersion,remoteVersion);
+          if(localComplete!==remoteComplete){side=localComplete?"local":"remote";chosen=side==="local"?localPackage:remotePackage;reason=`repaired an incomplete ${side==="local"?"server":"local"} package from the complete copy`;resolved++;}
+          else if(versionOrder>0){side="local";chosen=localPackage;reason=`newer plugin version ${localVersion} supersedes ${remoteVersion??"unknown"}`;resolved++;}
+          else if(versionOrder<0){reason=`newer plugin version ${remoteVersion} supersedes ${localVersion??"unknown"}`;resolved++;}
+          else if(localChanged&&!remoteChanged){chosen=localPackage;side="local";reason="only this device changed the package";}
+          else if(!localChanged&&remoteChanged){reason="only the server package changed";}
+          else if(this.packageMtime(localPackage)>this.packageMtime(remotePackage)){side="local";chosen=localPackage;reason="same plugin version; local package was modified later";resolved++;}
+          else{reason="same plugin version; server package was modified later";resolved++;}
+        }
+        for(const [path,entry] of chosen)final.set(path,entry);
+        if(localChanged||remoteChanged)this.status({phase:"merging",message:`Plugin package · ${id} · chose ${side}${(side==="local"?localVersion:remoteVersion)?` v${side==="local"?localVersion:remoteVersion}`:""} · ${reason}`,level:"info"});
+      }
+    }
     for (const path of [...paths].sort()) {
+      if(handledPluginPaths.has(path))continue;
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
       if (!settings.initialized && !b && !l && r) { final.set(path, r); continue; }
@@ -182,6 +226,20 @@ export class SyncEngine {
       if (!b && l && !r) { final.set(path, l); continue; }
       if (!b && !l && r) { final.set(path, r); continue; }
       if (!l && !r) continue;
+      if(isObsidianSystemPath(path)){
+        if(b&&(!l||!r)){
+          const kept=l??r;if(kept)final.set(path,kept);resolved++;this.status({phase:"merging",message:`Obsidian system file · ${path} · kept the modified version instead of an overlapping deletion`,level:"warning"});continue;
+        }
+        if(l&&r){
+          const preferred=l.mtime>=r.mtime?"local":"remote";
+          if(path.toLowerCase().endsWith(".json")){
+            const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):"{}",localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache));
+            const merged=mergeSystemJson(baseText,localText,remoteText,preferred),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});
+            this.status({phase:"merging",message:`Obsidian settings · ${path} · ${merged.reason}`,level:merged.overlaps?"warning":"success"});
+          }else{const chosen=preferred==="local"?l:r;final.set(path,chosen);this.status({phase:"merging",message:`Obsidian system file · ${path} · used newer ${preferred} whole file`,level:"info"});}
+          resolved++;continue;
+        }
+      }
       if(b&&(!l||!r)){
         conflicts++;
         if(l)await this.preserveDeletion(path,await this.localBytes(path,l,bytes),settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes);
@@ -213,9 +271,29 @@ export class SyncEngine {
       if(l&&r)await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);
     }
 
+    if(settings.syncPlugins){
+      const enablementPath=".obsidian/community-plugins.json",entry=final.get(enablementPath);
+      if(entry){
+        try{
+          const localEntry=local.get(enablementPath),clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(enablementPath,localEntry,bytes):await this.remoteBytes(entry,remoteCache));
+          const enabled=JSON.parse(decoder.decode(clear)) as unknown;
+          if(Array.isArray(enabled)){
+            const valid=enabled.filter((id):id is string=>typeof id==="string"&&(id==="gib-sync"||(final.has(`.obsidian/plugins/${id}/manifest.json`)&&final.has(`.obsidian/plugins/${id}/main.js`))));
+            const missing=enabled.filter((id)=>typeof id==="string"&&!valid.includes(id));
+            if(missing.length){const sanitized=encoder.encode(`${JSON.stringify(valid,null,2)}\n`),hash=await hashBytes(sanitized);bytes.set(hash,sanitized);final.set(enablementPath,{path:enablementPath,hash,size:sanitized.length,mtime:Date.now(),bytes:sanitized});resolved++;
+              this.status({phase:"merging",message:`Plugin enablement repaired · skipped ${missing.length} incomplete package${missing.length===1?"":"s"}: ${missing.slice(0,5).join(", ")}${missing.length>5?"…":""}`,level:"warning"});}
+          }
+        }catch{this.status({phase:"merging",message:"Plugin enablement list is non-standard JSON · kept the newer complete file",level:"warning"});}
+      }
+    }
+
     let downloaded = 0, deleted = 0;
     this.status({phase:"applying",message:"Applying merged changes to this device"});
-    for (const [path, entry] of final) {
+    const applyOrder=[...final].sort(([left],[right])=>{
+      const rank=(path:string)=>path===".obsidian/community-plugins.json"?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
+      return rank(left)-rank(right)||left.localeCompare(right);
+    });
+    for (const [path, entry] of applyOrder) {
       if (local.get(path)?.hash === entry.hash) continue;
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
       await this.ensureParent(path); await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
@@ -225,7 +303,7 @@ export class SyncEngine {
     // An ignored path is device-local: keep its accepted remote manifest entry
     // even though this device neither reads nor writes the file. This is
     // essential when phones intentionally omit desktop-only plugins.
-    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path)&&!isDeviceLocalWorkspacePath(entry.path));
+    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path)&&!isDeviceLocalObsidianPath(entry.path));
     const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const clientCanMirrorAll=!preservedIgnored.length;
@@ -235,7 +313,7 @@ export class SyncEngine {
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
-      return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
+      return { uploaded: 0, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId };
     }
 
     if(!settings.initialized&&remoteSnapshot){
@@ -255,13 +333,14 @@ export class SyncEngine {
     let snapshot:Snapshot;
     const highEntropyPaths=entries.filter((entry)=>this.text(entry.path)&&!remoteEntries.some((remoteEntry)=>remoteEntry.path===entry.path&&remoteEntry.hash===entry.hash))
       .filter((entry)=>{const clear=bytes.get(entry.hash);return clear?this.entropy(clear)>7.2:false;}).map((entry)=>entry.path);
+    const deviceLocalCleanupPaths=remoteEntries.filter((entry)=>isDeviceLocalObsidianPath(entry.path)&&!entries.some((next)=>next.path===entry.path)).slice(0,5000).map((entry)=>entry.path);
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,
-      clientTime:new Date().toISOString(),signals:{highEntropyPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
+      clientTime:new Date().toISOString(),signals:{highEntropyPaths,deviceLocalCleanupPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
     settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
-    return { uploaded, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
+    return { uploaded, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId };
   }
 }

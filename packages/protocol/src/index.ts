@@ -160,6 +160,7 @@ export interface SafeguardPolicy {
 
 export interface ClientSafetySignals {
   highEntropyPaths?: string[];
+  deviceLocalCleanupPaths?: string[];
   vaultIdentity?: string;
   staleBaseline?: boolean;
 }

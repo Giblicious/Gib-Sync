@@ -29,4 +29,19 @@ describe("safeguard assessment",()=>{
     const result=assessChanges([entry("note.md","a",10)],[entry("note.md","b",1000)],BALANCED_POLICY,{highEntropyPaths:["note.md"]});
     expect(result.assessment.reasons).toEqual(["1 files resemble encrypted or high-entropy content"]);
   });
+  it("allows declared cleanup only for server-recognized device-local plugin data",()=>{
+    const caches=Array.from({length:20},(_,index)=>entry(`.obsidian/plugins/gib-search/embeddings/model/chunk-${index}.bin`,String(index%10)));
+    const result=assessChanges([entry("note.md","a"),...caches],[entry("note.md","a")],BALANCED_POLICY,{deviceLocalCleanupPaths:caches.map((item)=>item.path),staleBaseline:true});
+    expect(result.assessment).toMatchObject({deleted:0,totalChanged:0,reasons:[]});expect(result.changes).toEqual([]);
+  });
+  it("does not trust cleanup declarations for ordinary user files",()=>{
+    const notes=Array.from({length:20},(_,index)=>entry(`Notes/note-${index}.md`,String(index%10)));
+    const result=assessChanges(notes,[],BALANCED_POLICY,{deviceLocalCleanupPaths:notes.map((item)=>item.path)});
+    expect(result.assessment.deleted).toBe(20);expect(result.assessment.reasons).toContain("20 files would be deleted");
+  });
+  it("still honors protected paths during recognized device-local cleanup",()=>{
+    const path=".obsidian/plugins/demo/cache/index.bin",policy=policyFor("balanced",{protectedPaths:[".obsidian"]});
+    const result=assessChanges([entry(path,"a")],[],policy,{deviceLocalCleanupPaths:[path]});
+    expect(result.assessment.reasons).toContain("Protected path .obsidian would be deleted");
+  });
 });

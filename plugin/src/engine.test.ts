@@ -121,14 +121,41 @@ describe("SyncEngine", () => {
   });
   it("downloads mobile-compatible plugin files after plugin sync is enabled",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.syncPlugins=true;config.lastSnapshotId=null;
-    const pluginBytes=new TextEncoder().encode("mobile plugin\n"),workspaceBytes=new TextEncoder().encode("{}"),pluginHash=await hashBytes(pluginBytes),workspaceHash=await hashBytes(workspaceBytes);
-    api.blobs.set(pluginHash,await encryptBlob(pluginBytes,config.vaultKey,pluginHash));api.blobs.set(workspaceHash,await encryptBlob(workspaceBytes,config.vaultKey,workspaceHash));
+    const pluginBytes=new TextEncoder().encode("mobile plugin\n"),workspaceBytes=new TextEncoder().encode("{}"),generatedBytes=new TextEncoder().encode("generated index"),pluginHash=await hashBytes(pluginBytes),workspaceHash=await hashBytes(workspaceBytes),generatedHash=await hashBytes(generatedBytes);
+    api.blobs.set(pluginHash,await encryptBlob(pluginBytes,config.vaultKey,pluginHash));api.blobs.set(workspaceHash,await encryptBlob(workspaceBytes,config.vaultKey,workspaceHash));api.blobs.set(generatedHash,await encryptBlob(generatedBytes,config.vaultKey,generatedHash));
     api.head={id:"00000000-0000-4000-8000-000000000204",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Plugins",entries:[
-      {path:".obsidian/plugins/calendar/main.js",hash:pluginHash,size:pluginBytes.length,mtime:1},{path:".obsidian/workspace.json",hash:workspaceHash,size:workspaceBytes.length,mtime:1}
+      {path:".obsidian/plugins/calendar/main.js",hash:pluginHash,size:pluginBytes.length,mtime:1},{path:".obsidian/workspace.json",hash:workspaceHash,size:workspaceBytes.length,mtime:1},{path:".obsidian/plugins/gib-search/embeddings/model/index.meta.json",hash:generatedHash,size:generatedBytes.length,mtime:1}
     ]};
     await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
-    expect(adapter.files.get(".obsidian/plugins/calendar/main.js")).toEqual(pluginBytes);expect(adapter.files.has(".obsidian/workspace.json")).toBe(false);
+    expect(adapter.files.get(".obsidian/plugins/calendar/main.js")).toEqual(pluginBytes);expect(adapter.files.has(".obsidian/workspace.json")).toBe(false);expect(adapter.files.has(".obsidian/plugins/gib-search/embeddings/model/index.meta.json")).toBe(false);
     expect(api.readyHeads).toEqual(["00000000-0000-4000-8000-000000000204"]);expect(api.head?.entries.map((entry)=>entry.path)).toEqual([".obsidian/plugins/calendar/main.js"]);
+  });
+  it("semantically combines Obsidian settings without creating deep conflict files",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncObsidianConfig=true;
+    const baseBytes=new TextEncoder().encode('{"theme":"old","editor":{"line":true}}'),localBytes=new TextEncoder().encode('{"theme":"dark","editor":{"line":true}}'),remoteBytes=new TextEncoder().encode('{"theme":"old","editor":{"line":false}}');
+    const baseHash=await hashBytes(baseBytes),remoteHash=await hashBytes(remoteBytes),base:Snapshot={id:"00000000-0000-4000-8000-000000000205",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base settings",entries:[{path:".obsidian/app.json",hash:baseHash,size:baseBytes.length,mtime:1}]};
+    config.lastSnapshotId=base.id;api.snapshots.set(base.id,base);api.blobs.set(baseHash,await encryptBlob(baseBytes,config.vaultKey,baseHash));api.blobs.set(remoteHash,await encryptBlob(remoteBytes,config.vaultKey,remoteHash));api.head={...base,id:"00000000-0000-4000-8000-000000000206",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:[{path:".obsidian/app.json",hash:remoteHash,size:remoteBytes.length,mtime:3}]};adapter.files.set(".obsidian/app.json",localBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(result.resolved).toBe(1);expect(api.head?.entries).toHaveLength(1);expect([...adapter.files.keys()].filter((path)=>path.includes("conflict"))).toHaveLength(0);expect(JSON.parse(new TextDecoder().decode(adapter.files.get(".obsidian/app.json")))).toEqual({theme:"dark",editor:{line:false}});
+  });
+  it("selects one complete plugin package and repairs incomplete enablement atomically",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;
+    const encode=(value:string)=>new TextEncoder().encode(value),baseManifest=encode('{"id":"demo","version":"1.0.0"}'),newManifest=encode('{"id":"demo","version":"2.0.0"}'),baseMain=encode("base code"),localMain=encode("complete local code"),enabled=encode('["demo","missing-plugin","gib-sync"]');
+    const baseManifestHash=await hashBytes(baseManifest),newManifestHash=await hashBytes(newManifest),baseMainHash=await hashBytes(baseMain),localMainHash=await hashBytes(localMain),enabledHash=await hashBytes(enabled);
+    const entries:Snapshot["entries"]=[{path:".obsidian/plugins/demo/manifest.json",hash:baseManifestHash,size:baseManifest.length,mtime:1},{path:".obsidian/plugins/demo/main.js",hash:baseMainHash,size:baseMain.length,mtime:1},{path:".obsidian/community-plugins.json",hash:enabledHash,size:enabled.length,mtime:1}],base:Snapshot={id:"00000000-0000-4000-8000-000000000207",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Plugin v1",entries};
+    config.lastSnapshotId=base.id;api.snapshots.set(base.id,base);for(const [hash,value] of [[baseManifestHash,baseManifest],[newManifestHash,newManifest],[baseMainHash,baseMain],[enabledHash,enabled]] as const)api.blobs.set(hash,await encryptBlob(value,config.vaultKey,hash));
+    api.head={...base,id:"00000000-0000-4000-8000-000000000208",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:[{path:".obsidian/plugins/demo/manifest.json",hash:newManifestHash,size:newManifest.length,mtime:4},{path:".obsidian/community-plugins.json",hash:enabledHash,size:enabled.length,mtime:1}]};
+    adapter.files.set(".obsidian/plugins/demo/manifest.json",newManifest);adapter.files.set(".obsidian/plugins/demo/main.js",localMain);adapter.files.set(".obsidian/community-plugins.json",enabled);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(result.resolved).toBeGreaterThanOrEqual(2);expect(adapter.files.get(".obsidian/plugins/demo/main.js")).toEqual(localMain);expect(api.head?.entries.map((entry)=>entry.path).sort()).toEqual([".obsidian/community-plugins.json",".obsidian/plugins/demo/main.js",".obsidian/plugins/demo/manifest.json"]);expect(JSON.parse(new TextDecoder().decode(adapter.files.get(".obsidian/community-plugins.json")))).toEqual(["demo","gib-sync"]);expect(api.blobs.has(localMainHash)).toBe(true);
+  });
+  it("repairs a locally incomplete plugin from the unchanged complete server package",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;
+    const manifest=new TextEncoder().encode('{"id":"demo","version":"1.0.0"}'),main=new TextEncoder().encode("working code"),manifestHash=await hashBytes(manifest),mainHash=await hashBytes(main);
+    const entries:Snapshot["entries"]=[{path:".obsidian/plugins/demo/manifest.json",hash:manifestHash,size:manifest.length,mtime:1},{path:".obsidian/plugins/demo/main.js",hash:mainHash,size:main.length,mtime:1}],base:Snapshot={id:"00000000-0000-4000-8000-000000000209",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Complete plugin",entries};
+    config.lastSnapshotId=base.id;api.head=base;api.snapshots.set(base.id,base);api.blobs.set(manifestHash,await encryptBlob(manifest,config.vaultKey,manifestHash));api.blobs.set(mainHash,await encryptBlob(main,config.vaultKey,mainHash));adapter.files.set(".obsidian/plugins/demo/manifest.json",manifest);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.resolved).toBe(1);expect(adapter.files.get(".obsidian/plugins/demo/main.js")).toEqual(main);expect(api.head?.entries).toEqual(entries);
   });
   it("never uploads a stale body when a file changes during a low-memory scan",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),before=new TextEncoder().encode("before\n"),after=new TextEncoder().encode("after\n");adapter.files.set("note.md",before);
