@@ -1,6 +1,6 @@
 {
   "name": "gib-sync-plugin",
-  "version": "0.8.17",
+  "version": "0.8.18",
   "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs production",
@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@gib-sync/protocol": "0.8.17",
+    "@gib-sync/protocol": "0.8.18",
     "diff": "^8.0.2"
   },
   "devDependencies": {

@@ -21,6 +21,7 @@ export class GibSyncApi {
   discover(server:string,seafileUrl:string,seafileUsername:string,seafilePassword:string) { return this.json<StorageDiscovery>("POST","/v1/storage/discover",{seafileUrl,seafileUsername,seafilePassword},undefined,server); }
   setup(server: string, body: StorageSetupRequest) { return this.json<SetupResponse>("POST", "/v1/setup", body, undefined, server); }
   state() { return this.json<SyncState>("GET", "/v1/state", undefined, this.settings().deviceToken); }
+  headState() { return this.json<{headId:string|null}>("GET", "/v1/head", undefined, this.settings().deviceToken); }
   watch(headId:string|null) { return this.json<WatchResponse>("GET", `/v1/watch?head=${encodeURIComponent(headId??"")}`, undefined, this.settings().deviceToken); }
   status() { return this.json<ServerStatus>("GET", "/v1/status", undefined, this.settings().deviceToken); }
   snapshot(id: string) { return this.json<Snapshot>("GET", `/v1/snapshots/${id}`, undefined, this.settings().deviceToken); }

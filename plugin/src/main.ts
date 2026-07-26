@@ -1,8 +1,9 @@
-import { Menu, Notice, Platform, Plugin, normalizePath, setIcon } from "obsidian";
+import { Menu, Notice, Platform, Plugin, TFolder, normalizePath, setIcon } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
 import { FileChangedDuringReadError, SyncEngine, SyncSafetyError } from "./engine";
 import { NotificationGate } from "./notifications";
+import { hashBytes } from "./crypto";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
@@ -28,12 +29,18 @@ export default class GibSyncPlugin extends Plugin {
   private mobileObserver:MutationObserver|null=null;
   private mobileMountScheduled=false;
   private mobileLayoutReady=!Platform.isMobile;
+  private readonly pathVersions=new Map<string,number>();
+  private pathRevision=0;
+  private journalSaveTimer:number|null=null;
+  private readonly expectedLocalMutations=new Map<string,string|null>();
 
   async onload() {
-    this.settings = await loadSettings(this); this.api = new GibSyncApi(() => this.settings);
+    this.settings = await loadSettings(this);this.settings.fullScanRequired=true;
+    for(const path of this.settings.pendingPaths)this.pathVersions.set(path,++this.pathRevision);
+    this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total));
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total),undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash));
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
@@ -45,10 +52,10 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
-    this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
-    this.registerEvent(this.app.vault.on("delete", (file) => this.scheduleFileChangeSync(file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();this.scheduleFileChangeSync(file.path,oldPath);}));
+    this.registerEvent(this.app.vault.on("create", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("delete", (file) => file instanceof TFolder?this.requireFullScan():this.scheduleFileChangeSync(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder)this.requireFullScan();else this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
@@ -77,6 +84,8 @@ export default class GibSyncPlugin extends Plugin {
     this.watchGeneration++;
     if(this.timer!==null)window.clearInterval(this.timer);
     if(this.debounce!==null)window.clearTimeout(this.debounce);
+    if(this.journalSaveTimer!==null)window.clearTimeout(this.journalSaveTimer);
+    if(this.settings.pendingPaths.length||this.settings.fullScanRequired)void this.saveSettings();
     this.mobileObserver?.disconnect();this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();
     this.removeStaleMobileSidebarIndicators();
   }
@@ -84,6 +93,15 @@ export default class GibSyncPlugin extends Plugin {
   private indicatorHealth(){const alerts=this.serverStatus?.healthAlerts??[],error=alerts.find((item)=>item.level==="error"),warning=alerts.find((item)=>item.level==="warning");return {errors:alerts.filter((item)=>item.level==="error").length,warnings:alerts.filter((item)=>item.level==="warning").length,description:error?.message??warning?.message};}
   indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),this.indicatorHealth());}
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
+  private appendIndicatorVisual(host:HTMLElement,state= this.indicatorState(),dotOnly=false){
+    if(state.key==="syncing"){
+      const ring=host.createSpan({cls:`gib-sync-progress-ring${this.liveStatus.total?" is-determinate":this.settings.animateStatusIndicator?" is-indeterminate":""}`});
+      const percent=this.liveStatus.total?Math.max(0,Math.min(100,((this.liveStatus.current??0)/this.liveStatus.total)*100)):25;
+      ring.style.setProperty("--gib-sync-progress",`${percent}%`);ring.setAttr("aria-hidden","true");return;
+    }
+    if(dotOnly)host.createSpan({cls:"gib-sync-indicator-dot"});
+    else{const icon=host.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);}
+  }
   private renderIndicator(element:HTMLElement,dotOnly=false) {
     const state=this.indicatorState(),animate=this.settings.animateStatusIndicator&&state.animated;
     const kind=element.dataset.gibSyncIndicatorKind;
@@ -94,13 +112,13 @@ export default class GibSyncPlugin extends Plugin {
       :"";
     element.className=`gib-sync-indicator${placement}${nativeClasses} is-${state.tone} is-${state.key}${animate?" is-animated":""}${dotOnly?" is-dot-only":""}`;
     element.empty();
-    if(dotOnly)element.createSpan({cls:"gib-sync-indicator-dot"});
+    if(dotOnly)this.appendIndicatorVisual(element,state,true);
     else if(nativeSidebar){
-      setIcon(element,state.icon);
+      this.appendIndicatorVisual(element,state);
       if(this.settings.showAttentionBadge&&state.attentionCount>0)element.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});
     }
     else{
-      const icon=element.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);
+      this.appendIndicatorVisual(element,state);
       if(this.settings.showAttentionBadge&&state.attentionCount>0)element.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});
     }
     element.setAttr("aria-label",`${state.label}. ${state.description}`);
@@ -111,7 +129,7 @@ export default class GibSyncPlugin extends Plugin {
     const state=this.indicatorState(),show=!Platform.isMobile&&(this.settings.desktopStatusIcon||this.settings.desktopStatusText);
     this.statusEl.toggleClass("is-hidden",!show);this.statusEl.className=`status-bar-item gib-sync-desktop-status is-${state.tone} is-${state.key}${this.settings.animateStatusIndicator&&state.animated?" is-animated":""}${show?"":" is-hidden"}`;
     this.statusEl.empty();
-    if(this.settings.desktopStatusIcon){const icon=this.statusEl.createSpan({cls:"gib-sync-indicator-icon"});setIcon(icon,state.icon);if(this.settings.showAttentionBadge&&state.attentionCount>0)this.statusEl.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});}
+    if(this.settings.desktopStatusIcon){this.appendIndicatorVisual(this.statusEl,state);if(this.settings.showAttentionBadge&&state.attentionCount>0)this.statusEl.createSpan({cls:"gib-sync-indicator-badge",text:String(Math.min(99,state.attentionCount))});}
     if(this.settings.desktopStatusText)this.statusEl.createSpan({cls:"gib-sync-status-short-text",text:state.label});
     this.statusEl.setAttr("aria-label",`${state.label}. ${state.description}`);
     this.statusEl.onclick=()=>this.openStatusOverview();
@@ -221,7 +239,8 @@ export default class GibSyncPlugin extends Plugin {
     catch(error){const message=error instanceof Error?error.message:String(error);this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity() });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],fullScanRequired:true,lastFullScanAt:null });
+    this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
@@ -294,8 +313,11 @@ export default class GibSyncPlugin extends Plugin {
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
+    const startingVersions=new Map(this.pathVersions);
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
+      for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
+      this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;this.liveStatus.lastError="";
       this.changedDuringReadFailures.clear();
       this.safetyHold=false;
@@ -334,12 +356,38 @@ export default class GibSyncPlugin extends Plugin {
     this.queueSync(delay,"Automatic sync","automatic");
   }
   scheduleFileChangeSync(...paths:string[]) {
-    if(!this.settings.deviceToken||!paths.some((path)=>shouldSyncChangedPath(path,this.settings)))return;
+    if(!this.settings.deviceToken)return;
+    const normalized=paths.map((path)=>normalizePath(path));
+    const expected=normalized.filter((path)=>this.expectedLocalMutations.has(path));
+    if(expected.length){for(const path of expected)void this.verifyExpectedMutation(path,this.expectedLocalMutations.get(path)!);paths=normalized.filter((path)=>!expected.includes(path));}
+    const relevant=paths.map((path)=>normalizePath(path)).filter((path)=>shouldSyncChangedPath(path,this.settings));if(!relevant.length)return;
+    for(const path of relevant)this.pathVersions.set(path,++this.pathRevision);
+    this.settings.pendingPaths=[...this.pathVersions.keys()].sort();this.persistJournalSoon();
     this.lastRelevantVaultChangeAt=Date.now();
     if(!this.settings.syncOnFileChange)return;
     if(this.liveStatus.running){this.fileChangePending=true;return;}
     const delay=Date.now()-this.lastVaultRenameAt<30_000?5000:2000;
     this.queueSync(delay,"Vault file changed","file-change");
+  }
+  private async verifyExpectedMutation(path:string,expectedHash:string|null){
+    await new Promise<void>((resolve)=>window.setTimeout(resolve,50));
+    try{
+      const stat=await this.app.vault.adapter.stat(path);
+      if(!stat&&expectedHash===null){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
+      if(stat?.type==="file"&&expectedHash&&await hashBytes(new Uint8Array(await this.app.vault.adapter.readBinary(path)))===expectedHash){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
+    }catch{}
+    if(this.expectedLocalMutations.get(path)!==expectedHash)return;this.expectedLocalMutations.delete(path);
+    this.scheduleFileChangeSync(path);
+  }
+  requireFullScan(){
+    this.settings.fullScanRequired=true;this.persistJournalSoon();
+    if(!this.settings.deviceToken||!this.settings.syncOnFileChange)return;
+    this.lastRelevantVaultChangeAt=Date.now();if(this.liveStatus.running){this.fileChangePending=true;return;}
+    this.queueSync(5000,"Folder structure changed; reconciling safely","file-change");
+  }
+  private persistJournalSoon(){
+    if(this.journalSaveTimer!==null)window.clearTimeout(this.journalSaveTimer);
+    this.journalSaveTimer=window.setTimeout(()=>{this.journalSaveTimer=null;void this.saveSettings();},250);
   }
   configureFileChangeSync() {
     if(this.settings.syncOnFileChange||this.debounceKind!=="file-change"||this.debounce===null)return;

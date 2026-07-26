@@ -11,13 +11,14 @@ import { DEFAULT_SETTINGS, type GibSyncSettings } from "./settings";
 beforeAll(() => Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true }));
 
 class MemoryAdapter {
-  files = new Map<string, Uint8Array>(); dirs = new Set<string>();
+  files = new Map<string, Uint8Array>(); dirs = new Set<string>();listCalls=0;readCalls:string[]=[];
   async list(path: string) {
+    this.listCalls++;
     const prefix = path ? `${path}/` : ""; const files: string[] = [], folders = new Set<string>();
     for (const name of this.files.keys()) if (name.startsWith(prefix)) { const rest = name.slice(prefix.length); const slash = rest.indexOf("/"); if (slash < 0) files.push(name); else folders.add(`${prefix}${rest.slice(0,slash)}`); }
     return { files, folders:[...folders] };
   }
-  async readBinary(path: string) { return this.files.get(path)!.slice().buffer; }
+  async readBinary(path: string) { this.readCalls.push(path);return this.files.get(path)!.slice().buffer; }
   async writeBinary(path: string, data: ArrayBuffer) { this.files.set(path, new Uint8Array(data)); }
   async stat(path: string) { const bytes = this.files.get(path); return bytes ? {type:"file" as const,ctime:1,mtime:1,size:bytes.length} : null; }
   async exists(path: string) { return this.files.has(path) || this.dirs.has(path); }
@@ -28,6 +29,7 @@ class MemoryAdapter {
 class MemoryApi {
   head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;readyHeads:string[]=[];lastCommitBody:any=null;
   async state() { return {head:this.head}; }
+  async headState() { return {headId:this.head?.id??null}; }
   async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new Error("missing");return snapshot; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
@@ -46,6 +48,21 @@ function settings(): GibSyncSettings {
 }
 
 describe("SyncEngine", () => {
+  it("uses only the lightweight head check when neither side changed",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear);
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000010",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();adapter.files.set("stable.md",clear);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,downloaded:0,fullScan:false});expect(adapter.listCalls).toBe(0);expect(adapter.readCalls).toEqual([]);
+  });
+  it("hashes only journaled paths and preserves the rest of the baseline",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),oldChanged=new TextEncoder().encode("old\n"),changed=new TextEncoder().encode("new\n"),stable=new TextEncoder().encode("stable\n");
+    const oldHash=await hashBytes(oldChanged),stableHash=await hashBytes(stable),base:Snapshot={id:"00000000-0000-4000-8000-000000000011",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"changed.md",hash:oldHash,size:oldChanged.length,mtime:1},{path:"stable.md",hash:stableHash,size:stable.length,mtime:1}]};
+    api.head=base;api.snapshots.set(base.id,base);api.blobs.set(oldHash,await encryptBlob(oldChanged,config.vaultKey,oldHash));api.blobs.set(stableHash,await encryptBlob(stable,config.vaultKey,stableHash));config.initialized=true;config.lastSnapshotId=base.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["changed.md"];
+    adapter.files.set("changed.md",changed);adapter.files.set("stable.md",stable);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:1,fullScan:false,processedPaths:["changed.md"]});expect(adapter.listCalls).toBe(0);expect(adapter.readCalls.every((path)=>path==="changed.md")).toBe(true);expect(api.head?.entries.map((entry)=>entry.path).sort()).toEqual(["changed.md","stable.md"]);
+  });
   it("pushes a new desktop vault as an encrypted snapshot", async () => {
     const adapter = new MemoryAdapter(); const api = new MemoryApi(); const config = settings(); const clear = new TextEncoder().encode("hello\n"); adapter.files.set("note.md",clear);
     const engine = new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}); const result = await engine.sync();

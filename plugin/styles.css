@@ -52,6 +52,12 @@
 .gib-sync-desktop-status.is-hidden { display: none; }
 .gib-sync-indicator-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; color: var(--text-muted); }
 .gib-sync-indicator-icon svg { width: 16px; height: 16px; stroke-width: 2.25; }
+.gib-sync-progress-ring { --gib-sync-progress: 25%; position: relative; display: inline-block; flex: none; width: 16px; height: 16px; border-radius: 50%; background: conic-gradient(var(--interactive-accent) var(--gib-sync-progress), color-mix(in srgb, var(--interactive-accent) 20%, transparent) 0); }
+.gib-sync-progress-ring::after { position: absolute; inset: 3px; border-radius: 50%; background: var(--background-primary); content: ""; }
+.gib-sync-mobile-sidebar-indicator .gib-sync-progress-ring::after { background: var(--background-secondary); }
+.gib-sync-mobile-top-indicator .gib-sync-progress-ring { width: 12px; height: 12px; }
+.gib-sync-mobile-top-indicator .gib-sync-progress-ring::after { inset: 2px; }
+.gib-sync-progress-ring.is-indeterminate { animation: gib-sync-ring 1s linear infinite; }
 .gib-sync-desktop-status.is-success .gib-sync-indicator-icon, .gib-sync-indicator.is-success .gib-sync-indicator-icon { color: var(--color-green); }
 .gib-sync-desktop-status.is-active .gib-sync-indicator-icon, .gib-sync-indicator.is-active .gib-sync-indicator-icon { color: var(--interactive-accent); }
 .gib-sync-desktop-status.is-warning .gib-sync-indicator-icon, .gib-sync-indicator.is-warning .gib-sync-indicator-icon { color: var(--color-orange); }
@@ -70,6 +76,7 @@
 .gib-sync-indicator.is-error .gib-sync-indicator-dot { border-color: var(--color-red); border-radius: 2px; background: var(--color-red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-red) 15%, transparent); }
 .gib-sync-indicator.is-animated .gib-sync-indicator-dot { animation: gib-sync-pulse 1.2s ease-in-out infinite; }
 @keyframes gib-sync-spin { to { transform: rotate(360deg); } }
+@keyframes gib-sync-ring { to { transform: rotate(360deg); } }
 .gib-sync-status-modal { width: min(620px, calc(100vw - 32px)); }
 .gib-sync-status-overview { display: flex; align-items: center; gap: .75rem; padding: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px 12px 0 0; background: var(--background-secondary); }
 .gib-sync-status-overview-icon { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 50%; background: var(--background-primary-alt); color: var(--text-muted); }
@@ -92,6 +99,7 @@
   .gib-sync-desktop-status.is-animated .gib-sync-indicator-icon,
   .gib-sync-indicator.is-animated .gib-sync-indicator-icon,
   .gib-sync-indicator.is-animated .gib-sync-indicator-dot,
+  .gib-sync-progress-ring,
   .gib-sync-status-head .gib-sync-status-dot { animation: none; }
 }
 

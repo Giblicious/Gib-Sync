@@ -11,7 +11,7 @@ type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<stri
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
-export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; }
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
@@ -27,7 +27,8 @@ export class SyncEngine {
     private readonly getSettings: () => GibSyncSettings,
     private readonly saveSettings: () => Promise<void>,
     private readonly status: (progress: SyncProgress) => void,
-    private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds))
+    private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
+    private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{}
   ) {}
 
   sync(): Promise<SyncResult> {
@@ -38,8 +39,8 @@ export class SyncEngine {
   async restoreAcceptedSnapshot():Promise<{downloaded:number;deleted:number}>{
     const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
-    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);await this.adapter.writeBinary(path,clear.slice().buffer);downloaded++;}
-    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){await this.adapter.remove(path);deleted++;}
+    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,clear.slice().buffer);downloaded++;}
+    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
     settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
   }
 
@@ -67,6 +68,25 @@ export class SyncEngine {
       // tighter memory limits, so changed content is read lazily when required.
       output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now() });
       current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:"Scanning local vault",current,total:paths.length});
+    }
+    return {files:output,unreadableConflictPaths};
+  }
+
+  private async scanIncremental(baseSnapshot:Snapshot,changedPaths:string[]):Promise<LocalScan>{
+    const output=this.map(baseSnapshot),unreadableConflictPaths=new Set<string>();let current=0;
+    for(const rawPath of changedPaths){
+      const path=normalizePath(rawPath);current++;
+      if(!this.include(path)){output.delete(path);continue;}
+      const stat=await this.adapter.stat(path);
+      if(!stat){output.delete(path);continue;}
+      if(stat.type!=="file")throw new SyncSafetyError("A changed folder requires a full vault reconciliation before syncing.");
+      try{
+        const bytes=new Uint8Array(await this.adapter.readBinary(path));output.set(path,{path,hash:await hashBytes(bytes),size:bytes.length,mtime:stat.mtime??Date.now()});
+      }catch(error){
+        if(!isGibSyncConflictPath(path))throw error;output.delete(path);unreadableConflictPaths.add(path);
+        this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});
+      }
+      this.status({phase:"scanning",message:"Checking changed files",current,total:changedPaths.length});
     }
     return {files:output,unreadableConflictPaths};
   }
@@ -181,10 +201,21 @@ export class SyncEngine {
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
-    this.status({phase:"scanning",message:"Listing local vault files"}); const scanned = await this.scan(),local=scanned.files;
-    this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
     const requestedBaseId=settings.lastSnapshotId;
+    const pendingPaths=[...new Set(settings.pendingPaths.map((path)=>normalizePath(path)).filter(Boolean))];
+    const lastAudit=settings.lastFullScanAt?Date.parse(settings.lastFullScanAt):0,auditDue=!lastAudit||Date.now()-lastAudit>=6*60*60*1000;
+    this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
+    let remoteHeadId:string|null;
+    try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
+    if(settings.initialized&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
+      this.status({phase:"up-to-date",message:"Up to date · no local or server changes"});
+      return {uploaded:0,downloaded:0,deleted:0,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
+    }
+    const remoteSnapshot=(await this.api.state()).head;
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
+    const fullScan=settings.fullScanRequired||!settings.initialized||!baseSnapshot||auditDue;
+    this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
+    const scanned=fullScan?await this.scan():await this.scanIncremental(baseSnapshot!,pendingPaths),local=scanned.files;
     let onboardingReconcile=false;
     if(settings.initialized&&requestedBaseId&&!baseSnapshot&&local.size){
       throw new SyncSafetyError("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
@@ -320,17 +351,17 @@ export class SyncEngine {
     for (const [path, entry] of applyOrder) {
       if (physicalLocal.get(path)?.hash === entry.hash) continue;
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
-      await this.ensureParent(path); await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
+      await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
     }
     for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
       if(scanned.unreadableConflictPaths.has(path)){
         this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});
         continue;
       }
-      await this.adapter.remove(path); deleted++;
+      this.expectLocalMutation(path,null);await this.adapter.remove(path); deleted++;
     }
     for(const path of orphanUnreadableConflicts){
-      try{await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}
+      try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}
       catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}
     }
 
@@ -347,7 +378,8 @@ export class SyncEngine {
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
-      return { uploaded: 0, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId };
+      if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
+      return { uploaded: 0, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
     }
 
     if(!settings.initialized&&remoteSnapshot){
@@ -375,6 +407,7 @@ export class SyncEngine {
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
-    return { uploaded, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId };
+    if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
+    return { uploaded, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
   }
 }
