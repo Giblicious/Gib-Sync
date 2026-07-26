@@ -29,6 +29,20 @@ describe("safeguard assessment",()=>{
     const result=assessChanges([entry("note.md","a",10)],[entry("note.md","b",1000)],BALANCED_POLICY,{highEntropyPaths:["note.md"]});
     expect(result.assessment.reasons).toEqual(["1 files resemble encrypted or high-entropy content"]);
   });
+  it("allows a large folder move and recognizes edited siblings as moves",()=>{
+    const before=Array.from({length:50},(_,index)=>entry(`Old folder/note-${index}.md`,`hash-${index}`,100));
+    const after=before.map((item,index)=>({...item,path:item.path.replace("Old folder/","New folder/"),hash:index===0?"edited".padEnd(64,"0"):item.hash,size:index===0?120:item.size}));
+    const result=assessChanges(before,after,BALANCED_POLICY);
+    expect(result.assessment).toMatchObject({created:0,deleted:0,modified:0,moved:50,totalChanged:50,reasons:[]});
+  });
+  it("still guards against extreme growth inside a recognized folder move",()=>{
+    const before=[entry("Old/large.bin","old",1024*1024),entry("Old/a.md","a"),entry("Old/b.md","b")];
+    const after=[entry("New/large.bin","rewritten",60*1024*1024),entry("New/a.md","a"),entry("New/b.md","b")];
+    const result=assessChanges(before,after,BALANCED_POLICY);
+    expect(result.assessment).toMatchObject({created:0,deleted:0,moved:3});
+    expect(result.assessment.reasons).toContain("1 files grew unexpectedly");
+    expect(result.assessment.bytesAdded).toBe(59*1024*1024);
+  });
   it("allows declared cleanup only for server-recognized device-local plugin data",()=>{
     const caches=Array.from({length:20},(_,index)=>entry(`.obsidian/plugins/gib-search/embeddings/model/chunk-${index}.bin`,String(index%10)));
     const result=assessChanges([entry("note.md","a"),...caches],[entry("note.md","a")],BALANCED_POLICY,{deviceLocalCleanupPaths:caches.map((item)=>item.path),staleBaseline:true});

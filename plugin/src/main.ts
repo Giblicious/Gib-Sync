@@ -12,6 +12,7 @@ export default class GibSyncPlugin extends Plugin {
   private statusEl!: HTMLElement; private timer: number | null = null; private debounce: number | null = null;
   private debounceKind: "automatic"|"file-change"|null = null;
   private fileChangePending = false;
+  private lastRelevantVaultChangeAt = 0;
   private watchGeneration = 0;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
@@ -281,6 +282,8 @@ export default class GibSyncPlugin extends Plugin {
     if(this.settings.paused){this.openStatusOverview();return false;}
     if(await this.checkObsidianSyncProtection(true))return false;
     if (this.liveStatus.running) return false;
+    const quietFor=Date.now()-this.lastRelevantVaultChangeAt;
+    if(this.lastRelevantVaultChangeAt&&quietFor<2000){this.queueSync(2250-quietFor,"Waiting for file operations to settle","file-change");return false;}
     const identity=this.currentVaultIdentity();
     if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
       const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
@@ -330,7 +333,9 @@ export default class GibSyncPlugin extends Plugin {
     this.queueSync(delay,"Automatic sync","automatic");
   }
   scheduleFileChangeSync(...paths:string[]) {
-    if(!this.settings.syncOnFileChange||!this.settings.deviceToken||!paths.some((path)=>shouldSyncChangedPath(path,this.settings)))return;
+    if(!this.settings.deviceToken||!paths.some((path)=>shouldSyncChangedPath(path,this.settings)))return;
+    this.lastRelevantVaultChangeAt=Date.now();
+    if(!this.settings.syncOnFileChange)return;
     if(this.liveStatus.running){this.fileChangePending=true;return;}
     this.queueSync(2000,"Vault file changed","file-change");
   }

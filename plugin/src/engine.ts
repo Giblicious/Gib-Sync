@@ -1,12 +1,12 @@
 import { normalizePath, type DataAdapter } from "obsidian";
-import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
+import { detectMoves, type ManifestEntry, type Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
 import { isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
 import { mergeSystemJson } from "./system-merge";
 
-type FileState = ManifestEntry & { bytes?: Uint8Array };
+type FileState = ManifestEntry & { bytes?: Uint8Array; sourcePath?:string };
 type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<string> };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
@@ -76,8 +76,8 @@ export class SyncEngine {
   }
   private async localBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>):Promise<Uint8Array>{
     const cached=cache.get(entry.hash);if(cached)return cached;
-    const clear=new Uint8Array(await this.adapter.readBinary(path));
-    if(await hashBytes(clear)!==entry.hash)throw new FileChangedDuringReadError(path);
+    const sourcePath=entry.sourcePath??path,clear=new Uint8Array(await this.adapter.readBinary(sourcePath));
+    if(await hashBytes(clear)!==entry.hash)throw new FileChangedDuringReadError(sourcePath);
     cache.set(entry.hash,clear);return clear;
   }
 
@@ -135,6 +135,27 @@ export class SyncEngine {
     final.set(copyPath,{path:copyPath,hash:copyHash,size:copyClear.length,mtime:Date.now(),bytes:copyClear});
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
+  private canonicalizeMoves(base:Map<string,FileState>,local:Map<string,FileState>,remote:Map<string,FileState>):number{
+    const localMoves=new Map(detectMoves([...base.values()],[...local.values()]).map((item)=>[item.previousPath,item.path]));
+    const remoteMoves=new Map(detectMoves([...base.values()],[...remote.values()]).map((item)=>[item.previousPath,item.path]));
+    const sources=[...new Set([...localMoves.keys(),...remoteMoves.keys()])].sort(),claimed=new Set<string>();let recognized=0;
+    for(const source of sources){
+      const b=base.get(source),localDestination=localMoves.get(source),remoteDestination=remoteMoves.get(source);if(!b)continue;
+      const localPath=localDestination??source,remotePath=remoteDestination??source,l=local.get(localPath),r=remote.get(remotePath);if(!l&&!r)continue;
+      if(localDestination&&!remoteDestination&&remote.has(localDestination))continue;
+      if(remoteDestination&&!localDestination&&local.has(remoteDestination))continue;
+      if(localDestination&&remoteDestination&&localDestination!==remoteDestination&&(remote.has(localDestination)||local.has(remoteDestination)))continue;
+      let destination=localDestination??remoteDestination!;
+      if(localDestination&&remoteDestination&&localDestination!==remoteDestination)destination=(l?.mtime??0)>(r?.mtime??0)?localDestination:remoteDestination;
+      if(!destination||claimed.has(destination)||base.has(destination))continue;claimed.add(destination);
+      base.delete(source);local.delete(source);remote.delete(source);if(localDestination)local.delete(localDestination);if(remoteDestination)remote.delete(remoteDestination);
+      base.set(destination,{...b,path:destination});
+      if(l)local.set(destination,{...l,path:destination,sourcePath:l.sourcePath??localPath});
+      if(r)remote.set(destination,{...r,path:destination});
+      recognized++;
+    }
+    return recognized;
+  }
   private packageSame(left:Map<string,FileState>,right:Map<string,FileState>):boolean{return left.size===right.size&&[...left].every(([path,entry])=>right.get(path)?.hash===entry.hash);}
   private packageMtime(entries:Map<string,FileState>):number{return Math.max(0,...[...entries.values()].map((entry)=>entry.mtime));}
   private compareVersions(left:string|null,right:string|null):number{
@@ -179,10 +200,11 @@ export class SyncEngine {
         this.status({phase:"merging",message:`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`});
       }
     }
-    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const final = new Map<string, FileState>();
+    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
+    if(recognizedMoves)this.status({phase:"merging",message:`Recognized ${recognizedMoves} file move${recognizedMoves===1?"":"s"} by content identity; edits will follow the destination`,level:"success"});
     const handledPluginPaths=new Set<string>();
     if(settings.syncPlugins){
       const pluginIds=new Set([...paths].map((path)=>obsidianPluginPath(path)?.id).filter((id):id is string=>Boolean(id)));
@@ -295,11 +317,11 @@ export class SyncEngine {
       return rank(left)-rank(right)||left.localeCompare(right);
     });
     for (const [path, entry] of applyOrder) {
-      if (local.get(path)?.hash === entry.hash) continue;
+      if (physicalLocal.get(path)?.hash === entry.hash) continue;
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
       await this.ensureParent(path); await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
     }
-    for (const path of local.keys()) if (!final.has(path) && this.include(path)) {
+    for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
       if(scanned.unreadableConflictPaths.has(path)){
         this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});
         continue;

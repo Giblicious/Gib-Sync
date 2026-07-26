@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ManifestEntry,Snapshot } from "@gib-sync/protocol";
+import { detectMoves, type ManifestEntry,type Snapshot } from "@gib-sync/protocol";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { mergeText } from "./merge.js";
@@ -105,8 +105,20 @@ export class ExternalImporter{
       downloaded.set(metadata.path,{metadata,bytes,hash});
     }
 
-    const newBytes=new Map<string,Uint8Array>();let changedFiles=0,deletedFiles=0,conflicts=0;
+    const nextReadable=new Map<string,ManifestEntry>([...mirrored.values()].map((entry)=>[entry.path,{path:entry.path,hash:entry.hash,size:entry.size,mtime:(entry.storage_mtime??0)*1000}]));
+    for(const missing of deleted)nextReadable.delete(missing.path);
+    for(const [path,item] of downloaded)nextReadable.set(path,{path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000});
+    const deletedPaths=new Set(deleted.map((entry)=>entry.path)),externalMoves=detectMoves([...mirrored.values()].map((entry)=>({path:entry.path,hash:entry.hash,size:entry.size,mtime:(entry.storage_mtime??0)*1000})),[...nextReadable.values()])
+      .filter((move)=>deletedPaths.has(move.previousPath)&&downloaded.has(move.path));
+    const handledDownloads=new Set<string>(),handledDeletes=new Set<string>(),newBytes=new Map<string,Uint8Array>();let changedFiles=0,deletedFiles=0,conflicts=0;
+    for(const move of externalMoves){
+      const item=downloaded.get(move.path)!;if(final.has(move.path))continue;
+      const current=final.get(move.previousPath),externalEntry:ManifestEntry={path:move.path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000};
+      final.delete(move.previousPath);final.set(move.path,current?{...current,path:move.path,mtime:Math.max(current.mtime,externalEntry.mtime)}:externalEntry);
+      newBytes.set(item.hash,item.bytes);handledDownloads.add(move.path);handledDeletes.add(move.previousPath);changedFiles++;
+    }
     for(const [path,item] of downloaded){
+      if(handledDownloads.has(path))continue;
       const base=mirrored.get(path),current=final.get(path);
       if(item.hash===base?.hash||item.hash===current?.hash)continue;
       changedFiles++;
@@ -137,6 +149,7 @@ export class ExternalImporter{
       this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);
     }
     for(const missing of deleted){
+      if(handledDeletes.has(missing.path))continue;
       const current=final.get(missing.path);if(!current)continue;
       if(current.hash===missing.hash){final.delete(missing.path);deletedFiles++;}
       else{

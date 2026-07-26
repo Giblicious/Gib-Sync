@@ -253,6 +253,19 @@ describe("Gib Sync API", () => {
     const held=(await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json();expect(held).toHaveLength(1);expect(held[0]).toMatchObject({source:"seafile",assessment:{deleted:10}});
     await app.close();
   });
+  it("carries an Obsidian edit through a concurrent Seafile move without duplication",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
+    const base=Buffer.from("base note\n"),baseHash=sha256(base);await app.inject({method:"PUT",url:`/v1/blobs/${baseHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(base,key,baseHash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Base",entries:[{path:"Old/note.md",hash:baseHash,size:base.length,mtime:1}]}})).json();
+    storage.files.set(`read:${credentials.vaultId}:Old/note.md`,base);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",credentials.vaultId,"Old/note.md",baseHash,base.length,new Date().toISOString(),sha256(base),1);store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",first.id,credentials.vaultId);
+    const edited=Buffer.from("edited in Obsidian\n"),editedHash=sha256(edited);await app.inject({method:"PUT",url:`/v1/blobs/${editedHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(edited,key,editedHash)});
+    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Edit",entries:[{path:"Old/note.md",hash:editedHash,size:edited.length,mtime:2}]}})).json();
+    storage.files.delete(`read:${credentials.vaultId}:Old/note.md`);storage.files.set(`read:${credentials.vaultId}:New/note.md`,base);
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:1,deletedFiles:0,conflicts:0});
+    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.parentId).toBe(second.id);expect(head.entries).toEqual([{path:"New/note.md",hash:editedHash,size:edited.length,mtime:expect.any(Number)}]);
+    await app.close();
+  });
   it("does not import its own readable writes while the mirror is catching up",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},key=Buffer.from(setup.vaultKey,"base64url");

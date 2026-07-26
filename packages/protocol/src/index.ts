@@ -228,6 +228,42 @@ export interface HealthAlert {
   at: string;
 }
 
+export interface DetectedMove {
+  previousPath: string;
+  path: string;
+}
+
+const movedPrefix=(previousPath:string,path:string):{previous:string;next:string}|null=>{
+  const previous=previousPath.split("/"),next=path.split("/");let suffix=0;
+  while(suffix<previous.length&&suffix<next.length&&previous[previous.length-1-suffix]===next[next.length-1-suffix])suffix++;
+  if(!suffix)return null;const previousPrefix=previous.slice(0,previous.length-suffix).join("/"),nextPrefix=next.slice(0,next.length-suffix).join("/");
+  return previousPrefix!==nextPrefix?{previous:previousPrefix,next:nextPrefix}:null;
+};
+
+/** Detects stable path moves, including edited files inside a folder move. */
+export function detectMoves(previous:ManifestEntry[],next:ManifestEntry[]):DetectedMove[]{
+  const before=new Map(previous.map((entry)=>[entry.path,entry])),after=new Map(next.map((entry)=>[entry.path,entry]));
+  const removed=[...before.values()].filter((entry)=>!after.has(entry.path)),created=[...after.values()].filter((entry)=>!before.has(entry.path));
+  const removedByHash=new Map<string,ManifestEntry[]>(),createdByHash=new Map<string,ManifestEntry[]>();
+  for(const entry of removed){const group=removedByHash.get(entry.hash)??[];group.push(entry);removedByHash.set(entry.hash,group);}
+  for(const entry of created){const group=createdByHash.get(entry.hash)??[];group.push(entry);createdByHash.set(entry.hash,group);}
+  const result=new Map<string,string>(),usedCreated=new Set<string>();
+  for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1)continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
+
+  // Exact matches reveal a folder-prefix move. Once at least two files agree
+  // on that prefix, carry edited siblings to their corresponding new paths.
+  const prefixCounts=new Map<string,{previous:string;next:string;count:number}>();
+  for(const [source,destination] of result){const prefixes=movedPrefix(source,destination);if(!prefixes)continue;const key=`${prefixes.previous}\0${prefixes.next}`,current=prefixCounts.get(key);if(current)current.count++;else prefixCounts.set(key,{...prefixes,count:1});}
+  const mappings=[...prefixCounts.values()].filter((item)=>item.count>=2).sort((left,right)=>right.previous.length-left.previous.length||right.count-left.count);
+  for(const source of removed){if(result.has(source.path))continue;
+    for(const mapping of mappings){const prefix=mapping.previous?`${mapping.previous}/`:"";if(prefix&&!source.path.startsWith(prefix))continue;if(!prefix&&source.path.includes("/"))continue;
+      const suffix=prefix?source.path.slice(prefix.length):source.path,candidate=mapping.next?`${mapping.next}/${suffix}`:suffix;
+      if(usedCreated.has(candidate)||before.has(candidate)||!after.has(candidate))continue;result.set(source.path,candidate);usedCreated.add(candidate);break;
+    }
+  }
+  return [...result].map(([previousPath,path])=>({previousPath,path})).sort((left,right)=>left.previousPath.localeCompare(right.previousPath));
+}
+
 export interface HealthRepairResult {
   headId: string | null;
   mirrorCurrent: boolean;

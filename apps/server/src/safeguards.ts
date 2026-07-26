@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ChangeAssessment,ChangeItem,ClientSafetySignals,ManifestEntry,QuarantineItem,SafeguardPolicy,Snapshot } from "@gib-sync/protocol";
+import { detectMoves, type ChangeAssessment,type ChangeItem,type ClientSafetySignals,type ManifestEntry,type QuarantineItem,type SafeguardPolicy,type Snapshot } from "@gib-sync/protocol";
 import { Store } from "./db.js";
 import { sha256 } from "./security.js";
 
@@ -35,24 +35,25 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
   const trustedCleanup=(path:string)=>requestedCleanup.has(normalize(path))&&isDeviceLocalObsidianPath(path);
   const allRawDeleted=[...before.values()].filter((entry)=>!after.has(entry.path));
   const rawDeleted=allRawDeleted.filter((entry)=>!trustedCleanup(entry.path)),rawCreated=[...after.values()].filter((entry)=>!before.has(entry.path));
-  const createdByHash=new Map<string,ManifestEntry[]>();for(const entry of rawCreated){const values=createdByHash.get(entry.hash)??[];values.push(entry);createdByHash.set(entry.hash,values);}
-  const moved:ChangeItem[]=[],deleted:ChangeItem[]=[],usedCreated=new Set<string>();
-  for(const entry of rawDeleted){const match=createdByHash.get(entry.hash)?.find((candidate)=>!usedCreated.has(candidate.path));if(match){usedCreated.add(match.path);moved.push({path:match.path,previousPath:entry.path,kind:"moved",previousSize:entry.size,size:match.size});}else deleted.push({path:entry.path,kind:"deleted",previousSize:entry.size});}
+  const detectedMoves=detectMoves(rawDeleted,rawCreated),movedSources=new Map(detectedMoves.map((item)=>[item.previousPath,item.path])),usedCreated=new Set(detectedMoves.map((item)=>item.path));
+  const moved:ChangeItem[]=detectedMoves.map((item)=>({path:item.path,previousPath:item.previousPath,kind:"moved",previousSize:before.get(item.previousPath)?.size,size:after.get(item.path)?.size}));
+  const deleted:ChangeItem[]=rawDeleted.filter((entry)=>!movedSources.has(entry.path)).map((entry)=>({path:entry.path,kind:"deleted",previousSize:entry.size}));
   const created=rawCreated.filter((entry)=>!usedCreated.has(entry.path)).map<ChangeItem>((entry)=>({path:entry.path,kind:"created",size:entry.size}));
   const modified=[...after.values()].filter((entry)=>before.has(entry.path)&&before.get(entry.path)!.hash!==entry.hash)
     .map<ChangeItem>((entry)=>({path:entry.path,kind:"modified",previousSize:before.get(entry.path)!.size,size:entry.size}));
   const changes=[...deleted,...created,...modified,...moved].sort((left,right)=>left.path.localeCompare(right.path));
-  const relevantPrevious=previous.length-(allRawDeleted.length-rawDeleted.length),baseline=Math.max(1,relevantPrevious),totalChanged=changes.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
-  const bytesRemoved=deleted.reduce((sum,item)=>sum+(item.previousSize??0),0)+modified.reduce((sum,item)=>sum+Math.max(0,(item.previousSize??0)-(item.size??0)),0);
-  const bytesAdded=created.reduce((sum,item)=>sum+(item.size??0),0)+modified.reduce((sum,item)=>sum+Math.max(0,(item.size??0)-(item.previousSize??0)),0);
+  const relevantPrevious=previous.length-(allRawDeleted.length-rawDeleted.length),baseline=Math.max(1,relevantPrevious),totalChanged=changes.length,riskyChanged=deleted.length+created.length+modified.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
+  const resized=[...modified,...moved];
+  const bytesRemoved=deleted.reduce((sum,item)=>sum+(item.previousSize??0),0)+resized.reduce((sum,item)=>sum+Math.max(0,(item.previousSize??0)-(item.size??0)),0);
+  const bytesAdded=created.reduce((sum,item)=>sum+(item.size??0),0)+resized.reduce((sum,item)=>sum+Math.max(0,(item.size??0)-(item.previousSize??0)),0);
   const reasons:string[]=[];
   if(deleted.length>=policy.deletionCount)reasons.push(`${deleted.length} files would be deleted`);
   if(deleted.length>=policy.smallVaultDeletionCount&&deleted.length/baseline*100>=policy.smallVaultDeletionPercent)reasons.push(`${Math.round(deleted.length/baseline*100)}% of the vault would be deleted`);
-  if(totalChanged>=policy.changedCount)reasons.push(`${totalChanged} files would change`);
-  if(totalChanged/baseline*100>=policy.changedPercent&&totalChanged>=5)reasons.push(`${affectedPercent}% of the vault would change`);
-  const folderCounts=new Map<string,number>();for(const item of [...deleted,...moved]){const folder=(item.previousPath??item.path).split("/")[0];folderCounts.set(folder,(folderCounts.get(folder)??0)+1);}
+  if(riskyChanged>=policy.changedCount)reasons.push(`${riskyChanged} files would change beyond recognized moves`);
+  if(riskyChanged/baseline*100>=policy.changedPercent&&riskyChanged>=5)reasons.push(`${Math.round(riskyChanged/baseline*1000)/10}% of the vault would change beyond recognized moves`);
+  const folderCounts=new Map<string,number>();for(const item of deleted){const folder=item.path.split("/")[0];folderCounts.set(folder,(folderCounts.get(folder)??0)+1);}
   for(const [folder,count] of folderCounts)if(count>=policy.folderImpactCount)reasons.push(`${count} files would leave ${folder||"the vault root"}`);
-  const growth=modified.filter((item)=>(item.size??0)-(item.previousSize??0)>=policy.fileGrowthBytes||((item.previousSize??0)>=1024*1024&&(item.size??0)/(item.previousSize??1)*100>=policy.fileGrowthPercent));
+  const growth=resized.filter((item)=>(item.size??0)-(item.previousSize??0)>=policy.fileGrowthBytes||((item.previousSize??0)>=1024*1024&&(item.size??0)/(item.previousSize??1)*100>=policy.fileGrowthPercent));
   if(growth.length)reasons.push(`${growth.length} files grew unexpectedly`);
   const extensionChanges=moved.filter((item)=>extension(item.path)!==extension(item.previousPath??""));
   if(extensionChanges.length>=5)reasons.push(`${extensionChanges.length} files changed extension`);

@@ -130,6 +130,25 @@ describe("SyncEngine", () => {
     expect(adapter.files.get(".obsidian/plugins/calendar/main.js")).toEqual(pluginBytes);expect(adapter.files.has(".obsidian/workspace.json")).toBe(false);expect(adapter.files.has(".obsidian/plugins/gib-search/embeddings/model/index.meta.json")).toBe(false);
     expect(api.readyHeads).toEqual(["00000000-0000-4000-8000-000000000204"]);expect(api.head?.entries.map((entry)=>entry.path)).toEqual([".obsidian/plugins/calendar/main.js"]);
   });
+  it("carries concurrent edits to the destination of a folder move",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;
+    const encode=(value:string)=>new TextEncoder().encode(value),baseValues=[encode("a\nb\nc\n"),encode("two\n"),encode("three\n")],localValues=[encode("A\nb\nc\n"),baseValues[1],baseValues[2]],remoteValues=[encode("a\nb\nC\n"),baseValues[1],baseValues[2]];
+    const baseEntries:Snapshot["entries"]=[],remoteEntries:Snapshot["entries"]=[];
+    for(let index=0;index<3;index++){const baseHash=await hashBytes(baseValues[index]),remoteHash=await hashBytes(remoteValues[index]);baseEntries.push({path:`Old/note-${index}.md`,hash:baseHash,size:baseValues[index].length,mtime:1});remoteEntries.push({path:`Old/note-${index}.md`,hash:remoteHash,size:remoteValues[index].length,mtime:index===0?3:1});api.blobs.set(baseHash,await encryptBlob(baseValues[index],config.vaultKey,baseHash));api.blobs.set(remoteHash,await encryptBlob(remoteValues[index],config.vaultKey,remoteHash));adapter.files.set(`New/note-${index}.md`,localValues[index]);}
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000710",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:baseEntries};
+    api.snapshots.set(base.id,base);api.head={...base,id:"00000000-0000-4000-8000-000000000711",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:remoteEntries};config.lastSnapshotId=base.id;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(api.head?.entries.every((entry)=>entry.path.startsWith("New/"))).toBe(true);expect([...adapter.files.keys()].some((path)=>path.startsWith("Old/"))).toBe(false);
+    expect(new TextDecoder().decode(adapter.files.get("New/note-0.md"))).toBe("A\nb\nC\n");
+  });
+  it("converges simultaneous moves to one destination instead of duplicating files",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;const entries:Snapshot["entries"]=[];
+    for(let index=0;index<3;index++){const clear=new TextEncoder().encode(`note ${index}\n`),hash=await hashBytes(clear);entries.push({path:`Old/note-${index}.md`,hash,size:clear.length,mtime:1});api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash));adapter.files.set(`Local destination/note-${index}.md`,clear);}
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000720",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries};api.snapshots.set(base.id,base);config.lastSnapshotId=base.id;
+    api.head={...base,id:"00000000-0000-4000-8000-000000000721",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:entries.map((entry)=>({...entry,path:entry.path.replace("Old/","Remote destination/")}))};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync(),paths=api.head!.entries.map((entry)=>entry.path);
+    expect(result.conflicts).toBe(0);expect(paths).toHaveLength(3);expect(paths.every((path)=>path.startsWith("Remote destination/"))).toBe(true);expect([...adapter.files.keys()].every((path)=>path.startsWith("Remote destination/"))).toBe(true);
+  });
   it("semantically combines Obsidian settings without creating deep conflict files",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncObsidianConfig=true;
     const baseBytes=new TextEncoder().encode('{"theme":"old","editor":{"line":true}}'),localBytes=new TextEncoder().encode('{"theme":"dark","editor":{"line":true}}'),remoteBytes=new TextEncoder().encode('{"theme":"old","editor":{"line":false}}');
