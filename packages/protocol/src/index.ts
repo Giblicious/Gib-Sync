@@ -233,6 +233,7 @@ export interface HealthRepairResult {
   mirrorCurrent: boolean;
   restoredFiles: number;
   removedFiles: number;
+  removedConflictCopies: number;
   dismissedQuarantines: number;
   clearedAlerts: number;
 }

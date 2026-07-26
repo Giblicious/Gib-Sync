@@ -3,7 +3,7 @@ import type { StorageLocation } from "@gib-sync/protocol";
 
 export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
-export interface SyncActivity { at:string; phase:SyncPhase; level:ActivityLevel; message:string; current?:number; total?:number; }
+export interface SyncActivity { at:string; phase:SyncPhase; level:ActivityLevel; message:string; current?:number; total?:number; repeats?:number; }
 export interface LiveSyncStatus {
   phase:SyncPhase; message:string; running:boolean; current?:number; total?:number;
   startedAt:string|null; completedAt:string|null; lastSuccessAt:string|null; lastErrorAt:string|null; lastError:string;
@@ -64,7 +64,12 @@ export function isGeneratedPluginPath(path:string):boolean {
 
 export function isLegacyObsidianConflictPath(path:string):boolean {
   const normalized=path.replace(/\\/g,"/").replace(/^\/+/g,"");
-  return normalized.toLowerCase().startsWith(".obsidian/")&&/ \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?:\.[^/]+)?$/i.test(normalized);
+  return normalized.toLowerCase().startsWith(".obsidian/")&&isGibSyncConflictPath(normalized);
+}
+
+export function isGibSyncConflictPath(path:string):boolean {
+  const normalized=path.replace(/\\/g,"/").replace(/^\/+/g,"");
+  return / \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?:\.[^/]+)?$/i.test(normalized);
 }
 
 export function isDeviceLocalObsidianPath(path:string):boolean {

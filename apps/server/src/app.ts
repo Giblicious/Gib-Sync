@@ -31,7 +31,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
   const safeguards=new SafeguardService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null;
-  const skipExternalOnce=new Set<string>(),healthRepairLocks=new Set<string>();
+  const skipExternalOnce=new Set<string>(),healthRepairLocks=new Set<string>(),mirrorWriteSettles=new Map<string,number>();
   const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
   function notifyVault(vaultId:string,headId:string|null,attention=false){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
@@ -65,6 +65,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   const mirrorJobs=new Map<string,Promise<void>>();const mirrorTimers=new Set<NodeJS.Timeout>();
   async function ingestExternalChanges(vaultId:string,fresh=false){
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
+    const settlingUntil=mirrorWriteSettles.get(vaultId)??0;if(settlingUntil>Date.now())return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};if(settlingUntil)mirrorWriteSettles.delete(vaultId);
     const result=await externalImporter.scan(vaultId,fresh);
     if(result.snapshotId){notifyVault(vaultId,result.snapshotId);scheduleMirror(vaultId,50);app.log.info({vaultId,...result},"Imported external Seafile changes");}
     else if(result.quarantineId){const headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id??null;notifyVault(vaultId,headId,true);}
@@ -77,9 +78,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const vault=store.one<{head_id:string|null;mirror_head_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id||vault.mirror_head_id===vault.head_id)return;
       const snapshot=store.getSnapshot(vault.head_id);if(!snapshot)return;const row=storageRow(vaultId);const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);const target=new Set(snapshot.entries.map((entry)=>entry.path));
       for(const entry of snapshot.entries){const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash)continue;
-        const encrypted=await storage.get(row,`blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`);const clear=decryptVaultBlob(encrypted,key,entry.hash);await storage.putReadable(row,entry.path,clear);
+        const encrypted=await storage.get(row,`blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`);const clear=decryptVaultBlob(encrypted,key,entry.hash);mirrorWriteSettles.set(vaultId,Date.now()+5000);await storage.putReadable(row,entry.path,clear);
         store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",vaultId,entry.path,entry.hash,clear.length,new Date().toISOString());}
-      for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",vaultId)){if(target.has(path))continue;await storage.deleteReadable(row,path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,path);}
+      for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",vaultId)){if(target.has(path))continue;mirrorWriteSettles.set(vaultId,Date.now()+5000);await storage.deleteReadable(row,path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,path);}
       const latest=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id;if(latest===snapshot.id){store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",snapshot.id,vaultId);return;}
     }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);})().catch((error)=>{app.log.error({err:error,vaultId},"Readable mirror reconciliation failed");}).finally(()=>mirrorJobs.delete(vaultId));
     mirrorJobs.set(vaultId,job);return job;
@@ -102,7 +103,19 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(healthRepairLocks.has(device.vault_id))return reply.conflict("A health repair is already running for this vault");healthRepairLocks.add(device.vault_id);
     try{
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;
-    const snapshot=vault.head_id?store.getSnapshot(vault.head_id):null,current=store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",device.vault_id);
+    let snapshot=vault.head_id?store.getSnapshot(vault.head_id):null,removedConflictCopies=0;
+    if(snapshot){
+      const generatedSuffix=/ \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?=\.[^/]+$|$)/i;
+      const paths=new Set(snapshot.entries.map((entry)=>entry.path)),groups=new Map<string,ManifestEntry[]>();
+      for(const entry of snapshot.entries){const original=entry.path.replace(generatedSuffix,"");if(original===entry.path)continue;const copies=groups.get(original)??[];copies.push(entry);groups.set(original,copies);}
+      const redundant=new Set<string>();for(const [original,copies] of groups)if(paths.has(original)&&copies.length>=3)for(const copy of copies)redundant.add(copy.path);
+      if(redundant.size){
+        const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)));
+        if(!cleaned)return reply.conflict("Vault changed while health repair was preparing the cleaned snapshot");
+        snapshot=cleaned;removedConflictCopies=redundant.size;
+      }
+    }
+    const current=store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",device.vault_id);
     const target=new Set((snapshot?.entries??[]).map((entry)=>entry.path));const removedFiles=current.filter((entry)=>!target.has(entry.path)).length;
     const dismissedQuarantines=store.one<{count:number}>("SELECT COUNT(*) count FROM quarantines WHERE vault_id=? AND status='pending'",device.vault_id)?.count??0;
     const clearedAlerts=store.one<{count:number}>("SELECT COUNT(*) count FROM health_events WHERE vault_id=? AND cleared_at IS NULL",device.vault_id)?.count??0,now=new Date().toISOString();
@@ -114,7 +127,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(repaired.head_id!==repaired.mirror_head_id){skipExternalOnce.add(device.vault_id);await reconcileReadableMirror(device.vault_id);repaired=store.one<{head_id:string|null;mirror_head_id:string|null}>("SELECT head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;}
     const mirrorCurrent=repaired.head_id===repaired.mirror_head_id;
     safeguards.event(device.vault_id,"health_repair",mirrorCurrent?"info":"error",mirrorCurrent?`${device.name} restored the accepted snapshot and rebuilt the readable mirror`:`${device.name} requested health repair but the readable mirror did not converge`);
-    notifyVault(device.vault_id,repaired.head_id,!mirrorCurrent);const result={headId:repaired.head_id,mirrorCurrent,restoredFiles:snapshot?.entries.length??0,removedFiles,dismissedQuarantines,clearedAlerts};
+    notifyVault(device.vault_id,repaired.head_id,!mirrorCurrent);const result={headId:repaired.head_id,mirrorCurrent,restoredFiles:snapshot?.entries.length??0,removedFiles,removedConflictCopies,dismissedQuarantines,clearedAlerts};
     return mirrorCurrent?result:reply.code(503).send({error:"Health repair could not make the readable mirror current",...result});
     }finally{healthRepairLocks.delete(device.vault_id);}
   });
@@ -260,7 +273,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,parentId,deviceId,deviceName,snapshot.createdAt,message,JSON.stringify(snapshot));
       store.run("UPDATE vaults SET head_id=? WHERE id=?",snapshot.id,vaultId);store.db.exec("COMMIT");
     }catch(error){try{store.db.exec("ROLLBACK");}catch{}throw error;}
-    notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
+    mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
 
   app.get("/v1/safeguards",async(request)=>{const device=await authenticate(request);return safeguards.state(device.vault_id,device.id);});
@@ -323,7 +336,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;if(vault.head_id!==snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
     const snapshot=store.getSnapshot(snapshotId);const entry=snapshot?.entries.find((item)=>item.path===path&&item.hash===expectedHash);if(!entry)return reply.badRequest("File is not part of this snapshot");
     const bytes=Buffer.from(request.body as Buffer);if(bytes.length!==entry.size||sha256(bytes)!==expectedHash)return reply.badRequest("Readable file integrity check failed");
-    await storage.putReadable(storageRow(device.vault_id),path,new Uint8Array(bytes));
+    mirrorWriteSettles.set(device.vault_id,Date.now()+5000);await storage.putReadable(storageRow(device.vault_id),path,new Uint8Array(bytes));
     store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",device.vault_id,path,expectedHash,bytes.length,new Date().toISOString());
     return reply.code(204).send();
   });
@@ -332,7 +345,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device=await authenticate(request);const snapshotId=z.object({snapshotId:z.string().uuid()}).parse(request.body).snapshotId;
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;if(vault.head_id!==snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
     const snapshot=store.getSnapshot(snapshotId);if(!snapshot)return reply.notFound();const target=new Set(snapshot.entries.map((entry)=>entry.path));let deletedFiles=0;
-    for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",device.vault_id)){if(target.has(path))continue;await storage.deleteReadable(storageRow(device.vault_id),path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",device.vault_id,path);deletedFiles++;}
+    for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",device.vault_id)){if(target.has(path))continue;mirrorWriteSettles.set(device.vault_id,Date.now()+5000);await storage.deleteReadable(storageRow(device.vault_id),path);store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",device.vault_id,path);deletedFiles++;}
     const missing=snapshot.entries.filter((entry)=>!store.one("SELECT 1 FROM mirror_entries WHERE vault_id=? AND path=? AND hash=?",device.vault_id,entry.path,entry.hash));
     if(missing.length)return reply.code(422).send({error:"Readable mirror is incomplete",paths:missing.slice(0,100).map((entry)=>entry.path)});
     store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",snapshotId,device.vault_id);

@@ -190,10 +190,12 @@ export default class GibSyncPlugin extends Plugin {
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
   report(phase:SyncPhase,message:string,level:ActivityLevel="info",current?:number,total?:number) {
     this.liveStatus.phase=phase; this.liveStatus.message=message; this.liveStatus.current=current; this.liveStatus.total=total;
-    const previous=this.liveStatus.activities.at(-1); if(previous&&previous.phase===phase&&previous.message===message&&current!==undefined){
-      Object.assign(previous,{at:new Date().toISOString(),level,current,total});
-    }else if (!previous || previous.message!==message) {
-      this.liveStatus.activities.push({at:new Date().toISOString(),phase,level,message,current,total});
+    const now=new Date().toISOString(),previous=this.liveStatus.activities.at(-1); if(previous&&previous.phase===phase&&previous.message===message&&current!==undefined){
+      Object.assign(previous,{at:now,level,current,total});
+    }else{
+      let repeated=-1;for(let index=this.liveStatus.activities.length-1;index>=0;index--){const entry=this.liveStatus.activities[index];if(entry.phase===phase&&entry.message===message&&Date.now()-Date.parse(entry.at)<10*60_000){repeated=index;break;}}
+      if(repeated>=0){const [entry]=this.liveStatus.activities.splice(repeated,1);this.liveStatus.activities.push({...entry,at:now,level,current,total,repeats:(entry.repeats??1)+1});}
+      else this.liveStatus.activities.push({at:now,phase,level,message,current,total,repeats:1});
       if (this.liveStatus.activities.length>100) this.liveStatus.activities.splice(0,this.liveStatus.activities.length-100);
     }
     this.emitStatus();
@@ -213,7 +215,7 @@ export default class GibSyncPlugin extends Plugin {
   openSafeguards(){if(this.safeguardModalOpen)return;this.safeguardModalOpen=true;new SafeguardReviewModal(this.app,this,()=>{this.safeguardModalOpen=false;}).open();}
   async repairVaultHealth(){
     if(this.liveStatus.running)return false;this.report("mirroring","Repairing from the accepted server snapshot","info");
-    try{const result=await this.api.repairHealth();this.safetyHold=false;await this.refreshServerStatus();this.report("complete",`Health repaired · ${result.restoredFiles} readable files verified · ${result.removedFiles} obsolete files removed · ${result.dismissedQuarantines} held changes dismissed`,"success");new Notice("Gib Sync repaired the accepted vault and readable recovery copy.",6000);return await this.runSync();}
+    try{const result=await this.api.repairHealth();this.safetyHold=false;await this.refreshServerStatus();this.report("complete",`Health repaired · ${result.restoredFiles} readable files verified · ${result.removedConflictCopies} redundant conflict copies cleaned · ${result.removedFiles} obsolete files removed · ${result.dismissedQuarantines} held changes dismissed`,"success");new Notice("Gib Sync repaired the accepted vault and readable recovery copy.",6000);return await this.runSync();}
     catch(error){const message=error instanceof Error?error.message:String(error);this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {

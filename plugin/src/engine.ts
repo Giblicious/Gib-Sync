@@ -3,10 +3,11 @@ import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import { isDeviceLocalObsidianPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
+import { isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
 import { mergeSystemJson } from "./system-merge";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array };
+type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<string> };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
@@ -36,7 +37,7 @@ export class SyncEngine {
 
   async restoreAcceptedSnapshot():Promise<{downloaded:number;deleted:number}>{
     const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
-    const local=await this.scan(),head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();let downloaded=0,deleted=0;
+    const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
     for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);await this.adapter.writeBinary(path,clear.slice().buffer);downloaded++;}
     for(const path of local.keys())if(!remote.has(path)&&this.include(path)){await this.adapter.remove(path);deleted++;}
     settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
@@ -57,17 +58,17 @@ export class SyncEngine {
     return files;
   }
 
-  private async scan(): Promise<Map<string, FileState>> {
-    const output = new Map<string, FileState>();
+  private async scan(): Promise<LocalScan> {
+    const output = new Map<string, FileState>(),unreadableConflictPaths=new Set<string>();
     const paths = await this.listFiles(); let current = 0;
     for (const path of paths) {
-      const bytes = new Uint8Array(await this.adapter.readBinary(path)); const stat = await this.adapter.stat(path);
+      let bytes:Uint8Array,stat;try{bytes=new Uint8Array(await this.adapter.readBinary(path));stat=await this.adapter.stat(path);}catch(error){if(!isGibSyncConflictPath(path))throw error;unreadableConflictPaths.add(path);this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});current++;continue;}
       // Retain metadata rather than every file body. Mobile WebViews have much
       // tighter memory limits, so changed content is read lazily when required.
       output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now() });
       current++; if (current===1 || current===paths.length || current%25===0) this.status({phase:"scanning",message:"Scanning local vault",current,total:paths.length});
     }
-    return output;
+    return {files:output,unreadableConflictPaths};
   }
 
   private map(snapshot: Snapshot | null): Map<string, FileState> {
@@ -159,7 +160,7 @@ export class SyncEngine {
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
-    this.status({phase:"scanning",message:"Listing local vault files"}); const local = await this.scan();
+    this.status({phase:"scanning",message:"Listing local vault files"}); const scanned = await this.scan(),local=scanned.files;
     this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
     const requestedBaseId=settings.lastSnapshotId;
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
@@ -178,7 +179,7 @@ export class SyncEngine {
         this.status({phase:"merging",message:`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`});
       }
     }
-    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
+    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
@@ -298,7 +299,13 @@ export class SyncEngine {
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
       await this.ensureParent(path); await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
     }
-    for (const path of local.keys()) if (!final.has(path) && this.include(path)) { await this.adapter.remove(path); deleted++; }
+    for (const path of local.keys()) if (!final.has(path) && this.include(path)) {
+      if(scanned.unreadableConflictPaths.has(path)){
+        this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});
+        continue;
+      }
+      await this.adapter.remove(path); deleted++;
+    }
 
     // An ignored path is device-local: keep its accepted remote manifest entry
     // even though this device neither reads nor writes the file. This is

@@ -163,6 +163,19 @@ describe("SyncEngine", () => {
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
     await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);expect(api.commits).toBe(0);
   });
+  it("isolates an unreadable generated conflict copy without blocking the vault",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;
+    const path="Notes/Entry (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md",accepted=new TextEncoder().encode("accepted conflict copy\n"),edited=new TextEncoder().encode("ordinary edit\n"),acceptedHash=await hashBytes(accepted);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000701",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path,hash:acceptedHash,size:accepted.length,mtime:1}]};
+    config.lastSnapshotId=base.id;api.head=base;api.snapshots.set(base.id,base);api.blobs.set(acceptedHash,await encryptBlob(accepted,config.vaultKey,acceptedHash));adapter.files.set(path,new Uint8Array([1]));adapter.files.set("ordinary.md",edited);
+    const read=adapter.readBinary.bind(adapter);adapter.readBinary=async(candidate:string)=>{if(candidate===path)throw Object.assign(new Error("access denied"),{code:"EPERM"});return read(candidate);};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.uploaded).toBe(1);expect(api.head?.entries.find((entry)=>entry.path===path)?.hash).toBe(acceptedHash);expect(api.head?.entries.some((entry)=>entry.path==="ordinary.md")).toBe(true);
+  });
+  it("still stops for an unreadable ordinary note",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("ordinary.md",new Uint8Array([1]));adapter.readBinary=async()=>{throw Object.assign(new Error("access denied"),{code:"EPERM"});};
+    await expect(new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync()).rejects.toThrow("access denied");
+  });
   it("retries mirror supersession without reporting a committed sync as failed",async()=>{
     const adapter=new MemoryAdapter();const api=new MemoryApi();const config=settings();const clear=new TextEncoder().encode("current\n");const hash=await hashBytes(clear);adapter.files.set("note.md",clear);
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000321",vaultId:"vault",parentId:null,deviceId:"other",deviceName:"Mobile",createdAt:new Date().toISOString(),message:"Current",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]};

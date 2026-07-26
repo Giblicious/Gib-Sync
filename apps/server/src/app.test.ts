@@ -89,8 +89,21 @@ describe("Gib Sync API", () => {
     const commit=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Accepted",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]}})).json();
     const held=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.id,message:"Bad empty proposal",entries:[]}});expect(held.statusCode).toBe(423);
     storage.files.set(`read:${credentials.vaultId}:obsolete.tmp`,Buffer.from("obsolete"));store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?)",credentials.vaultId,"obsolete.tmp",sha256(Buffer.from("obsolete")),8,new Date().toISOString());
-    const repaired=await app.inject({method:"POST",url:"/v1/health/repair",headers:auth,payload:{restoreAcceptedHead:true}});expect(repaired.statusCode).toBe(200);expect(repaired.json()).toMatchObject({headId:commit.id,mirrorCurrent:true,restoredFiles:1,removedFiles:1,dismissedQuarantines:1});
+    const repaired=await app.inject({method:"POST",url:"/v1/health/repair",headers:auth,payload:{restoreAcceptedHead:true}});expect(repaired.statusCode).toBe(200);expect(repaired.json()).toMatchObject({headId:commit.id,mirrorCurrent:true,restoredFiles:1,removedFiles:1,removedConflictCopies:0,dismissedQuarantines:1});
     expect(Array.from(storage.files.get(`read:${credentials.vaultId}:note.md`)??[])).toEqual(Array.from(clear));expect(storage.files.has(`read:${credentials.vaultId}:obsolete.tmp`)).toBe(false);expect((await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json()).toEqual([]);
+    await app.close();
+  });
+  it("cleans only redundant generated conflict storms when the intact original is present",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`};
+    const clear=Buffer.from("intact note\n"),hash=sha256(clear),encrypted=encryptVaultBlob(clear,credentials.vaultKey,hash);
+    await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:Buffer.from(encrypted)});
+    const paths=["note.md","note (conflict - Phone - 2026-07-26 16-46-00 UTC).md","note (conflict - Seafile - 2026-07-26 16-46-01 UTC - 2).md","note (conflict - Desktop - 2026-07-26 16-46-02 UTC - 3).md"];
+    const commit=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"False conflict storm",entries:paths.map((path)=>({path,hash,size:clear.length,mtime:1}))}})).json();
+    const repaired=await app.inject({method:"POST",url:"/v1/health/repair",headers:auth,payload:{restoreAcceptedHead:true}});expect(repaired.statusCode).toBe(200);
+    expect(repaired.json()).toMatchObject({headId:expect.any(String),mirrorCurrent:true,restoredFiles:1,removedConflictCopies:3});expect(repaired.json().headId).not.toBe(commit.id);
+    const state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.entries.map((entry:{path:string})=>entry.path)).toEqual(["note.md"]);
+    expect(store.getSnapshot(commit.id)?.entries).toHaveLength(4);
     await app.close();
   });
   it("returns stale watches immediately and wakes current watches when the vault head changes",async()=>{
@@ -239,6 +252,17 @@ describe("Gib Sync API", () => {
     expect((await waiting).json()).toEqual({changed:true,headId:first.id,attention:true});expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.id).toBe(first.id);
     const held=(await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json();expect(held).toHaveLength(1);expect(held[0]).toMatchObject({source:"seafile",assessment:{deleted:10}});
     await app.close();
+  });
+  it("does not import its own readable writes while the mirror is catching up",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},key=Buffer.from(setup.vaultKey,"base64url");
+    const original=Buffer.from("original\n"),created=Buffer.from("created in Obsidian\n"),external=Buffer.from("transient readable copy\n"),originalHash=sha256(original),createdHash=sha256(created);
+    for(const [hash,clear] of [[originalHash,original],[createdHash,created]] as const)await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"original.md",hash:originalHash,size:original.length,mtime:1}]}})).json(),now=new Date().toISOString();
+    storage.files.set(`read:${setup.vaultId}:original.md`,original);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",setup.vaultId,"original.md",originalHash,original.length,now,"original-id",1);store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",first.id,setup.vaultId);
+    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Add note",entries:[...first.entries,{path:"new.md",hash:createdHash,size:created.length,mtime:2}]}})).json();await app.inject({method:"PUT",url:"/v1/mirror/file?path=new.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":second.id,"x-gib-sync-hash":createdHash},payload:created});storage.files.set(`read:${setup.vaultId}:new.md`,external);
+    expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json()).toMatchObject({snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0});
+    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.id).toBe(second.id);expect(head.entries.filter((entry:any)=>entry.path.includes("conflict -"))).toHaveLength(0);await app.close();
   });
   it("supports write locks, protected paths, bookmarks, device restrictions, and revocation",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);

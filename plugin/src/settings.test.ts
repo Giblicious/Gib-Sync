@@ -1,8 +1,12 @@
 import { describe,expect,it } from "vitest";
 import type { Plugin } from "obsidian";
-import { DEFAULT_SETTINGS,loadSettings,shouldSyncChangedPath } from "./settings";
+import { DEFAULT_SETTINGS,isGibSyncConflictPath,loadSettings,shouldSyncChangedPath } from "./settings";
 
 describe("file-change sync filtering",()=>{
+  it("recognizes only timestamped Gib Sync conflict-copy names",()=>{
+    expect(isGibSyncConflictPath("Notes/Entry (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md")).toBe(true);
+    expect(isGibSyncConflictPath("Notes/my conflict notes.md")).toBe(false);
+  });
   it("syncs ordinary vault files and normalizes Windows separators",()=>{
     expect(shouldSyncChangedPath("Notes/today.md",DEFAULT_SETTINGS)).toBe(true);
     expect(shouldSyncChangedPath("Notes\\today.md",DEFAULT_SETTINGS)).toBe(true);
