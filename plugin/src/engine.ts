@@ -3,7 +3,7 @@ import type { ManifestEntry, Snapshot } from "@gib-sync/protocol";
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import { shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
+import { isDeviceLocalWorkspacePath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
@@ -12,6 +12,10 @@ const decoder = new TextDecoder(); const encoder = new TextEncoder();
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; mirrored:number; snapshotId: string | null; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
+export class FileChangedDuringReadError extends Error {
+  override readonly name="FileChangedDuringReadError";
+  constructor(readonly path:string){super(`${path} changed while Gib Sync was reading it. It was not uploaded; sync will retry with the newer saved version.`);}
+}
 
 export class SyncEngine {
   private running: Promise<SyncResult> | null = null;
@@ -71,7 +75,7 @@ export class SyncEngine {
   private async localBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>):Promise<Uint8Array>{
     const cached=cache.get(entry.hash);if(cached)return cached;
     const clear=new Uint8Array(await this.adapter.readBinary(path));
-    if(await hashBytes(clear)!==entry.hash)throw new Error(`${path} changed while Gib Sync was reading it. It was not uploaded; sync will retry with the newer saved version.`);
+    if(await hashBytes(clear)!==entry.hash)throw new FileChangedDuringReadError(path);
     cache.set(entry.hash,clear);return clear;
   }
 
@@ -216,7 +220,7 @@ export class SyncEngine {
     // An ignored path is device-local: keep its accepted remote manifest entry
     // even though this device neither reads nor writes the file. This is
     // essential when phones intentionally omit desktop-only plugins.
-    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path));
+    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path)&&!isDeviceLocalWorkspacePath(entry.path));
     const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const clientCanMirrorAll=!preservedIgnored.length;
@@ -229,8 +233,8 @@ export class SyncEngine {
       return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
     }
 
-    if(onboardingReconcile&&remoteSnapshot){
-      this.status({phase:"committing",message:"Verifying the matched server baseline before publishing the union"});
+    if(!settings.initialized&&remoteSnapshot){
+      this.status({phase:"committing",message:onboardingReconcile?"Verifying the matched server baseline before publishing the union":"Verifying the first download before cleaning device-local workspace state"});
       try{await this.api.markDeviceReady(remoteSnapshot.id);}
       catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"The server vault changed during onboarding verification");throw error;}
     }

@@ -41,10 +41,18 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   return settings;
 }
 
+export function isDeviceLocalWorkspacePath(path:string):boolean {
+  const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
+  return /^\.obsidian\/workspace(?:-[^/]+)?\.json$/i.test(normalized);
+}
+
 export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): boolean {
   const normalized=path.replace(/\\/g,"/").replace(/^\/+/,"");
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/"))return false;
   if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
+  // Workspace files are rapidly rewritten UI state and differ between desktop
+  // and mobile. They are always device-local, even when config sync is enabled.
+  if(isDeviceLocalWorkspacePath(normalized))return false;
   if(normalized===".obsidian/core-plugins.json")return false;
   const obsidianRoot=normalized===".obsidian";
   const pluginPath=normalized===".obsidian/plugins"||normalized.startsWith(".obsidian/plugins/")||normalized===".obsidian/community-plugins.json";

@@ -2,7 +2,7 @@ import { webcrypto } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { DataAdapter } from "obsidian";
 import type { Snapshot } from "@gib-sync/protocol";
-import { SyncEngine } from "./engine";
+import { FileChangedDuringReadError, SyncEngine } from "./engine";
 import { ApiError } from "./api";
 import type { GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes, toBase64Url } from "./crypto";
@@ -120,7 +120,7 @@ describe("SyncEngine", () => {
     expect(api.head?.entries.map((entry)=>entry.path).sort()).toEqual([".obsidian/plugins/desktop-tool/main.js","note.md"]);expect(adapter.files.has(".obsidian/plugins/desktop-tool/main.js")).toBe(false);
   });
   it("downloads mobile-compatible plugin files after plugin sync is enabled",async()=>{
-    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;config.lastSnapshotId=null;
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.syncPlugins=true;config.lastSnapshotId=null;
     const pluginBytes=new TextEncoder().encode("mobile plugin\n"),workspaceBytes=new TextEncoder().encode("{}"),pluginHash=await hashBytes(pluginBytes),workspaceHash=await hashBytes(workspaceBytes);
     api.blobs.set(pluginHash,await encryptBlob(pluginBytes,config.vaultKey,pluginHash));api.blobs.set(workspaceHash,await encryptBlob(workspaceBytes,config.vaultKey,workspaceHash));
     api.head={id:"00000000-0000-4000-8000-000000000204",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Plugins",entries:[
@@ -128,12 +128,13 @@ describe("SyncEngine", () => {
     ]};
     await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(adapter.files.get(".obsidian/plugins/calendar/main.js")).toEqual(pluginBytes);expect(adapter.files.has(".obsidian/workspace.json")).toBe(false);
+    expect(api.readyHeads).toEqual(["00000000-0000-4000-8000-000000000204"]);expect(api.head?.entries.map((entry)=>entry.path)).toEqual([".obsidian/plugins/calendar/main.js"]);
   });
   it("never uploads a stale body when a file changes during a low-memory scan",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),before=new TextEncoder().encode("before\n"),after=new TextEncoder().encode("after\n");adapter.files.set("note.md",before);
     const originalRead=adapter.readBinary.bind(adapter);let reads=0;adapter.readBinary=async(path:string)=>{reads++;if(reads===2)adapter.files.set(path,after);return originalRead(path);};
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
-    await expect(engine.sync()).rejects.toThrow("changed while Gib Sync was reading it");expect(api.commits).toBe(0);
+    await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);expect(api.commits).toBe(0);
   });
   it("retries mirror supersession without reporting a committed sync as failed",async()=>{
     const adapter=new MemoryAdapter();const api=new MemoryApi();const config=settings();const clear=new TextEncoder().encode("current\n");const hash=await hashBytes(clear);adapter.files.set("note.md",clear);

@@ -1,7 +1,7 @@
 import { Menu, Notice, Platform, Plugin, normalizePath, setIcon } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
-import { SyncEngine, SyncSafetyError } from "./engine";
+import { FileChangedDuringReadError, SyncEngine, SyncSafetyError } from "./engine";
 import { NotificationGate } from "./notifications";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
@@ -20,6 +20,7 @@ export default class GibSyncPlugin extends Plugin {
   private readonly notificationGate=new NotificationGate();
   private nativeSyncBlocked=false;
   private nativeSyncNoticeShown=false;
+  private readonly changedDuringReadFailures=new Map<string,{count:number;firstAt:number}>();
   private mobileSidebarEl:HTMLElement|null=null;
   private mobileTopEl:HTMLButtonElement|null=null;
   private mobileObserver:MutationObserver|null=null;
@@ -277,23 +278,36 @@ export default class GibSyncPlugin extends Plugin {
     if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
+    let changedDuringRead:FileChangedDuringReadError|null=null;
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
+      this.changedDuringReadFailures.clear();
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
       this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
       await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
     } catch (error) {
-      console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
-      this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
-      this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
-      if(error instanceof ApiError&&error.status===423){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);if((error.responseBody as any)?.quarantine)this.openSafeguards();void this.refreshServerStatus();}
-      else if(error instanceof SyncSafetyError){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);}
-      else{this.report("error",`Sync failed: ${message}`,"error");this.notify("sync-error",`Gib Sync failed: ${message}`,8000,60_000);}
+      const now=new Date().toISOString();this.liveStatus.running=false;this.liveStatus.completedAt=now;
+      if(error instanceof FileChangedDuringReadError){
+        changedDuringRead=error;
+        const nowMs=Date.now(),previous=this.changedDuringReadFailures.get(error.path);
+        const failure=previous?{count:previous.count+1,firstAt:previous.firstAt}:{count:1,firstAt:nowMs};
+        this.changedDuringReadFailures.set(error.path,failure);
+        this.report("scheduled",`${error.path} changed during sync; quietly retrying the saved version`,"info");
+        if(failure.count>=3&&nowMs-failure.firstAt>=120_000)this.notify(`changing-file:${error.path}`,`Gib Sync has been unable to read ${error.path} consistently for over two minutes. Close anything continuously rewriting it, then sync again.`,8000,300_000);
+      }else{
+        console.error("Gib Sync failed", error);const message=error instanceof Error?error.message:String(error);
+        this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
+        this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
+        if(error instanceof ApiError&&error.status===423){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);if((error.responseBody as any)?.quarantine)this.openSafeguards();void this.refreshServerStatus();}
+        else if(error instanceof SyncSafetyError){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);}
+        else{this.report("error",`Sync failed: ${message}`,"error");this.notify("sync-error",`Gib Sync failed: ${message}`,8000,60_000);}
+      }
     } finally {
-      if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
+      if(changedDuringRead){this.fileChangePending=false;this.queueSync(2000,"File changed during sync; retrying");}
+      else if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
       else this.scheduleNextSyncLabel();
     }
   }

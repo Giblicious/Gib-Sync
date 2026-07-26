@@ -20,6 +20,9 @@ describe("file-change sync filtering",()=>{
   it("separates Obsidian configuration from installed plugins",()=>{
     const settings={...DEFAULT_SETTINGS,syncObsidianConfig:true};
     expect(shouldSyncChangedPath(".obsidian/themes/theme.css",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/workspace.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/workspace-mobile.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/workspace-tablet.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/core-plugins.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(false);
