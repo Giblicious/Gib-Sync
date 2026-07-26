@@ -51,6 +51,8 @@ Simultaneous edits use a lossless three-way policy:
 - Edit-versus-delete conflicts retain the edited note with a warning so a deletion never silently destroys concurrent work.
 - Binary conflicts preserve both files.
 
+When a newly paired device already contains a vault, Gib Sync compares content hashes before writing anything. If at least 90% of the included files match the server exactly, it treats the vaults as copies: it downloads and verifies the current server head, keeps files unique to either side, and preserves both versions of every differing same-path file before publishing the union. Lower-overlap vaults remain blocked as likely mismatches.
+
 The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
 
 `.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes themes, snippets, hotkeys, and other settings. **Sync installed plugins** independently includes community plugin folders and `community-plugins.json`, while always excluding Gib Sync's own directory so the running synchronizer cannot overwrite itself. Plugin `data.json` files can contain API keys and are copied to the readable Seafile tree when plugin sync is enabled. Explicit exclusions are omitted from both representations.

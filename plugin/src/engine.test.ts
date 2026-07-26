@@ -26,11 +26,12 @@ class MemoryAdapter {
 }
 
 class MemoryApi {
-  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;lastCommitBody:any=null;
+  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;readyHeads:string[]=[];lastCommitBody:any=null;
   async state() { return {head:this.head}; }
   async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new Error("missing");return snapshot; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
+  async markDeviceReady(headId:string|null){this.readyHeads.push(headId??"");return {ok:true};}
   async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"]}) {
     this.commits++;this.lastCommitBody=body; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries};this.snapshots.set(this.head.id,this.head);return this.head;
   }
@@ -63,6 +64,21 @@ describe("SyncEngine", () => {
     api.head={id:"00000000-0000-4000-8000-000000000201",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Shared",entries:[{path:"note.md",hash,size:remote.length,mtime:1}]};
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
     await expect(engine.sync()).rejects.toThrow("Onboarding protection paused");expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(local);
+  });
+  it("losslessly unifies a highly overlapping newly paired vault",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.deviceName="New phone";
+    const remoteEntries:Snapshot["entries"]=[];
+    for(let index=0;index<10;index++){
+      const path=`Note ${index}.md`,remoteBytes=new TextEncoder().encode(index===9?"remote edit\n":`same ${index}\n`),remoteHash=await hashBytes(remoteBytes);
+      remoteEntries.push({path,hash:remoteHash,size:remoteBytes.length,mtime:100+index});api.blobs.set(remoteHash,await encryptBlob(remoteBytes,config.vaultKey,remoteHash));
+      adapter.files.set(path,index===9?new TextEncoder().encode("local edit\n"):remoteBytes);
+    }
+    api.head={id:"00000000-0000-4000-8000-000000000210",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Existing vault",entries:remoteEntries};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(1);expect(api.readyHeads).toEqual(["00000000-0000-4000-8000-000000000210"]);expect(api.commits).toBe(1);expect(api.head?.entries).toHaveLength(11);
+    expect(api.head?.entries.some((entry)=>entry.path.includes("conflict - New phone"))).toBe(true);
+    expect([...adapter.files.values()].map((bytes)=>new TextDecoder().decode(bytes)).join("\n")).toContain("local edit");
+    expect([...adapter.files.values()].map((bytes)=>new TextDecoder().decode(bytes)).join("\n")).toContain("remote edit");
   });
   it("blocks a returning device with local files when its verified baseline is unavailable",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("local\n"),remote=new TextEncoder().encode("remote\n"),hash=await hashBytes(remote);

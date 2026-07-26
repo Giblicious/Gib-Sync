@@ -225,10 +225,10 @@ export class StatusOverviewModal extends Modal{
 }
 
 export class GibSyncSettingTab extends PluginSettingTab {
-  private unsubscribe:(()=>void)|null=null;private liveRoot:HTMLElement|null=null;
+  private unsubscribe:(()=>void)|null=null;private liveRoot:HTMLElement|null=null;private liveRenderTimer:number|null=null;
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
-  display(){this.unsubscribe?.();this.containerEl.empty();this.containerEl.addClass("gib-sync-settings");this.containerEl.createEl("h2",{text:"Gib Sync"});const configured=Boolean(this.plugin.settings.deviceToken);
-    this.liveRoot=this.containerEl.createDiv({cls:"gib-sync-status-panel"});this.renderLive();this.unsubscribe=this.plugin.subscribeStatus(()=>this.renderLive());
+  display(){this.unsubscribe?.();if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;this.containerEl.empty();this.containerEl.addClass("gib-sync-settings");this.containerEl.createEl("h2",{text:"Gib Sync"});const configured=Boolean(this.plugin.settings.deviceToken);
+    this.liveRoot=this.containerEl.createDiv({cls:"gib-sync-status-panel"});this.renderLive();this.unsubscribe=this.plugin.subscribeStatus(()=>this.scheduleLiveRender());
     const actions=new Setting(this.containerEl).setName("Actions").setDesc(configured?"Sync now, or refresh server-side counters and connection details.":"Connect manually with Seafile details, or enter a temporary quick code from an existing device.");
     actions.addButton((button)=>button.setButtonText(configured?"Sync now":"Manual setup").setCta().onClick(()=>configured?void this.plugin.runSync():new SetupModal(this.app,this.plugin).open()));
     if(configured)actions.addButton((button)=>button.setButtonText("Refresh status").onClick(()=>void this.plugin.refreshServerStatus()));
@@ -271,7 +271,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
     if(configured)new Setting(this.containerEl).setName("Version history").addButton((button)=>button.setButtonText("Open history").onClick(()=>new HistoryModal(this.app,this.plugin).open()));
     if(configured)void this.plugin.refreshServerStatus();
   }
-  hide(){this.unsubscribe?.();this.unsubscribe=null;}
+  hide(){this.unsubscribe?.();this.unsubscribe=null;if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;}
   private included(path:string,exclusions:string[],syncConfig:boolean,syncPlugins:boolean):boolean{
     return shouldSyncChangedPath(path,{...this.plugin.settings,exclusions,syncObsidianConfig:syncConfig,syncPlugins});
   }
@@ -281,10 +281,11 @@ export class GibSyncSettingTab extends PluginSettingTab {
     if(!affected.length)return true;const examples=affected.slice(0,10).map((entry)=>`- ${entry.path}`).join("\n");
     return confirmAction(this.app,"Apply sync filter",`This device will stop syncing ${affected.length} file${affected.length===1?"":"s"}:\n\n${examples}${affected.length>10?`\n- …and ${affected.length-10} more`:""}\n\nTheir accepted remote versions remain safe and available to other devices.`,"Apply filter");
   }
-  private renderLive(){if(!this.liveRoot)return;const root=this.liveRoot;root.empty();const live=this.plugin.liveStatus;const server=this.plugin.serverStatus;const storage=server?.storage||this.plugin.settings.storage;
+  private scheduleLiveRender(){if(this.liveRenderTimer!==null)return;this.liveRenderTimer=window.setTimeout(()=>{this.liveRenderTimer=null;this.renderLive();},250);}
+  private renderLive(){if(!this.liveRoot)return;const root=this.liveRoot;const previousLog=root.querySelector<HTMLElement>(".gib-sync-activity-log"),previousScroll=previousLog?.scrollTop??0,wasAtTop=!previousLog||previousScroll<4;root.empty();const live=this.plugin.liveStatus;const server=this.plugin.serverStatus;const storage=server?.storage||this.plugin.settings.storage;
     const header=root.createDiv({cls:`gib-sync-status-head is-${live.phase}`});header.createDiv({cls:"gib-sync-status-dot"});const copy=header.createDiv();copy.createEl("strong",{text:live.message});copy.createEl("div",{cls:"gib-sync-muted",text:live.running?`Running since ${when(live.startedAt)}`:`State: ${live.phase}`});
-    if(live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
-    const grid=root.createDiv({cls:"gib-sync-status-grid"});const item=(label:string,value:string)=>{const el=grid.createDiv();el.createEl("span",{text:label});el.createEl("strong",{text:value});};
+    const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${live.total?Math.min(100,((live.current||0)/live.total)*100):0}%`}});
+    const grid=root.createDiv({cls:"gib-sync-status-grid"});const item=(label:string,value:string)=>{const el=grid.createDiv();el.createEl("span",{text:label});el.createEl("strong",{text:value,attr:{title:value}});};
     item("Last success",when(live.lastSuccessAt));item("Last result",live.lastResult||"No completed sync yet");item("Next automatic sync",when(live.nextSyncAt));item("Last error",live.lastError||"None");
     item("Server",this.plugin.settings.serverUrl||"Not connected");item("Vault / device",this.plugin.settings.vaultName?`${this.plugin.settings.vaultName} / ${this.plugin.settings.deviceName}`:"Not configured");
     if(storage){item("Seafile",`${storage.username} @ ${storage.seafileUrl}`);item("Readable recovery vault",`${storage.libraryName}:${storage.readablePath}`);item("Sync metadata",`${storage.libraryName}:${storage.basePath}/.gib-sync`);}
@@ -293,7 +294,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
       if(server.healthAlerts.length){const alerts=root.createDiv({cls:"gib-sync-health-alerts"});alerts.createEl("strong",{text:"Health notifications"});for(const alert of server.healthAlerts.slice(0,8))alerts.createDiv({cls:`gib-sync-health-alert is-${alert.level}`,text:alert.message});}
     }
     const activity=root.createDiv({cls:"gib-sync-activity"});const title=activity.createDiv({cls:"gib-sync-activity-title"});title.createEl("strong",{text:"Live activity"});const buttons=title.createDiv();const copyButton=buttons.createEl("button",{text:"Copy diagnostics"});copyButton.onclick=async()=>{const copied=await copyText(JSON.stringify(privacySafeDiagnostics(live,server,{configured:Boolean(this.plugin.settings.deviceToken),storageConfigured:Boolean(storage)}),null,2));new Notice(copied?"Privacy-safe Gib Sync diagnostics copied":"Clipboard access is unavailable on this device.",copied?4000:8000);};const clear=buttons.createEl("button",{text:"Clear"});clear.onclick=()=>this.plugin.clearActivity();
-    const log=activity.createDiv({cls:"gib-sync-activity-log"});for(const entry of [...live.activities].reverse().slice(0,30)){const row=log.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}if(!live.activities.length)log.createEl("div",{cls:"gib-sync-muted",text:"Activity will appear here as Gib Sync works."});
+    const log=activity.createDiv({cls:"gib-sync-activity-log"});for(const entry of [...live.activities].reverse().slice(0,30)){const row=log.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createEl("span",{text:entry.message});}if(!live.activities.length)log.createEl("div",{cls:"gib-sync-muted",text:"Activity will appear here as Gib Sync works."});log.scrollTop=wasAtTop?0:previousScroll;
   }
 }
 

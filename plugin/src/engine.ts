@@ -11,6 +11,7 @@ const decoder = new TextDecoder(); const encoder = new TextEncoder();
 
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; mirrored:number; snapshotId: string | null; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; }
+export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 
 export class SyncEngine {
   private running: Promise<SyncResult> | null = null;
@@ -149,13 +150,20 @@ export class SyncEngine {
     this.status({phase:"reading-remote",message:"Reading the remote snapshot"}); const remoteSnapshot = (await this.api.state()).head;
     const requestedBaseId=settings.lastSnapshotId;
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
+    let onboardingReconcile=false;
     if(settings.initialized&&requestedBaseId&&!baseSnapshot&&local.size){
-      throw new Error("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
+      throw new SyncSafetyError("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
     }
     if(remoteSnapshot&&!baseSnapshot&&local.size){
-      const remoteHashes=new Map(remoteSnapshot.entries.map((entry)=>[entry.path,entry.hash]));
+      const remoteHashes=new Map(remoteSnapshot.entries.filter((entry)=>this.include(entry.path)).map((entry)=>[entry.path,entry.hash]));
       const unexpected=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)!==entry.hash);
-      if(unexpected.length)throw new Error(`Onboarding protection paused sync because this server vault already has history and the local vault contains ${unexpected.length} unverified file${unexpected.length===1?"":"s"}. No files were uploaded or deleted. Verify that you opened the intended local and server vaults.`);
+      if(unexpected.length){
+        const exactMatches=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)===entry.hash).length;
+        const comparedSize=Math.max(local.size,remoteHashes.size),overlap=comparedSize?exactMatches/comparedSize:0;
+        if(overlap<0.9)throw new SyncSafetyError(`Onboarding protection paused sync because the local and server vaults are not similar enough for automatic reconciliation (${exactMatches} of ${comparedSize} files match exactly). No files were uploaded or deleted. Verify that you opened the intended local and server vaults.`);
+        onboardingReconcile=true;
+        this.status({phase:"merging",message:`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`});
+      }
     }
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot); const final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
@@ -219,6 +227,12 @@ export class SyncEngine {
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
       return { uploaded: 0, downloaded, deleted, conflicts, mirrored, snapshotId: settings.lastSnapshotId };
+    }
+
+    if(onboardingReconcile&&remoteSnapshot){
+      this.status({phase:"committing",message:"Verifying the matched server baseline before publishing the union"});
+      try{await this.api.markDeviceReady(remoteSnapshot.id);}
+      catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"The server vault changed during onboarding verification");throw error;}
     }
 
     this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;

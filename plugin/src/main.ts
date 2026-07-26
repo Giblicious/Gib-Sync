@@ -1,7 +1,7 @@
 import { Menu, Notice, Platform, Plugin, normalizePath, setIcon } from "obsidian";
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
-import { SyncEngine } from "./engine";
+import { SyncEngine, SyncSafetyError } from "./engine";
 import { NotificationGate } from "./notifications";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
@@ -290,6 +290,7 @@ export default class GibSyncPlugin extends Plugin {
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
       this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
       if(error instanceof ApiError&&error.status===423){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);if((error.responseBody as any)?.quarantine)this.openSafeguards();void this.refreshServerStatus();}
+      else if(error instanceof SyncSafetyError){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);}
       else{this.report("error",`Sync failed: ${message}`,"error");this.notify("sync-error",`Gib Sync failed: ${message}`,8000,60_000);}
     } finally {
       if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
