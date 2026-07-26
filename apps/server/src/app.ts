@@ -278,6 +278,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;
     const row=store.one<{source:string;status:string}>("SELECT source,status FROM quarantines WHERE id=? AND vault_id=?",id,device.vault_id);if(!row)return reply.notFound();if(row.status!=="pending")return reply.conflict("Quarantine is no longer pending");
     store.run("UPDATE quarantines SET status='rejected',resolved_at=?,resolved_by=? WHERE id=?",new Date().toISOString(),device.id,id);
+    safeguards.clearResolvedQuarantineAlerts(device.vault_id);
     if(row.source==="seafile"){store.run("UPDATE vaults SET mirror_head_id=NULL WHERE id=?",device.vault_id);skipExternalOnce.add(device.vault_id);scheduleMirror(device.vault_id,50);}
     safeguards.event(device.vault_id,"quarantine_rejected","info",`Suspicious changes were rejected by ${device.name}`);return {ok:true};
   });
@@ -289,6 +290,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(body.trustMinutes)store.run("UPDATE vaults SET trusted_until=?,trusted_device_id=? WHERE id=?",new Date(Date.now()+body.trustMinutes*60_000).toISOString(),row.device_id,device.vault_id);
     const snapshot=await acceptSnapshot(device.vault_id,row.parent_id,row.device_id,row.device_name,`${row.message} (approved by ${device.name})`,entries);if(!snapshot){store.run("UPDATE quarantines SET status='stale' WHERE id=?",id);return reply.conflict("Vault changed after this proposal; review a new proposal");}
     store.run("UPDATE quarantines SET status='approved',resolved_at=?,resolved_by=? WHERE id=?",new Date().toISOString(),device.id,id);
+    safeguards.clearResolvedQuarantineAlerts(device.vault_id);
     safeguards.event(device.vault_id,"quarantine_approved","info",`Suspicious changes were approved by ${device.name}`);return reply.code(201).send(snapshot);
   });
   app.post("/v1/devices/current/ready",async(request,reply)=>{

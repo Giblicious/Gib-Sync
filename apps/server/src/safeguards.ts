@@ -96,10 +96,15 @@ export class SafeguardService{
   }
   list(vaultId:string):QuarantineItem[]{
     this.store.run("UPDATE quarantines SET status='stale' WHERE vault_id=? AND status='pending' AND expires_at<?",vaultId,new Date().toISOString());
+    this.clearResolvedQuarantineAlerts(vaultId);
     return this.store.all<any>("SELECT * FROM quarantines WHERE vault_id=? AND status='pending' ORDER BY created_at DESC",vaultId).map((row)=>({
       id:row.id,proposalHash:row.proposal_hash,source:row.source,deviceId:row.device_id,deviceName:row.device_name,parentId:row.parent_id,createdAt:row.created_at,
       expiresAt:row.expires_at,status:row.status,message:row.message,assessment:JSON.parse(row.assessment_json),changes:JSON.parse(row.changes_json)
     }));
+  }
+  clearResolvedQuarantineAlerts(vaultId:string){
+    const pending=this.store.one<{count:number}>("SELECT COUNT(*) count FROM quarantines WHERE vault_id=? AND status='pending'",vaultId)?.count??0;if(pending)return;
+    this.store.run("UPDATE health_events SET cleared_at=? WHERE vault_id=? AND cleared_at IS NULL AND code IN ('mass_change_quarantine','external_quarantine')",new Date().toISOString(),vaultId);
   }
   event(vaultId:string,code:string,level:"info"|"warning"|"error",message:string){this.store.run("INSERT INTO health_events(id,vault_id,code,level,message,created_at) VALUES(?,?,?,?,?,?)",randomUUID(),vaultId,code,level,message,new Date().toISOString());}
 }

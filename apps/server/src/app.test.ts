@@ -251,6 +251,7 @@ describe("Gib Sync API", () => {
     await app.inject({method:"PUT",url:"/v1/safeguards/policy",headers:auth,payload:currentPolicy});
     const protectedDelete=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Delete protected",entries:[]}});expect(protectedDelete.statusCode).toBe(423);
     await app.inject({method:"POST",url:"/v1/quarantines/"+protectedDelete.json().quarantine.id+"/reject",headers:auth,payload:{}});
+    expect(store.one<{count:number}>("SELECT COUNT(*) count FROM health_events WHERE vault_id=? AND code='mass_change_quarantine' AND cleared_at IS NULL",owner.vaultId)?.count).toBe(0);
     await app.inject({method:"POST",url:"/v1/safeguards/lock",headers:auth,payload:{locked:true}});
     expect((await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Locked",entries:first.entries}})).statusCode).toBe(423);
     await app.inject({method:"POST",url:"/v1/safeguards/lock",headers:auth,payload:{locked:false}});
