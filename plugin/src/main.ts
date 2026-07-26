@@ -79,7 +79,8 @@ export default class GibSyncPlugin extends Plugin {
     this.removeStaleMobileSidebarIndicators();
   }
   private attentionCount():number{return this.serverStatus?.safeguards.pendingQuarantines??0;}
-  indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount());}
+  private indicatorHealth(){const alerts=this.serverStatus?.healthAlerts??[],error=alerts.find((item)=>item.level==="error"),warning=alerts.find((item)=>item.level==="warning");return {errors:alerts.filter((item)=>item.level==="error").length,warnings:alerts.filter((item)=>item.level==="warning").length,description:error?.message??warning?.message};}
+  indicatorState(){return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),this.indicatorHealth());}
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
   private renderIndicator(element:HTMLElement,dotOnly=false) {
     const state=this.indicatorState(),animate=this.settings.animateStatusIndicator&&state.animated;
@@ -289,7 +290,7 @@ export default class GibSyncPlugin extends Plugin {
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
-      this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
+      this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;this.liveStatus.lastError="";
       this.changedDuringReadFailures.clear();
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();

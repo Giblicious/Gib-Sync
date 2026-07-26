@@ -15,4 +15,9 @@ describe("status indicator state",()=>{
     live.phase="error";live.lastError="Offline";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"error",description:"Offline"});
     live.phase="up-to-date";expect(deriveIndicatorState(live,true,false).key).toBe("synced");
   });
+  it("does not show green when the server reports a health problem",()=>{
+    const live=initialLiveStatus(true);live.phase="up-to-date";
+    expect(deriveIndicatorState(live,true,false,0,{errors:1,warnings:0,description:"Readable mirror failed"})).toMatchObject({key:"error",label:"Needs repair",description:"Readable mirror failed"});
+    expect(deriveIndicatorState(live,true,false,0,{errors:0,warnings:1})).toMatchObject({key:"attention",tone:"warning"});
+  });
 });

@@ -221,6 +221,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.get("/v1/status", async (request) => {
     const device = await authenticate(request); const vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
+    safeguards.clearResolvedQuarantineAlerts(device.vault_id);
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
     const devices=store.all<{id:string;name:string;created_at:string;last_seen_at:string;revoked_at:string|null;initial_sync_complete:number;clock_skew_ms:number}>("SELECT id,name,created_at,last_seen_at,revoked_at,initial_sync_complete,clock_skew_ms FROM devices WHERE vault_id=? ORDER BY created_at",device.vault_id)
       .map((item)=>({id:item.id,name:item.name,createdAt:item.created_at,lastSeenAt:item.last_seen_at,revokedAt:item.revoked_at,ready:Boolean(item.initial_sync_complete),clockSkewMs:item.clock_skew_ms,current:item.id===device.id}));
