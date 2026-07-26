@@ -191,6 +191,21 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.uploaded).toBe(1);expect(api.head?.entries.find((entry)=>entry.path===path)?.hash).toBe(acceptedHash);expect(api.head?.entries.some((entry)=>entry.path==="ordinary.md")).toBe(true);
   });
+  it("deletes a local-only generated conflict copy instead of uploading it again",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;
+    const path="Notes/Orphan (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md",clear=new TextEncoder().encode("obsolete copy\n");adapter.files.set(path,clear);
+    api.head={id:"00000000-0000-4000-8000-000000000702",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Clean",entries:[]};config.lastSnapshotId=api.head.id;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,deleted:1,conflicts:0});expect(adapter.files.has(path)).toBe(false);expect(api.commits).toBe(0);
+  });
+  it("keeps retrying a locked orphaned conflict copy without restoring it remotely",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;
+    const path="Notes/Locked (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md";adapter.files.set(path,new Uint8Array([1]));
+    api.head={id:"00000000-0000-4000-8000-000000000703",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Clean",entries:[]};config.lastSnapshotId=api.head.id;
+    adapter.readBinary=async()=>{throw Object.assign(new Error("access denied"),{code:"EPERM"});};adapter.remove=async()=>{throw Object.assign(new Error("locked"),{code:"EPERM"});};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,deleted:0,conflicts:0});expect(api.commits).toBe(0);expect(api.head.entries).toEqual([]);
+  });
   it("still stops for an unreadable ordinary note",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("ordinary.md",new Uint8Array([1]));adapter.readBinary=async()=>{throw Object.assign(new Error("access denied"),{code:"EPERM"});};
     await expect(new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync()).rejects.toThrow("access denied");

@@ -200,7 +200,7 @@ export class SyncEngine {
         this.status({phase:"merging",message:`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`});
       }
     }
-    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
+    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
@@ -243,6 +243,7 @@ export class SyncEngine {
       if(handledPluginPaths.has(path))continue;
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
+      if (!b && l && !r && isGibSyncConflictPath(path)) { resolved++;this.status({phase:"merging",message:`Removing orphaned generated conflict copy · ${path}`,level:"success"});continue; }
       if (!settings.initialized && !b && !l && r) { final.set(path, r); continue; }
       if (this.same(l, b)) { if (r) final.set(path, r); continue; }
       if (this.same(r, b)) { if (l) final.set(path, l); continue; }
@@ -327,6 +328,10 @@ export class SyncEngine {
         continue;
       }
       await this.adapter.remove(path); deleted++;
+    }
+    for(const path of orphanUnreadableConflicts){
+      try{await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}
+      catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}
     }
 
     // An ignored path is device-local: keep its accepted remote manifest entry
