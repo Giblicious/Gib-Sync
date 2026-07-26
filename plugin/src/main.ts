@@ -13,6 +13,7 @@ export default class GibSyncPlugin extends Plugin {
   private debounceKind: "automatic"|"file-change"|null = null;
   private fileChangePending = false;
   private lastRelevantVaultChangeAt = 0;
+  private lastVaultRenameAt = 0;
   private watchGeneration = 0;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
@@ -47,7 +48,7 @@ export default class GibSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.scheduleFileChangeSync(file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => this.scheduleFileChangeSync(file.path,oldPath)));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
@@ -282,8 +283,8 @@ export default class GibSyncPlugin extends Plugin {
     if(this.settings.paused){this.openStatusOverview();return false;}
     if(await this.checkObsidianSyncProtection(true))return false;
     if (this.liveStatus.running) return false;
-    const quietFor=Date.now()-this.lastRelevantVaultChangeAt;
-    if(this.lastRelevantVaultChangeAt&&quietFor<2000){this.queueSync(2250-quietFor,"Waiting for file operations to settle","file-change");return false;}
+    const settleWindow=Date.now()-this.lastVaultRenameAt<30_000?5000:2000,quietFor=Date.now()-this.lastRelevantVaultChangeAt;
+    if(this.lastRelevantVaultChangeAt&&quietFor<settleWindow){this.queueSync(settleWindow+250-quietFor,"Waiting for file moves and automatic link updates to settle","file-change");return false;}
     const identity=this.currentVaultIdentity();
     if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
       const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
@@ -337,7 +338,8 @@ export default class GibSyncPlugin extends Plugin {
     this.lastRelevantVaultChangeAt=Date.now();
     if(!this.settings.syncOnFileChange)return;
     if(this.liveStatus.running){this.fileChangePending=true;return;}
-    this.queueSync(2000,"Vault file changed","file-change");
+    const delay=Date.now()-this.lastVaultRenameAt<30_000?5000:2000;
+    this.queueSync(delay,"Vault file changed","file-change");
   }
   configureFileChangeSync() {
     if(this.settings.syncOnFileChange||this.debounceKind!=="file-change"||this.debounce===null)return;

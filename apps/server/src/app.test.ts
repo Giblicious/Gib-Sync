@@ -239,6 +239,13 @@ describe("Gib Sync API", () => {
     const trusted=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:approved.json().id,message:"Trusted delete",entries:[]}});
     expect(trusted.statusCode).toBe(201);await app.close();
   });
+  it("allows an explicit device-scoped maintenance session and lets it end early",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
+    const started=await app.inject({method:"POST",url:"/v1/safeguards/maintenance",headers:auth,payload:{minutes:60}});expect(started.statusCode).toBe(200);expect(started.json().trustedUntil).toEqual(expect.any(String));
+    const ended=await app.inject({method:"POST",url:"/v1/safeguards/maintenance",headers:auth,payload:{minutes:0}});expect(ended.statusCode).toBe(200);expect(ended.json().trustedUntil).toBeNull();
+    await app.close();
+  });
   it("quarantines mass deletion from Seafile and wakes watchers for immediate review",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};

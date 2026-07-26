@@ -31,6 +31,7 @@ export class GibSyncApi {
   safeguards(){return this.json<SafeguardState>("GET","/v1/safeguards",undefined,this.settings().deviceToken);}
   updateSafeguardPolicy(policy:SafeguardPolicy){return this.json<SafeguardState>("PUT","/v1/safeguards/policy",policy,this.settings().deviceToken);}
   setWriteLock(locked:boolean){return this.json<SafeguardState>("POST","/v1/safeguards/lock",{locked},this.settings().deviceToken);}
+  setMaintenance(minutes:number){return this.json<SafeguardState>("POST","/v1/safeguards/maintenance",{minutes},this.settings().deviceToken);}
   quarantines(){return this.json<QuarantineItem[]>("GET","/v1/quarantines",undefined,this.settings().deviceToken);}
   approveQuarantine(id:string,trustMinutes=0){return this.json<Snapshot>("POST",`/v1/quarantines/${id}/approve`,{trustMinutes},this.settings().deviceToken);}
   rejectQuarantine(id:string){return this.json<{ok:boolean}>("POST",`/v1/quarantines/${id}/reject`,{},this.settings().deviceToken);}

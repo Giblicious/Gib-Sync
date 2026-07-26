@@ -287,6 +287,14 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     safeguards.event(device.vault_id,locked?"write_lock_enabled":"write_lock_disabled","info",locked?`Remote writes frozen by ${device.name}`:`Remote writes resumed by ${device.name}`);
     return safeguards.state(device.vault_id,device.id);
   });
+  app.post("/v1/safeguards/maintenance",async(request)=>{
+    const device=await authenticate(request),minutes=z.object({minutes:z.number().int().min(0).max(60)}).parse(request.body).minutes;
+    const until=minutes?new Date(Date.now()+minutes*60_000).toISOString():null;
+    if(minutes)store.run("UPDATE vaults SET trusted_until=?,trusted_device_id=? WHERE id=?",until,device.id,device.vault_id);
+    else store.run("UPDATE vaults SET trusted_until=NULL,trusted_device_id=NULL WHERE id=? AND trusted_device_id=?",device.vault_id,device.id);
+    safeguards.event(device.vault_id,minutes?"maintenance_started":"maintenance_ended","info",minutes?`${device.name} started a ${minutes}-minute maintenance session`:`${device.name} ended its maintenance session`);
+    return safeguards.state(device.vault_id,device.id);
+  });
   app.get("/v1/quarantines",async(request)=>{const device=await authenticate(request);return safeguards.list(device.vault_id);});
   app.post("/v1/quarantines/:id/reject",async(request,reply)=>{
     const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;

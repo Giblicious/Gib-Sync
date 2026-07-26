@@ -2,7 +2,7 @@ import { App, Modal, Notice, Platform, PluginSettingTab, Setting, setIcon } from
 import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, QuarantineItem, SafeguardPolicy, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
-import { shouldSyncChangedPath } from "./settings";
+import { isGibSyncConflictPath,shouldSyncChangedPath } from "./settings";
 import { detailedDiagnostics,privacySafeDiagnostics } from "./diagnostics";
 
 function defaultDeviceName(): string {
@@ -139,13 +139,15 @@ export class SafeguardReviewModal extends Modal{
   private item(item:QuarantineItem){
     const card=this.contentEl.createDiv({cls:"gib-sync-safeguard-card"});card.createEl("h3",{text:`${item.deviceName} · ${item.source==="seafile"?"Seafile/WebDAV":"Obsidian device"}`});
     card.createEl("p",{text:assessmentText(item.assessment)});const reasons=card.createEl("ul");for(const reason of item.assessment.reasons)reasons.createEl("li",{text:reason});
+    const deleted=item.changes.filter((change)=>change.kind==="deleted"),verifiedCleanup=item.source==="device"&&deleted.length>0&&deleted.every((change)=>isGibSyncConflictPath(change.path));
+    if(verifiedCleanup){const explanation=card.createDiv({cls:"gib-sync-attention-card is-warning"});explanation.createEl("strong",{text:"Recognized Gib Sync conflict cleanup"});explanation.createEl("p",{text:`All ${deleted.length} deleted files are generated conflict copies. This batch also contains ${item.assessment.modified} edited note${item.assessment.modified===1?"":"s"}. Approving maintenance keeps exactly these local results and temporarily permits the rest of your cleanup.`});}
     const disclosure=card.createEl("details");disclosure.createEl("summary",{text:`Review ${item.changes.length} changed paths`});const list=disclosure.createEl("ul",{cls:"gib-sync-change-list"});
     for(const change of item.changes)list.createEl("li",{text:`${change.kind}: ${change.previousPath?`${change.previousPath} → `:""}${change.path}`});
     const actions=card.createDiv({cls:"gib-sync-row-actions"});
-    const approve=actions.createEl("button",{text:"Approve once"}),trust=actions.createEl("button",{text:"Approve + trust 15 min"}),reject=actions.createEl("button",{text:"Reject and restore"});
+    const approve=actions.createEl("button",{text:"Approve once"}),trustMinutes=verifiedCleanup?60:15,trust=actions.createEl("button",{text:verifiedCleanup?"Approve cleanup + maintain 60 min":"Approve + trust 15 min"}),reject=actions.createEl("button",{text:"Reject and restore"});
     const disable=()=>{approve.disabled=true;trust.disabled=true;reject.disabled=true;};
     approve.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id);this.close();await this.plugin.runSync();new Notice("Quarantined changes approved");}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
-    trust.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id,15);this.close();await this.plugin.runSync();new Notice("Changes approved; this source is trusted for 15 minutes");}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
+    trust.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id,trustMinutes);this.close();await this.plugin.runSync();new Notice(`Changes approved; this device is in maintenance for ${trustMinutes} minutes`);}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
     reject.onclick=async()=>{if(!await confirmAction(this.app,"Reject quarantined changes","Reject this entire change batch and restore this device to the last accepted snapshot?","Reject and restore",true))return;disable();try{await this.plugin.api.rejectQuarantine(item.id);const restored=await this.plugin.engine.restoreAcceptedSnapshot();this.close();new Notice(`Changes rejected · restored ${restored.downloaded} and removed ${restored.deleted} local files`,10000);void this.plugin.refreshServerStatus();}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
   }
   onClose(){this.contentEl.empty();this.closed();}
@@ -165,6 +167,8 @@ export class SafeguardSettingsModal extends Modal{
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Mass-change safeguards");this.contentEl.setText("Loading…");try{const state=await this.plugin.api.safeguards(),policy={...state.policy,protectedPaths:[...state.policy.protectedPaths]};this.contentEl.empty();
     this.contentEl.createEl("p",{text:"Balanced and strict modes use server-maintained thresholds. Custom mode uses every value below. Protected paths are enforced in every mode."});
+    const maintenance=new Setting(this.contentEl).setName("Vault maintenance session").setDesc(state.trustedUntil?`Mass changes from this device are allowed until ${when(state.trustedUntil)}. Snapshot history and conflict handling remain active.`:"Temporarily allow intentional bulk edits, conflict-copy cleanup, and reorganizing from this device. Protection resumes automatically after 60 minutes.");
+    maintenance.addButton((button)=>button.setButtonText(state.trustedUntil?"End maintenance":"Start 60-minute maintenance").setWarning().onClick(async()=>{const starting=!state.trustedUntil;if(starting&&!await confirmAction(this.app,"Start vault maintenance","Allow mass changes from this device for 60 minutes? Use this only while intentionally cleaning up or reorganizing the vault. Other devices remain protected and version history continues.","Start maintenance",true))return;button.setDisabled(true);try{await this.plugin.api.setMaintenance(starting?60:0);this.close();await this.plugin.refreshServerStatus();new Notice(starting?"Vault maintenance started for 60 minutes":"Vault maintenance ended");}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);button.setDisabled(false);}}));
     new Setting(this.contentEl).setName("Protection mode").addDropdown((dropdown)=>dropdown.addOption("balanced","Balanced").addOption("strict","Strict").addOption("custom","Custom").setValue(policy.mode).onChange((value)=>policy.mode=value as SafeguardPolicy["mode"]));
     const number=(name:string,key:keyof SafeguardPolicy,description:string)=>new Setting(this.contentEl).setName(name).setDesc(description).addText((text)=>text.setValue(String(policy[key])).onChange((value)=>{const parsed=Number(value);if(Number.isFinite(parsed))(policy as any)[key]=parsed;}));
     number("Deletion count","deletionCount","Quarantine at this many deletions.");
