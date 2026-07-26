@@ -61,6 +61,8 @@ On mobile, Gib Sync uses Obsidian's mobile-safe request and vault-adapter APIs, 
 
 Status indicators are independently configurable. Desktop can show an icon, a short state word, both, or neither. Mobile can show a tappable icon in the right-sidebar status area, a compact dot immediately before the view-mode control, or both. Every surface opens the same live status panel with progress, recent activity, attention counts, Sync now, and pause/resume actions. Long-pressing a mobile indicator requests an immediate sync.
 
+Notifications are operation-level and rate-limited. A quarantined mass change or remote write lock places automatic file-change, foreground, and periodic sync triggers on a quiet hold until the safeguard is resolved. The live status panel retains the detailed error while mobile receives only one actionable notice instead of a notice for every changed file.
+
 Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. If it is, Gib Sync stops its timers and incoming watch and refuses new sync runs until Obsidian Sync is disabled. This mutual-exclusion safeguard prevents two synchronization engines from concurrently changing the same vault. `.obsidian/core-plugins.json` is always device-local so configuration sync cannot re-enable Obsidian Sync elsewhere.
 
 ## Deployment

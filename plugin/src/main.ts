@@ -2,6 +2,7 @@ import { Menu, Notice, Platform, Plugin, normalizePath, setIcon } from "obsidian
 import type { ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,GibSyncApi } from "./api";
 import { SyncEngine } from "./engine";
+import { NotificationGate } from "./notifications";
 import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
@@ -15,6 +16,8 @@ export default class GibSyncPlugin extends Plugin {
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
+  private safetyHold=false;
+  private readonly notificationGate=new NotificationGate();
   private nativeSyncBlocked=false;
   private nativeSyncNoticeShown=false;
   private mobileSidebarEl:HTMLElement|null=null;
@@ -190,8 +193,12 @@ export default class GibSyncPlugin extends Plugin {
     }
     this.emitStatus();
   }
+  private notify(key:string,message:string,duration=8000,cooldownMs=60_000){
+    const visible=this.notificationGate.next(key,message,cooldownMs);
+    if(visible)new Notice(visible,duration);
+  }
   clearActivity() { this.liveStatus.activities=[]; this.emitStatus(); }
-  async refreshServerStatus() { if (!this.settings.deviceToken) return; try { this.serverStatus=await this.api.status(); this.settings.storage=this.serverStatus.storage; await this.saveSettings(); this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
+  async refreshServerStatus() { if (!this.settings.deviceToken) return; try { const wasHeld=this.safetyHold;this.serverStatus=await this.api.status(); this.settings.storage=this.serverStatus.storage; if(!this.serverStatus.safeguards.pendingQuarantines&&!this.serverStatus.safeguards.writeLocked)this.safetyHold=false; await this.saveSettings(); if(wasHeld&&!this.safetyHold)this.scheduleNextSyncLabel();else this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
   async saveSettings() { await this.saveData(this.settings); }
   currentVaultIdentity():string {
     const adapter=this.app.vault.adapter as unknown as {getBasePath?:()=>string};
@@ -265,7 +272,7 @@ export default class GibSyncPlugin extends Plugin {
     const identity=this.currentVaultIdentity();
     if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
       const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
-      this.report("error",message,"error");new Notice(message,12000);return;
+      this.report("error",message,"error");this.notify("vault-location",message,10000,300_000);return;
     }
     if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
@@ -273,16 +280,17 @@ export default class GibSyncPlugin extends Plugin {
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.conflicts} conflicts`;
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;
+      this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
       this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
       await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
-      if (result.conflicts) new Notice(`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`, 8000); void this.refreshServerStatus();
+      if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
     } catch (error) {
       console.error("Gib Sync failed", error); const message=error instanceof Error?error.message:String(error); const now=new Date().toISOString();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastErrorAt=now;this.liveStatus.lastError=message;
       this.settings.lastErrorAt=now;this.settings.lastError=message;await this.saveSettings();
-      if(error instanceof ApiError&&error.status===423){this.report("error",message,"warning");new Notice(message,12000);if((error.responseBody as any)?.quarantine)this.openSafeguards();}
-      else{this.report("error",`Sync failed: ${message}`,"error");new Notice(`Gib Sync failed: ${message}`,10000);}
+      if(error instanceof ApiError&&error.status===423){this.safetyHold=true;this.report("blocked",message,"warning");this.notify("safeguard",message,10000,60_000);if((error.responseBody as any)?.quarantine)this.openSafeguards();void this.refreshServerStatus();}
+      else{this.report("error",`Sync failed: ${message}`,"error");this.notify("sync-error",`Gib Sync failed: ${message}`,8000,60_000);}
     } finally {
       if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(2000,"Files changed during sync");}
       else this.scheduleNextSyncLabel();
@@ -303,16 +311,16 @@ export default class GibSyncPlugin extends Plugin {
     this.scheduleNextSyncLabel();
   }
   private queueSync(delay:number,reason:string,kind:"automatic"|"file-change"="file-change") {
-    if(this.nativeSyncBlocked||this.settings.paused)return;
+    if(this.nativeSyncBlocked||this.settings.paused||this.safetyHold)return;
     if (this.debounce !== null) window.clearTimeout(this.debounce);
     this.debounceKind=kind;
     this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`${reason}; sync in ${Math.max(1,Math.round(delay/1000))}s`);
     this.debounce = window.setTimeout(() => { this.debounce = null;this.debounceKind=null;void this.runSync(); }, delay);
   }
-  private scheduleNextSyncLabel() { if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } else {this.liveStatus.nextSyncAt=null;this.emitStatus();} }
+  private scheduleNextSyncLabel() { if (!this.nativeSyncBlocked&&!this.settings.paused&&!this.safetyHold&&this.settings.autoSync&&this.settings.deviceToken) { this.liveStatus.nextSyncAt=new Date(Date.now()+Math.max(15,this.settings.syncIntervalSeconds)*1000).toISOString(); this.emitStatus(); } else {this.liveStatus.nextSyncAt=null;this.emitStatus();} }
   configureTimer() {
     if (this.timer !== null) window.clearInterval(this.timer); this.timer = null;
-    if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => void this.runSync(), Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
+    if (!this.nativeSyncBlocked&&!this.settings.paused&&this.settings.autoSync && this.settings.deviceToken) { this.timer = window.setInterval(() => {if(!this.safetyHold)void this.runSync();}, Math.max(15, this.settings.syncIntervalSeconds) * 1000); this.scheduleNextSyncLabel(); }
     else { this.liveStatus.nextSyncAt=null;this.emitStatus(); }
   }
   configureWatch() {
@@ -327,9 +335,10 @@ export default class GibSyncPlugin extends Plugin {
         if(generation!==this.watchGeneration)return;
         failures=0;
         if(result.attention){
+          this.safetyHold=true;
           await this.refreshServerStatus();
-          this.report("scheduled","Suspicious remote changes need review","warning");
-          new Notice("Gib Sync quarantined suspicious remote changes. Review them in settings.",12000);
+          this.report("blocked","Suspicious remote changes need review","warning");
+          this.notify("safeguard","Gib Sync quarantined suspicious remote changes. Review them in settings.",10000,60_000);
           this.openSafeguards();
         }else if(result.changed&&result.headId!==this.settings.lastSnapshotId){
           this.report("scheduled","Remote change detected; syncing now","info");
