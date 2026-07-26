@@ -17,6 +17,7 @@ const extension=(path:string)=>{const name=path.slice(path.lastIndexOf("/")+1),i
 const isDeviceLocalObsidianPath=(path:string)=>{
   const value=normalize(path);
   if(/^\.obsidian\/workspace(?:-[^/]+)?\.json$/i.test(value))return true;
+  if(value.toLowerCase().startsWith(".obsidian/")&&/ \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?:\.[^/]+)?$/i.test(value))return true;
   const match=/^\.obsidian\/plugins\/[^/]+\/(.+)$/i.exec(value);if(!match)return false;
   const generated=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","node_modules","search-index","temp","tmp"]);
   return match[1].split("/").some((segment)=>generated.has(segment.toLowerCase()))||/\.(?:log|tmp)$/i.test(match[1]);

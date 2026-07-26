@@ -31,7 +31,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
   const safeguards=new SafeguardService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null;
-  const skipExternalOnce=new Set<string>();
+  const skipExternalOnce=new Set<string>(),healthRepairLocks=new Set<string>();
   const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
   function notifyVault(vaultId:string,headId:string|null,attention=false){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
@@ -64,6 +64,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   const mirrorJobs=new Map<string,Promise<void>>();const mirrorTimers=new Set<NodeJS.Timeout>();
   async function ingestExternalChanges(vaultId:string,fresh=false){
+    if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
     const result=await externalImporter.scan(vaultId,fresh);
     if(result.snapshotId){notifyVault(vaultId,result.snapshotId);scheduleMirror(vaultId,50);app.log.info({vaultId,...result},"Imported external Seafile changes");}
     else if(result.quarantineId){const headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id??null;notifyVault(vaultId,headId,true);}
@@ -95,6 +96,28 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
 
   app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+
+  app.post("/v1/health/repair",async(request,reply)=>{
+    const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
+    if(healthRepairLocks.has(device.vault_id))return reply.conflict("A health repair is already running for this vault");healthRepairLocks.add(device.vault_id);
+    try{
+    const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;
+    const snapshot=vault.head_id?store.getSnapshot(vault.head_id):null,current=store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",device.vault_id);
+    const target=new Set((snapshot?.entries??[]).map((entry)=>entry.path));const removedFiles=current.filter((entry)=>!target.has(entry.path)).length;
+    const dismissedQuarantines=store.one<{count:number}>("SELECT COUNT(*) count FROM quarantines WHERE vault_id=? AND status='pending'",device.vault_id)?.count??0;
+    const clearedAlerts=store.one<{count:number}>("SELECT COUNT(*) count FROM health_events WHERE vault_id=? AND cleared_at IS NULL",device.vault_id)?.count??0,now=new Date().toISOString();
+    store.run("UPDATE quarantines SET status='rejected',resolved_at=?,resolved_by=? WHERE vault_id=? AND status='pending'",now,device.id,device.vault_id);
+    store.run("UPDATE health_events SET cleared_at=? WHERE vault_id=? AND cleared_at IS NULL",now,device.vault_id);
+    store.run("UPDATE mirror_entries SET hash=? WHERE vault_id=?",`repair:${now}`,device.vault_id);store.run("UPDATE vaults SET mirror_head_id=NULL,external_error=NULL WHERE id=?",device.vault_id);
+    skipExternalOnce.add(device.vault_id);await reconcileReadableMirror(device.vault_id);
+    let repaired=store.one<{head_id:string|null;mirror_head_id:string|null}>("SELECT head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;
+    if(repaired.head_id!==repaired.mirror_head_id){skipExternalOnce.add(device.vault_id);await reconcileReadableMirror(device.vault_id);repaired=store.one<{head_id:string|null;mirror_head_id:string|null}>("SELECT head_id,mirror_head_id FROM vaults WHERE id=?",device.vault_id)!;}
+    const mirrorCurrent=repaired.head_id===repaired.mirror_head_id;
+    safeguards.event(device.vault_id,"health_repair",mirrorCurrent?"info":"error",mirrorCurrent?`${device.name} restored the accepted snapshot and rebuilt the readable mirror`:`${device.name} requested health repair but the readable mirror did not converge`);
+    notifyVault(device.vault_id,repaired.head_id,!mirrorCurrent);const result={headId:repaired.head_id,mirrorCurrent,restoredFiles:snapshot?.entries.length??0,removedFiles,dismissedQuarantines,clearedAlerts};
+    return mirrorCurrent?result:reply.code(503).send({error:"Health repair could not make the readable mirror current",...result});
+    }finally{healthRepairLocks.delete(device.vault_id);}
+  });
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 

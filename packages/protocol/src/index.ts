@@ -228,6 +228,15 @@ export interface HealthAlert {
   at: string;
 }
 
+export interface HealthRepairResult {
+  headId: string | null;
+  mirrorCurrent: boolean;
+  restoredFiles: number;
+  removedFiles: number;
+  dismissedQuarantines: number;
+  clearedAlerts: number;
+}
+
 export interface RestorePreview {
   snapshotId: string;
   snapshotCreatedAt: string;

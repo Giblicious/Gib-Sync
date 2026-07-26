@@ -62,8 +62,13 @@ export function isGeneratedPluginPath(path:string):boolean {
   return plugin.relative.split("/").some((segment)=>generatedFolders.has(segment.toLowerCase()))||/\.(?:log|tmp)$/i.test(plugin.relative);
 }
 
+export function isLegacyObsidianConflictPath(path:string):boolean {
+  const normalized=path.replace(/\\/g,"/").replace(/^\/+/g,"");
+  return normalized.toLowerCase().startsWith(".obsidian/")&&/ \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?:\.[^/]+)?$/i.test(normalized);
+}
+
 export function isDeviceLocalObsidianPath(path:string):boolean {
-  return isDeviceLocalWorkspacePath(path)||isGeneratedPluginPath(path);
+  return isDeviceLocalWorkspacePath(path)||isGeneratedPluginPath(path)||isLegacyObsidianConflictPath(path);
 }
 
 export function isObsidianSystemPath(path:string):boolean {

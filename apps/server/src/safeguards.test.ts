@@ -44,4 +44,10 @@ describe("safeguard assessment",()=>{
     const result=assessChanges([entry(path,"a")],[],policy,{deviceLocalCleanupPaths:[path]});
     expect(result.assessment.reasons).toContain("Protected path .obsidian would be deleted");
   });
+  it("allows cleanup of legacy Gib Sync conflict artifacts only inside Obsidian system data",()=>{
+    const path=".obsidian/app (conflict - Phone - 2026-07-25 12-10-00 UTC).json";
+    expect(assessChanges([entry(path,"a")],[],BALANCED_POLICY,{deviceLocalCleanupPaths:[path]}).assessment.reasons).toEqual([]);
+    const note="Notes/app (conflict - Phone - 2026-07-25 12-10-00 UTC).md";
+    expect(assessChanges([entry(note,"a")],[],BALANCED_POLICY,{deviceLocalCleanupPaths:[note]}).assessment.deleted).toBe(1);
+  });
 });

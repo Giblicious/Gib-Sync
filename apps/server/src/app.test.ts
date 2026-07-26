@@ -7,7 +7,7 @@ import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { buildApp } from "./app.js";
 import type { SeafileStorage } from "./seafile.js";
-import { decryptVaultBlob,normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
+import { decryptVaultBlob,encryptVaultBlob,normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
 
 class MemoryStorage {
   files = new Map<string, Uint8Array>();
@@ -79,6 +79,18 @@ describe("Gib Sync API", () => {
     const auth = {authorization:`Bearer ${credentials.deviceToken}`};
     const first = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"One",entries:[]}}); expect(first.statusCode).toBe(201);
     const stale = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Stale",entries:[]}}); expect(stale.statusCode).toBe(409);
+    await app.close();
+  });
+  it("repairs a dirty readable mirror from the accepted snapshot and dismisses held proposals",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`};
+    const clear=Buffer.from("accepted note\n"),hash=sha256(clear),encrypted=encryptVaultBlob(clear,credentials.vaultKey,hash);
+    await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:Buffer.from(encrypted)});
+    const commit=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Accepted",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]}})).json();
+    const held=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.id,message:"Bad empty proposal",entries:[]}});expect(held.statusCode).toBe(423);
+    storage.files.set(`read:${credentials.vaultId}:obsolete.tmp`,Buffer.from("obsolete"));store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?)",credentials.vaultId,"obsolete.tmp",sha256(Buffer.from("obsolete")),8,new Date().toISOString());
+    const repaired=await app.inject({method:"POST",url:"/v1/health/repair",headers:auth,payload:{restoreAcceptedHead:true}});expect(repaired.statusCode).toBe(200);expect(repaired.json()).toMatchObject({headId:commit.id,mirrorCurrent:true,restoredFiles:1,removedFiles:1,dismissedQuarantines:1});
+    expect(Array.from(storage.files.get(`read:${credentials.vaultId}:note.md`)??[])).toEqual(Array.from(clear));expect(storage.files.has(`read:${credentials.vaultId}:obsolete.tmp`)).toBe(false);expect((await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json()).toEqual([]);
     await app.close();
   });
   it("returns stale watches immediately and wakes current watches when the vault head changes",async()=>{

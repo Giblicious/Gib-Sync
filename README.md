@@ -66,6 +66,8 @@ On mobile, Gib Sync uses Obsidian's mobile-safe request and vault-adapter APIs, 
 
 Status indicators are independently configurable. Desktop can show an icon, a short state word, both, or neither. Mobile can show a tappable icon in the right-sidebar status area, a compact dot immediately before the view-mode control, or both. Every surface opens the same live status panel with progress, recent activity, attention counts, Sync now, and pause/resume actions. Long-pressing a mobile indicator requests an immediate sync.
 
+**Repair vault health** provides a convergent recovery path when a vault is stuck. After explicit confirmation, the accepted server snapshot becomes the repair checkpoint, pending quarantined proposals are dismissed, the readable Seafile mirror is rebuilt and integrity-checked from encrypted history, obsolete mirror files and legacy `.obsidian` conflict artifacts are removed, and ordinary synchronization resumes. Normal notes and version history are preserved.
+
 Notifications are operation-level and rate-limited. A quarantined mass change or remote write lock places automatic file-change, foreground, and periodic sync triggers on a quiet hold until the safeguard is resolved. The live status panel retains the detailed error while mobile receives only one actionable notice instead of a notice for every changed file.
 
 The live activity panel identifies each three-way merge path, version sizes, chosen resolution, fallback reason, and retry backoff. **Copy detailed log** includes those vault-relative file names but excludes credentials, keys, tokens, and server addresses; **Copy safe log** removes activity text and file names for public sharing.

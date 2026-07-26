@@ -38,6 +38,7 @@ describe("file-change sync filtering",()=>{
     expect(shouldSyncChangedPath(".obsidian/workspace.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/gib-search/embeddings/model/index.meta.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/cache/index.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/app (conflict - Phone - 2026-07-25 12-10-00 UTC).json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/data.json",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/plugins/gib-sync/data.json",settings)).toBe(false);
   });

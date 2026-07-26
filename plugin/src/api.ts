@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { CommitRequest, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, QuarantineItem, QuickCodeClaim, QuickCodePairing, RestorePreview, SafeguardPolicy, SafeguardState, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState, WatchResponse } from "@gib-sync/protocol";
+import type { CommitRequest, HealthRepairResult, HistoryItem, ManifestEntry, MirrorCompleteResponse, MirrorPlanResponse, QuarantineItem, QuickCodeClaim, QuickCodePairing, RestorePreview, SafeguardPolicy, SafeguardState, ServerStatus, SetupResponse, Snapshot, StorageDiscovery, StorageSetupRequest, SyncState, WatchResponse } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
@@ -34,6 +34,7 @@ export class GibSyncApi {
   quarantines(){return this.json<QuarantineItem[]>("GET","/v1/quarantines",undefined,this.settings().deviceToken);}
   approveQuarantine(id:string,trustMinutes=0){return this.json<Snapshot>("POST",`/v1/quarantines/${id}/approve`,{trustMinutes},this.settings().deviceToken);}
   rejectQuarantine(id:string){return this.json<{ok:boolean}>("POST",`/v1/quarantines/${id}/reject`,{},this.settings().deviceToken);}
+  repairHealth(){return this.json<HealthRepairResult>("POST","/v1/health/repair",{restoreAcceptedHead:true},this.settings().deviceToken);}
   markDeviceReady(headId:string|null){return this.json<{ok:boolean}>("POST","/v1/devices/current/ready",{headId},this.settings().deviceToken);}
   revokeDevice(id:string){return this.json<{ok:boolean}>("POST",`/v1/devices/${id}/revoke`,{},this.settings().deviceToken);}
   bookmark(id:string,label="Known good"){return this.json<{ok:boolean;label:string}>("PUT",`/v1/bookmarks/${id}`,{label},this.settings().deviceToken);}

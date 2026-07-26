@@ -41,6 +41,7 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({ id: "enter-quick-code", name: "Enter temporary setup code", callback: () => new QuickCodeEntryModal(this.app, this).open() });
     this.addCommand({ id: "open-history", name: "Open version history", checkCallback: (checking) => { if (!this.settings.deviceToken) return false; if (!checking) new HistoryModal(this.app, this).open(); return true; } });
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
+    this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("create", (file) => this.scheduleFileChangeSync(file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleFileChangeSync(file.path)));
@@ -209,6 +210,11 @@ export default class GibSyncPlugin extends Plugin {
   }
   async acceptCurrentVaultIdentity(){this.settings.vaultIdentity=this.currentVaultIdentity();await this.saveSettings();this.report("idle","Current vault location trusted","success");}
   openSafeguards(){if(this.safeguardModalOpen)return;this.safeguardModalOpen=true;new SafeguardReviewModal(this.app,this,()=>{this.safeguardModalOpen=false;}).open();}
+  async repairVaultHealth(){
+    if(this.liveStatus.running)return false;this.report("mirroring","Repairing from the accepted server snapshot","info");
+    try{const result=await this.api.repairHealth();this.safetyHold=false;await this.refreshServerStatus();this.report("complete",`Health repaired · ${result.restoredFiles} readable files verified · ${result.removedFiles} obsolete files removed · ${result.dismissedQuarantines} held changes dismissed`,"success");new Notice("Gib Sync repaired the accepted vault and readable recovery copy.",6000);return await this.runSync();}
+    catch(error){const message=error instanceof Error?error.message:String(error);this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
+  }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity() });
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
