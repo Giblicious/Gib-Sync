@@ -42,7 +42,7 @@ export default class GibSyncPlugin extends Plugin {
     this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total),undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash));
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total),undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash),Platform.isMobile);
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
@@ -332,7 +332,7 @@ export default class GibSyncPlugin extends Plugin {
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     const startingVersions=new Map(this.pathVersions);
     try {
-      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts${result.serverOnly?` · ${result.serverOnly} oversized attachments server-only on this phone`:""}`;
       for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;this.liveStatus.lastError="";
@@ -446,7 +446,7 @@ export default class GibSyncPlugin extends Plugin {
           this.report("scheduled","Remote change detected; syncing now","info");
           const succeeded=await this.runSync();
           if(succeeded)syncFailures=0;
-          else{syncFailures++;this.report("scheduled",`Incoming sync retry backed off after failure · attempt ${syncFailures}`,"warning");await new Promise<void>((resolve)=>window.setTimeout(resolve,Math.min(60_000,5000*2**Math.min(syncFailures-1,4))));}
+          else{syncFailures++;const delay=Math.min(60_000,5000*2**Math.min(syncFailures-1,4));this.liveStatus.running=false;this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();this.report("scheduled",`Incoming sync failed · retry ${syncFailures} in ${Math.round(delay/1000)}s · ${this.liveStatus.lastError||"see recent activity"}`,"warning");await new Promise<void>((resolve)=>window.setTimeout(resolve,delay));}
         }
       }catch(error){
         if(generation!==this.watchGeneration)return;

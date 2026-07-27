@@ -88,6 +88,12 @@ describe("SyncEngine", () => {
     await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(adapter.writeCalls).toEqual(["Z-note.md","A-large.mp3"]);
   });
+  it("keeps oversized attachments server-only on mobile without deleting or recommitting them",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),small=new TextEncoder().encode("phone note\n"),large=new Uint8Array(25*1024*1024),smallHash=await hashBytes(small),largeHash=await hashBytes(large);
+    api.blobs.set(smallHash,await encryptBlob(small,config.vaultKey,smallHash));api.contents.set(largeHash,large);api.head={id:"00000000-0000-4000-8000-000000000126",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"Note.md",hash:smallHash,size:small.length,mtime:1},{path:"Audio.mp3",hash:largeHash,size:large.length,mtime:1}]};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},undefined,undefined,true).sync();
+    expect(result).toMatchObject({downloaded:1,serverOnly:1});expect(adapter.files.get("Note.md")).toEqual(small);expect(adapter.files.has("Audio.mp3")).toBe(false);expect(api.contentCalls).toEqual([]);expect(api.commits).toBe(0);expect(api.head.entries.map((entry)=>entry.path).sort()).toEqual(["Audio.mp3","Note.md"]);
+  });
   it("blocks a newly paired device from uploading a different pre-existing vault",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("wrong vault\n"),remote=new TextEncoder().encode("shared vault\n"),hash=await hashBytes(remote);
     adapter.files.set("note.md",local);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));

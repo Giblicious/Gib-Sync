@@ -17,7 +17,7 @@ function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   return bytes.slice().buffer;
 }
 
-export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; serverOnly:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
@@ -34,7 +34,8 @@ export class SyncEngine {
     private readonly saveSettings: () => Promise<void>,
     private readonly status: (progress: SyncProgress) => void,
     private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
-    private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{}
+    private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{},
+    private readonly mobile=false
   ) {}
 
   sync(): Promise<SyncResult> {
@@ -59,6 +60,13 @@ export class SyncEngine {
     return shouldSyncChangedPath(normalizePath(path),this.getSettings());
   }
 
+  private mobileServerOnly(entry:Pick<FileState,"path"|"size">):boolean{
+    const limit=this.getSettings().mobileMaxFileSizeMb;
+    return this.mobile&&Number.isFinite(limit)&&limit>0&&!isObsidianSystemPath(entry.path)&&entry.size>limit*1024*1024;
+  }
+
+  private includeEntry(entry:Pick<FileState,"path"|"size">):boolean{return this.include(entry.path)&&!this.mobileServerOnly(entry);}
+
   private async listFiles(path = ""): Promise<string[]> {
     const listing = await this.adapter.list(path); const files = listing.files.filter((file) => this.include(file));
     for (const folder of listing.folders.filter((item) => this.include(item))) files.push(...await this.listFiles(folder));
@@ -69,7 +77,7 @@ export class SyncEngine {
     const output = new Map<string, FileState>(),unreadableConflictPaths=new Set<string>();
     const paths = await this.listFiles(); let current = 0;
     for (const path of paths) {
-      let bytes:Uint8Array,stat;try{bytes=new Uint8Array(await this.adapter.readBinary(path));stat=await this.adapter.stat(path);}catch(error){if(!isGibSyncConflictPath(path))throw error;unreadableConflictPaths.add(path);this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});current++;continue;}
+      let bytes:Uint8Array,stat;try{stat=await this.adapter.stat(path);if(stat?.type==="file"&&this.mobileServerOnly({path,size:stat.size})){current++;continue;}bytes=new Uint8Array(await this.adapter.readBinary(path));}catch(error){if(!isGibSyncConflictPath(path))throw error;unreadableConflictPaths.add(path);this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});current++;continue;}
       // Retain metadata rather than every file body. Mobile WebViews have much
       // tighter memory limits, so changed content is read lazily when required.
       output.set(path, { path, hash: await hashBytes(bytes), size: bytes.length, mtime: stat?.mtime ?? Date.now() });
@@ -86,6 +94,7 @@ export class SyncEngine {
       const stat=await this.adapter.stat(path);
       if(!stat){output.delete(path);continue;}
       if(stat.type!=="file")throw new SyncSafetyError("A changed folder requires a full vault reconciliation before syncing.");
+      if(this.mobileServerOnly({path,size:stat.size})){output.delete(path);continue;}
       try{
         const bytes=new Uint8Array(await this.adapter.readBinary(path));output.set(path,{path,hash:await hashBytes(bytes),size:bytes.length,mtime:stat.mtime??Date.now()});
       }catch(error){
@@ -98,7 +107,7 @@ export class SyncEngine {
   }
 
   private map(snapshot: Snapshot | null): Map<string, FileState> {
-    return new Map((snapshot?.entries ?? []).filter((entry) => this.include(entry.path)).map((entry) => [entry.path, { ...entry }]));
+    return new Map((snapshot?.entries ?? []).filter((entry) => this.includeEntry(entry)).map((entry) => [entry.path, { ...entry }]));
   }
   private async localBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>):Promise<Uint8Array>{
     const cached=cache.get(entry.hash);if(cached)return cached;
@@ -215,7 +224,7 @@ export class SyncEngine {
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
     if(settings.initialized&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       this.status({phase:"up-to-date",message:"Up to date · no local or server changes"});
-      return {uploaded:0,downloaded:0,deleted:0,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
+      return {uploaded:0,downloaded:0,deleted:0,conflicts:0,resolved:0,mirrored:0,serverOnly:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
     const remoteSnapshot=(await this.api.state()).head;
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
@@ -227,7 +236,7 @@ export class SyncEngine {
       throw new SyncSafetyError("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
     }
     if(remoteSnapshot&&!baseSnapshot&&local.size){
-      const remoteHashes=new Map(remoteSnapshot.entries.filter((entry)=>this.include(entry.path)).map((entry)=>[entry.path,entry.hash]));
+      const remoteHashes=new Map(remoteSnapshot.entries.filter((entry)=>this.includeEntry(entry)).map((entry)=>[entry.path,entry.hash]));
       const unexpected=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)!==entry.hash);
       if(unexpected.length){
         const exactMatches=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)===entry.hash).length;
@@ -377,7 +386,8 @@ export class SyncEngine {
     // An ignored path is device-local: keep its accepted remote manifest entry
     // even though this device neither reads nor writes the file. This is
     // essential when phones intentionally omit desktop-only plugins.
-    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>!this.include(entry.path)&&!isDeviceLocalObsidianPath(entry.path));
+    const preservedIgnored=(remoteSnapshot?.entries??[]).filter((entry)=>(!this.include(entry.path)||this.mobileServerOnly(entry))&&!isDeviceLocalObsidianPath(entry.path));
+    const serverOnly=preservedIgnored.filter((entry)=>this.mobileServerOnly(entry)).length;
     const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const clientCanMirrorAll=!preservedIgnored.length;
@@ -386,9 +396,9 @@ export class SyncEngine {
       settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();let mirrored=0;
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
-      this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
+      this.status({phase:"up-to-date",message:serverOnly?`Up to date · ${serverOnly} oversized attachment${serverOnly===1?"":"s"} kept server-only on this mobile device`:"Up to date · readable recovery copy verified"});
       if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
-      return { uploaded: 0, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
+      return { uploaded: 0, downloaded, deleted, conflicts, resolved, mirrored,serverOnly, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
     }
 
     if(!settings.initialized&&remoteSnapshot){
@@ -417,6 +427,6 @@ export class SyncEngine {
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
     if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
-    return { uploaded, downloaded, deleted, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
+    return { uploaded, downloaded, deleted, conflicts, resolved, mirrored,serverOnly, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
   }
 }

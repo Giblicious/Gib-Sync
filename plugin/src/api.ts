@@ -6,7 +6,7 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.22";
+export const CLIENT_VERSION="0.8.23";
 
 export class GibSyncApi {
   constructor(private readonly settings: () => GibSyncSettings) {}

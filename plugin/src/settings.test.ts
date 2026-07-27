@@ -57,7 +57,7 @@ describe("file-change sync filtering",()=>{
     const plugin={loadData:async()=>({deviceName:"Existing device"})} as unknown as Plugin;
     await expect(loadSettings(plugin)).resolves.toMatchObject({
       deviceName:"Existing device",desktopStatusIcon:true,desktopStatusText:true,
-      mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false
+      mobileSidebarIndicator:true,mobileTopIndicator:false,mobileMaxFileSizeMb:24,paused:false
     });
   });
 });
