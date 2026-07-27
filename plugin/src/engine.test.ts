@@ -2,7 +2,7 @@ import { webcrypto } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { DataAdapter } from "obsidian";
 import type { Snapshot } from "@gib-sync/protocol";
-import { FileChangedDuringReadError, SyncEngine } from "./engine";
+import { FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
 import { ApiError } from "./api";
 import type { GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes, toBase64Url } from "./crypto";
@@ -27,11 +27,12 @@ class MemoryAdapter {
 }
 
 class MemoryApi {
-  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;readyHeads:string[]=[];lastCommitBody:any=null;
+  head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); contents=new Map<string,Uint8Array>();contentCalls:string[]=[];mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;readyHeads:string[]=[];lastCommitBody:any=null;
   async state() { return {head:this.head}; }
   async headState() { return {headId:this.head?.id??null}; }
   async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new Error("missing");return snapshot; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
+  async getContent(hash:string){this.contentCalls.push(hash);return this.contents.get(hash)!;}
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
   async markDeviceReady(headId:string|null){this.readyHeads.push(headId??"");return {ok:true};}
   async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"]}) {
@@ -74,6 +75,12 @@ describe("SyncEngine", () => {
     api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash)); api.head={id:"00000000-0000-4000-8000-000000000123",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"folder/note.md",hash,size:clear.length,mtime:1}]};
     const engine = new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}); const result=await engine.sync();
     expect(result.downloaded).toBe(1);expect(result.mirrored).toBe(1);expect(api.commits).toBe(0);expect(adapter.files.get("folder/note.md")).toEqual(clear);expect(api.mirror.get("folder/note.md")).toEqual(clear);expect(config.lastSnapshotId).toBe(api.head.id);
+  });
+  it("uses the verified low-memory content path for a large mobile onboarding file",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("large attachment fixture"),hash=await hashBytes(clear);
+    api.contents.set(hash,clear);api.head={id:"00000000-0000-4000-8000-000000000124",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"audio/large.mp3",hash,size:LOW_MEMORY_DOWNLOAD_BYTES,mtime:1}]};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.downloaded).toBe(1);expect(api.contentCalls).toEqual([hash,hash]);expect(adapter.files.get("audio/large.mp3")).toEqual(clear);expect(api.mirror.get("audio/large.mp3")).toEqual(clear);expect(api.commits).toBe(0);
   });
   it("blocks a newly paired device from uploading a different pre-existing vault",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("wrong vault\n"),remote=new TextEncoder().encode("shared vault\n"),hash=await hashBytes(remote);

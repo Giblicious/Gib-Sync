@@ -39,7 +39,7 @@ export function decryptVaultBlob(payload:Uint8Array,vaultKey:string,hash:string)
   if(payload[0]!==1||payload.length<29)throw new Error("Unsupported or invalid encrypted blob");
   const packed=Buffer.from(payload);const ciphertext=packed.subarray(13,packed.length-16);const tag=packed.subarray(packed.length-16);
   const decipher=createDecipheriv("aes-256-gcm",Buffer.from(vaultKey,"base64url"),packed.subarray(1,13));decipher.setAAD(Buffer.from(hash));decipher.setAuthTag(tag);
-  const clear=Buffer.concat([decipher.update(ciphertext),decipher.final()]);if(sha256(clear)!==hash)throw new Error(`Integrity check failed for ${hash}`);return new Uint8Array(clear);
+  const clear=Buffer.concat([decipher.update(ciphertext),decipher.final()]);if(sha256(clear)!==hash)throw new Error(`Integrity check failed for ${hash}`);return clear;
 }
 
 export function encryptVaultBlob(payload:Uint8Array,vaultKey:string,hash:string):Uint8Array {

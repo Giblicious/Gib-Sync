@@ -6,7 +6,7 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.19";
+export const CLIENT_VERSION="0.8.20";
 
 export class GibSyncApi {
   constructor(private readonly settings: () => GibSyncSettings) {}
@@ -52,6 +52,11 @@ export class GibSyncApi {
   async getBlob(hash: string): Promise<Uint8Array> {
     const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "GET", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}` }, throw: false });
     if (response.status !== 200) throw new ApiError(`Blob download failed (${response.status})`, response.status, null);
+    return new Uint8Array(response.arrayBuffer);
+  }
+  async getContent(hash:string):Promise<Uint8Array>{
+    const response=await requestUrl({url:this.url(`/v1/content/${hash}`),method:"GET",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`},throw:false});
+    if(response.status!==200)throw new ApiError(`Large-file download failed (${response.status})`,response.status,response.text);
     return new Uint8Array(response.arrayBuffer);
   }
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {

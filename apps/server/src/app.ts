@@ -405,21 +405,33 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;const result=store.run("DELETE FROM snapshot_bookmarks WHERE vault_id=? AND snapshot_id=?",device.vault_id,id);if(!result.changes)return reply.notFound();return {ok:true};
   });
 
-  app.get("/v1/blobs/:hash", async (request, reply) => {
-    const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
-    const exists = store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, hash);
-    if (!exists) return reply.notFound();
-    const row=storageRow(device.vault_id);let bytes:Uint8Array;
+  async function loadEncryptedBlob(vaultId:string,hash:string):Promise<Uint8Array|null>{
+    const exists=store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?",vaultId,hash);if(!exists)return null;
+    const row=storageRow(vaultId);let bytes:Uint8Array;
     try{bytes=await storage.get(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`);}
     catch(error){
-      const vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",device.vault_id);
+      const vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId);
       const entry=vault?.head_id?store.getSnapshot(vault.head_id)?.entries.find((item)=>item.hash===hash):undefined;
       if(!entry)throw error;
       const clear=await storage.getReadable(row,entry.path);if(sha256(clear)!==hash)throw error;
-      const key=openJson<string>(vault!.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id);
+      const key=openJson<string>(vault!.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);
       bytes=encryptVaultBlob(clear,key,hash);await storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,bytes);
-      app.log.warn({vaultId:device.vault_id,hash,path:entry.path},"Recovered missing encrypted blob from readable mirror");
+      app.log.warn({vaultId,hash,path:entry.path},"Recovered missing encrypted blob from readable mirror");
     }
+    return bytes;
+  }
+
+  app.get("/v1/content/:hash",async(request,reply)=>{
+    const device=await authenticate(request),hash=z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
+    const encrypted=await loadEncryptedBlob(device.vault_id,hash);if(!encrypted)return reply.notFound();
+    const vault=store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",device.vault_id)!;
+    const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id),clear=decryptVaultBlob(encrypted,key,hash);
+    return reply.header("Cache-Control","no-store").header("X-Content-SHA256",hash).type("application/octet-stream").send(Buffer.from(clear.buffer,clear.byteOffset,clear.byteLength));
+  });
+
+  app.get("/v1/blobs/:hash", async (request, reply) => {
+    const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
+    const bytes=await loadEncryptedBlob(device.vault_id,hash);if(!bytes)return reply.notFound();
     return reply.type("application/octet-stream").send(Buffer.from(bytes));
   });
 

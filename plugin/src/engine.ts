@@ -10,6 +10,12 @@ type FileState = ManifestEntry & { bytes?: Uint8Array; sourcePath?:string };
 type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<string> };
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
+export const LOW_MEMORY_DOWNLOAD_BYTES=8*1024*1024;
+
+function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
+  if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
+  return bytes.slice().buffer;
+}
 
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
@@ -39,7 +45,7 @@ export class SyncEngine {
   async restoreAcceptedSnapshot():Promise<{downloaded:number;deleted:number}>{
     const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
-    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,clear.slice().buffer);downloaded++;}
+    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
     for(const path of local.keys())if(!remote.has(path)&&this.include(path)){this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
     settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
   }
@@ -103,8 +109,8 @@ export class SyncEngine {
 
   private async remoteBytes(entry: FileState, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
     const existing = cache.get(entry.hash); if (existing) return existing;
-    const encrypted = await this.api.getBlob(entry.hash); const bytes = await decryptBlob(encrypted, this.getSettings().vaultKey, entry.hash);
-    cache.set(entry.hash, bytes); return bytes;
+    if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){const bytes=await this.api.getContent(entry.hash);if(await hashBytes(bytes)!==entry.hash)throw new Error(`Integrity check failed for ${entry.path}`);return bytes;}
+    const bytes=await decryptBlob(await this.api.getBlob(entry.hash),this.getSettings().vaultKey,entry.hash);cache.set(entry.hash,bytes);return bytes;
   }
 
   private async ensureParent(path: string): Promise<void> {
@@ -194,8 +200,8 @@ export class SyncEngine {
 
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
     this.status({phase:"mirroring",message:"Planning the readable Seafile recovery copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
-    let mirrored=0;for(const path of plan.uploadPaths){const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);bytes.set(entry.hash,clear);
-      await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);mirrored++;this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
+    let mirrored=0;for(const path of plan.uploadPaths){const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
+      await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}mirrored++;this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
     await this.api.mirrorComplete(snapshotId);this.status({phase:"mirroring",message:`Readable recovery copy is current · ${entries.length} files`});return mirrored;
   }
 
@@ -350,8 +356,9 @@ export class SyncEngine {
     });
     for (const [path, entry] of applyOrder) {
       if (physicalLocal.get(path)?.hash === entry.hash) continue;
-      const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache); bytes.set(entry.hash, clear);
-      await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path, clear.slice().buffer); downloaded++;
+      if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
+      const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
+      await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);} downloaded++;
     }
     for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
       if(scanned.unreadableConflictPaths.has(path)){

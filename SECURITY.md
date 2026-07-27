@@ -7,6 +7,8 @@ Gib Sync stores two complementary representations:
 
 The readable representation deliberately favors recoverability over protection from the server. Losing every device, the Gib Sync database, and the server secret does not make the latest mirrored vault unreadable: it can be downloaded directly from Seafile. Use Seafile permissions, HTTPS, host security, and encrypted disks/backups to protect it.
 
+For large-file downloads, an authenticated Gib Sync service decrypts the encrypted history object transiently and sends integrity-checked content over HTTPS. This avoids retaining multiple full-size encrypted and decrypted copies in a mobile WebView. It does not create another readable server-side copy; the ordinary Seafile recovery tree described above remains the readable representation.
+
 Device access uses independent 256-bit bearer tokens; the server stores only hashes. Vault keys and Seafile API tokens are encrypted at rest with `GIBSYNC_SERVER_SECRET`. Setup passwords are sent only over TLS to exchange them for Seafile API tokens and are not stored. `SEAFILE_ALLOWED_HOSTS` limits storage setup to approved hosts.
 
 Temporary quick codes contain five random decimal digits, expire and roll every 60 seconds, work once, and permit at most five failed guesses per client per 60-second window. Returned credentials are encrypted using a key derived from the code. Manual enrollment requires valid credentials for the same Seafile identity and selected vault.
