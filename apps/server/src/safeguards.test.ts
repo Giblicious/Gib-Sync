@@ -17,9 +17,19 @@ describe("safeguard assessment",()=>{
   it("quarantines complete deletion even for a one-file vault",()=>{
     expect(assessChanges([entry("only.md","a")],[],BALANCED_POLICY).assessment.reasons).toContain("A nonempty vault would become completely empty");
   });
-  it("flags even one deletion when it comes from a stale baseline",()=>{
+  it("allows an ordinary single-file deletion from an older baseline",()=>{
     const result=assessChanges([entry("keep.md","a"),entry("delete.md","b")],[entry("keep.md","a")],BALANCED_POLICY,{staleBaseline:true});
-    expect(result.assessment.reasons).toContain("A stale device would delete 1 file");
+    expect(result.assessment).toMatchObject({deleted:1,reasons:[]});
+  });
+  it("still guards a meaningful deletion batch from an older baseline",()=>{
+    const before=Array.from({length:100},(_,index)=>entry(`note-${index}.md`,String(index%10)));
+    const result=assessChanges(before,before.slice(5),BALANCED_POLICY,{staleBaseline:true});
+    expect(result.assessment.reasons).toContain("An out-of-date device would delete 5 files");
+  });
+  it("still guards a concentrated stale deletion in a small vault",()=>{
+    const before=Array.from({length:20},(_,index)=>entry(`note-${index}.md`,String(index%10)));
+    const result=assessChanges(before,before.slice(3),BALANCED_POLICY,{staleBaseline:true});
+    expect(result.assessment.reasons).toContain("An out-of-date device would delete 3 files");
   });
   it("always flags deletion of a protected path",()=>{
     const policy=policyFor("balanced",{protectedPaths:["Critical"]});

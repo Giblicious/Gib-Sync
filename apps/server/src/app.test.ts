@@ -257,6 +257,16 @@ describe("Gib Sync API", () => {
     const trusted=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:approved.json().id,message:"Trusted delete",entries:[]}});
     expect(trusted.statusCode).toBe(201);await app.close();
   });
+  it("retires obsolete warning proposals when a newer safe sync is accepted",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Phone")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
+    const clear=Buffer.from("shared\n"),hash=sha256(clear),key=Buffer.from(setup.vaultKey,"base64url");await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const entries=Array.from({length:20},(_,index)=>({path:`Folder/note-${index}.md`,hash,size:clear.length,mtime:1}));
+    const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries}})).json();
+    const held=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Bulk delete",entries:entries.slice(10)}});expect(held.statusCode).toBe(423);
+    const accepted=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Ordinary addition",entries:[...entries,{path:"Folder/new.md",hash,size:clear.length,mtime:2}]}});expect(accepted.statusCode).toBe(201);
+    expect((await app.inject({method:"GET",url:"/v1/quarantines",headers:auth})).json()).toEqual([]);await app.close();
+  });
   it("allows an explicit device-scoped maintenance session and lets it end early",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};

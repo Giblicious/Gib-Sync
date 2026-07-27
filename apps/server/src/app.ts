@@ -287,9 +287,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     try{
       const latest=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(latest!==parentId){store.db.exec("ROLLBACK");return null;}
       store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,parentId,deviceId,deviceName,snapshot.createdAt,message,JSON.stringify(snapshot));
-      store.run("UPDATE vaults SET head_id=? WHERE id=?",snapshot.id,vaultId);store.db.exec("COMMIT");
+      store.run("UPDATE vaults SET head_id=? WHERE id=?",snapshot.id,vaultId);
+      store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",snapshot.createdAt,vaultId,parentId);
+      store.db.exec("COMMIT");
     }catch(error){try{store.db.exec("ROLLBACK");}catch{}throw error;}
-    mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
+    safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
 
   app.get("/v1/safeguards",async(request)=>{const device=await authenticate(request);return safeguards.state(device.vault_id,device.id);});
