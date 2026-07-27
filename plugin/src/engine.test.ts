@@ -89,6 +89,13 @@ describe("SyncEngine", () => {
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
     await expect(engine.sync()).rejects.toThrow("Onboarding protection paused");expect(api.commits).toBe(0);expect(adapter.files.get("note.md")).toEqual(local);
   });
+  it("resumes a partial first download instead of comparing its subset to the whole server vault",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),remoteEntries:Snapshot["entries"]=[];
+    for(let index=0;index<20;index++){const clear=new TextEncoder().encode(`server ${index}\n`),hash=await hashBytes(clear),path=`Note ${index}.md`;remoteEntries.push({path,hash,size:clear.length,mtime:index});api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash));if(index<4)adapter.files.set(path,clear);}
+    adapter.files.set("Local scratch.md",new TextEncoder().encode("preserve me\n"));api.head={id:"00000000-0000-4000-8000-000000000202",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Existing vault",entries:remoteEntries};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.downloaded).toBe(16);expect(api.readyHeads).toEqual([api.head?.parentId??"00000000-0000-4000-8000-000000000202"]);expect(api.commits).toBe(1);expect(adapter.files.get("Local scratch.md")).toEqual(new TextEncoder().encode("preserve me\n"));expect([...adapter.files.keys()].filter((path)=>path.includes("conflict"))).toEqual([]);
+  });
   it("losslessly unifies a highly overlapping newly paired vault",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.deviceName="New phone";
     const remoteEntries:Snapshot["entries"]=[];

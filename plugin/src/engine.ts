@@ -232,9 +232,11 @@ export class SyncEngine {
       if(unexpected.length){
         const exactMatches=[...local.values()].filter((entry)=>remoteHashes.get(entry.path)===entry.hash).length;
         const comparedSize=Math.max(local.size,remoteHashes.size),overlap=comparedSize?exactMatches/comparedSize:0;
-        if(overlap<0.9)throw new SyncSafetyError(`Onboarding protection paused sync because the local and server vaults are not similar enough for automatic reconciliation (${exactMatches} of ${comparedSize} files match exactly). No files were uploaded or deleted. Verify that you opened the intended local and server vaults.`);
+        const localUserFiles=[...local.values()].filter((entry)=>!isObsidianSystemPath(entry.path)),exactUserMatches=localUserFiles.filter((entry)=>remoteHashes.get(entry.path)===entry.hash).length;
+        const localAgreement=localUserFiles.length?exactUserMatches/localUserFiles.length:1,interruptedDownload=localUserFiles.length===0||(exactUserMatches>0&&localAgreement>=0.8);
+        if(overlap<0.9&&!interruptedDownload)throw new SyncSafetyError(`Onboarding protection paused sync because this appears to be a different populated vault (${exactMatches} of ${comparedSize} files match the server; ${exactUserMatches} of ${localUserFiles.length} local user files match). No files were uploaded or deleted. Verify that you opened the intended local and server vaults.`);
         onboardingReconcile=true;
-        this.status({phase:"merging",message:`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`});
+        this.status({phase:"merging",message:overlap>=0.9?`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`:`Interrupted onboarding recognized · ${exactUserMatches}/${localUserFiles.length} local user files already match; resuming the server-first download while preserving local-only files`,level:"success"});
       }
     }
     const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
