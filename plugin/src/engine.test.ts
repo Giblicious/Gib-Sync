@@ -88,12 +88,6 @@ describe("SyncEngine", () => {
     await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(adapter.writeCalls).toEqual(["Z-note.md","A-large.mp3"]);
   });
-  it("keeps oversized attachments server-only on mobile without deleting or recommitting them",async()=>{
-    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),small=new TextEncoder().encode("phone note\n"),large=new Uint8Array(25*1024*1024),smallHash=await hashBytes(small),largeHash=await hashBytes(large);
-    api.blobs.set(smallHash,await encryptBlob(small,config.vaultKey,smallHash));api.contents.set(largeHash,large);api.head={id:"00000000-0000-4000-8000-000000000126",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"Note.md",hash:smallHash,size:small.length,mtime:1},{path:"Audio.mp3",hash:largeHash,size:large.length,mtime:1}]};
-    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},undefined,undefined,true).sync();
-    expect(result).toMatchObject({downloaded:1,serverOnly:1});expect(adapter.files.get("Note.md")).toEqual(small);expect(adapter.files.has("Audio.mp3")).toBe(false);expect(api.contentCalls).toEqual([]);expect(api.commits).toBe(0);expect(api.head.entries.map((entry)=>entry.path).sort()).toEqual(["Audio.mp3","Note.md"]);
-  });
   it("blocks a newly paired device from uploading a different pre-existing vault",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("wrong vault\n"),remote=new TextEncoder().encode("shared vault\n"),hash=await hashBytes(remote);
     adapter.files.set("note.md",local);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
@@ -218,6 +212,14 @@ describe("SyncEngine", () => {
     config.lastSnapshotId=base.id;api.head=base;api.snapshots.set(base.id,base);api.blobs.set(manifestHash,await encryptBlob(manifest,config.vaultKey,manifestHash));api.blobs.set(mainHash,await encryptBlob(main,config.vaultKey,mainHash));adapter.files.set(".obsidian/plugins/demo/manifest.json",manifest);
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.resolved).toBe(1);expect(adapter.files.get(".obsidian/plugins/demo/main.js")).toEqual(main);expect(api.head?.entries).toEqual(entries);
+  });
+  it("restores missing ancillary files when complete same-version plugin packages are reconciled",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;
+    const values={manifest:new TextEncoder().encode('{"id":"demo","version":"1.0.0"}'),main:new TextEncoder().encode("code"),styles:new TextEncoder().encode("body{}"),model:new Uint8Array(LOW_MEMORY_DOWNLOAD_BYTES)};const entries:Snapshot["entries"]=[];
+    for(const [name,value] of Object.entries(values)){const hash=await hashBytes(value),path=`.obsidian/plugins/demo/${name==="manifest"?"manifest.json":name==="main"?"main.js":name==="styles"?"styles.css":"models/model.onnx"}`;entries.push({path,hash,size:value.length,mtime:1});adapter.files.set(path,value);if(value.length>=LOW_MEMORY_DOWNLOAD_BYTES)api.contents.set(hash,value);else api.blobs.set(hash,await encryptBlob(value,config.vaultKey,hash));}
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000210",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Complete package",entries};config.lastSnapshotId=base.id;api.snapshots.set(base.id,base);api.head={...base,id:"00000000-0000-4000-8000-000000000211",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",entries:entries.filter((entry)=>entry.path.endsWith("manifest.json")||entry.path.endsWith("main.js"))};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({conflicts:0,resolved:1,uploaded:2});expect(api.head.entries.map((entry)=>entry.path).sort()).toEqual(entries.map((entry)=>entry.path).sort());expect([...adapter.files.keys()].some((path)=>path.includes("conflict"))).toBe(false);
   });
   it("never uploads a stale body when a file changes during a low-memory scan",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),before=new TextEncoder().encode("before\n"),after=new TextEncoder().encode("after\n");adapter.files.set("note.md",before);

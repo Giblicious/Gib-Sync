@@ -41,7 +41,7 @@ describe("file-change sync filtering",()=>{
     expect(shouldSyncChangedPath(".obsidian/community-plugins.json",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/workspace.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/gib-search/embeddings/model/index.meta.json",settings)).toBe(false);
-    expect(shouldSyncChangedPath(".obsidian/plugins/gib-search/models/Xenova/model.onnx",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/plugins/gib-search/models/Xenova/model.onnx",settings)).toBe(true);
     expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/cache/index.json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/app (conflict - Phone - 2026-07-25 12-10-00 UTC).json",settings)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/plugins/search-tool/data.json",settings)).toBe(true);
@@ -57,7 +57,7 @@ describe("file-change sync filtering",()=>{
     const plugin={loadData:async()=>({deviceName:"Existing device"})} as unknown as Plugin;
     await expect(loadSettings(plugin)).resolves.toMatchObject({
       deviceName:"Existing device",desktopStatusIcon:true,desktopStatusText:true,
-      mobileSidebarIndicator:true,mobileTopIndicator:false,mobileMaxFileSizeMb:24,paused:false
+      mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false
     });
   });
 });

@@ -6,7 +6,7 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.23";
+export const CLIENT_VERSION="0.8.24";
 
 export class GibSyncApi {
   constructor(private readonly settings: () => GibSyncSettings) {}
@@ -54,7 +54,7 @@ export class GibSyncApi {
     if (response.status !== 200) throw new ApiError(`Blob download failed (${response.status})`, response.status, null);
     return new Uint8Array(response.arrayBuffer);
   }
-  async getContent(hash:string):Promise<Uint8Array>{
+  async getContent(hash:string,expectedSize?:number):Promise<Uint8Array>{
     // requestUrl eagerly exposes text/json alongside the ArrayBuffer. That is
     // convenient for API responses but can exhaust a mobile WebView when the
     // vault contains large audio, PDF, or model files. Fetch keeps one binary
@@ -62,7 +62,12 @@ export class GibSyncApi {
     const response=await fetch(this.url(`/v1/content/${hash}`),{method:"GET",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`},cache:"no-store"});
     if(!response.ok)throw new ApiError(`Large-file download failed (${response.status})`,response.status,null);
     if(response.headers.get("x-content-sha256")!==hash)throw new Error("Large-file integrity header is missing or invalid");
-    return new Uint8Array(await response.arrayBuffer());
+    if(!response.body||expectedSize===undefined)return new Uint8Array(await response.arrayBuffer());
+    const bytes=new Uint8Array(expectedSize),reader=response.body.getReader();let offset=0;
+    try{for(;;){const {done,value}=await reader.read();if(done)break;if(offset+value.byteLength>bytes.byteLength)throw new Error("Large-file response exceeded its declared size");bytes.set(value,offset);offset+=value.byteLength;}}
+    finally{reader.releaseLock();}
+    if(offset!==bytes.byteLength)throw new Error(`Large-file response ended early (${offset} of ${bytes.byteLength} bytes)`);
+    return bytes;
   }
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
     const body = bytes.slice().buffer;
