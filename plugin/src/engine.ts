@@ -109,7 +109,7 @@ export class SyncEngine {
 
   private async remoteBytes(entry: FileState, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
     const existing = cache.get(entry.hash); if (existing) return existing;
-    if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){const bytes=await this.api.getContent(entry.hash);if(await hashBytes(bytes)!==entry.hash)throw new Error(`Integrity check failed for ${entry.path}`);return bytes;}
+    if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){const bytes=await this.api.getContent(entry.hash);if(bytes.byteLength!==entry.size)throw new Error(`Large-file length check failed for ${entry.path}`);return bytes;}
     const bytes=await decryptBlob(await this.api.getBlob(entry.hash),this.getSettings().vaultKey,entry.hash);cache.set(entry.hash,bytes);return bytes;
   }
 
@@ -352,9 +352,9 @@ export class SyncEngine {
 
     let downloaded = 0, deleted = 0;
     this.status({phase:"applying",message:"Applying merged changes to this device"});
-    const applyOrder=[...final].sort(([left],[right])=>{
-      const rank=(path:string)=>path===".obsidian/community-plugins.json"?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
-      return rank(left)-rank(right)||left.localeCompare(right);
+    const applyOrder=[...final].sort(([left,leftEntry],[right,rightEntry])=>{
+      const rank=(path:string,entry:FileState)=>path===".obsidian/community-plugins.json"?4:entry.size>=LOW_MEMORY_DOWNLOAD_BYTES?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
+      return rank(left,leftEntry)-rank(right,rightEntry)||left.localeCompare(right);
     });
     for (const [path, entry] of applyOrder) {
       if (physicalLocal.get(path)?.hash === entry.hash) continue;

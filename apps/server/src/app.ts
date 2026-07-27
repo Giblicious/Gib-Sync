@@ -426,6 +426,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const encrypted=await loadEncryptedBlob(device.vault_id,hash);if(!encrypted)return reply.notFound();
     const vault=store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",device.vault_id)!;
     const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id),clear=decryptVaultBlob(encrypted,key,hash);
+    app.log.info({vaultId:device.vault_id,deviceId:device.id,hash,bytes:clear.byteLength},"Serving verified low-memory content");
     return reply.header("Cache-Control","no-store").header("X-Content-SHA256",hash).type("application/octet-stream").send(Buffer.from(clear.buffer,clear.byteOffset,clear.byteLength));
   });
 

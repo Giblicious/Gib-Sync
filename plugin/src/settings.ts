@@ -61,7 +61,7 @@ export function isPluginDataPath(path:string):boolean {
 
 export function isGeneratedPluginPath(path:string):boolean {
   const plugin=obsidianPluginPath(path);if(!plugin)return false;
-  const generatedFolders=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","node_modules","search-index","temp","tmp"]);
+  const generatedFolders=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","models","node_modules","search-index","temp","tmp"]);
   return plugin.relative.split("/").some((segment)=>generatedFolders.has(segment.toLowerCase()))||/\.(?:log|tmp)$/i.test(plugin.relative);
 }
 

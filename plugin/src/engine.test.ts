@@ -11,7 +11,7 @@ import { DEFAULT_SETTINGS, type GibSyncSettings } from "./settings";
 beforeAll(() => Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true }));
 
 class MemoryAdapter {
-  files = new Map<string, Uint8Array>(); dirs = new Set<string>();listCalls=0;readCalls:string[]=[];
+  files = new Map<string, Uint8Array>(); dirs = new Set<string>();listCalls=0;readCalls:string[]=[];writeCalls:string[]=[];
   async list(path: string) {
     this.listCalls++;
     const prefix = path ? `${path}/` : ""; const files: string[] = [], folders = new Set<string>();
@@ -19,7 +19,7 @@ class MemoryAdapter {
     return { files, folders:[...folders] };
   }
   async readBinary(path: string) { this.readCalls.push(path);return this.files.get(path)!.slice().buffer; }
-  async writeBinary(path: string, data: ArrayBuffer) { this.files.set(path, new Uint8Array(data)); }
+  async writeBinary(path: string, data: ArrayBuffer) { this.writeCalls.push(path);this.files.set(path, new Uint8Array(data)); }
   async stat(path: string) { const bytes = this.files.get(path); return bytes ? {type:"file" as const,ctime:1,mtime:1,size:bytes.length} : null; }
   async exists(path: string) { return this.files.has(path) || this.dirs.has(path); }
   async mkdir(path: string) { this.dirs.add(path); }
@@ -77,10 +77,16 @@ describe("SyncEngine", () => {
     expect(result.downloaded).toBe(1);expect(result.mirrored).toBe(1);expect(api.commits).toBe(0);expect(adapter.files.get("folder/note.md")).toEqual(clear);expect(api.mirror.get("folder/note.md")).toEqual(clear);expect(config.lastSnapshotId).toBe(api.head.id);
   });
   it("uses the verified low-memory content path for a large mobile onboarding file",async()=>{
-    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("large attachment fixture"),hash=await hashBytes(clear);
-    api.contents.set(hash,clear);api.head={id:"00000000-0000-4000-8000-000000000124",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"audio/large.mp3",hash,size:LOW_MEMORY_DOWNLOAD_BYTES,mtime:1}]};
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new Uint8Array(LOW_MEMORY_DOWNLOAD_BYTES),hash=await hashBytes(clear);
+    api.contents.set(hash,clear);api.head={id:"00000000-0000-4000-8000-000000000124",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"audio/large.mp3",hash,size:clear.length,mtime:1}]};
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
-    expect(result.downloaded).toBe(1);expect(api.contentCalls).toEqual([hash,hash]);expect(adapter.files.get("audio/large.mp3")).toEqual(clear);expect(api.mirror.get("audio/large.mp3")).toEqual(clear);expect(api.commits).toBe(0);
+    expect(result.downloaded).toBe(1);expect(api.contentCalls).toEqual([hash,hash]);expect(adapter.files.get("audio/large.mp3")?.byteLength).toBe(clear.byteLength);expect(api.mirror.get("audio/large.mp3")?.byteLength).toBe(clear.byteLength);expect(api.commits).toBe(0);
+  });
+  it("applies small vault files before large attachments during onboarding",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),small=new TextEncoder().encode("note\n"),large=new Uint8Array(LOW_MEMORY_DOWNLOAD_BYTES),smallHash=await hashBytes(small),largeHash=await hashBytes(large);
+    api.blobs.set(smallHash,await encryptBlob(small,config.vaultKey,smallHash));api.contents.set(largeHash,large);api.head={id:"00000000-0000-4000-8000-000000000125",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"A-large.mp3",hash:largeHash,size:large.length,mtime:1},{path:"Z-note.md",hash:smallHash,size:small.length,mtime:1}]};
+    await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(adapter.writeCalls).toEqual(["Z-note.md","A-large.mp3"]);
   });
   it("blocks a newly paired device from uploading a different pre-existing vault",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),local=new TextEncoder().encode("wrong vault\n"),remote=new TextEncoder().encode("shared vault\n"),hash=await hashBytes(remote);
