@@ -43,7 +43,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(externalTimer)clearInterval(externalTimer);if(externalStartupTimer)clearTimeout(externalStartupTimer);
     for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]);await externalImporter.settle();store.db.close();
   });
-  await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] });
+  await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],exposedHeaders:["X-Content-SHA256"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
   await app.register(sensible);
   app.setErrorHandler((error,_request,reply)=>{

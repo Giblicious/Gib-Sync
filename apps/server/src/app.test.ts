@@ -57,7 +57,7 @@ describe("Gib Sync API", () => {
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
     const clear=Buffer.from("large mobile attachment"),hash=sha256(clear),encrypted=encryptVaultBlob(clear,setup.vaultKey,hash);
     await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:Buffer.from(encrypted)});
-    const response=await app.inject({method:"GET",url:`/v1/content/${hash}`,headers:auth});expect(response.statusCode).toBe(200);expect(response.headers["cache-control"]).toBe("no-store");expect(response.headers["x-content-sha256"]).toBe(hash);expect(response.rawPayload).toEqual(clear);
+    const response=await app.inject({method:"GET",url:`/v1/content/${hash}`,headers:{...auth,origin:"app://obsidian.md"}});expect(response.statusCode).toBe(200);expect(response.headers["cache-control"]).toBe("no-store");expect(response.headers["x-content-sha256"]).toBe(hash);expect(response.headers["access-control-expose-headers"]).toContain("X-Content-SHA256");expect(response.rawPayload).toEqual(clear);
     expect((await app.inject({method:"GET",url:`/v1/content/${hash}`})).statusCode).toBe(401);await app.close();
   });
   it("enrolls, stores an encrypted blob, commits, pairs, and restores", async () => {
