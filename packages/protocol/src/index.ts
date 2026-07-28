@@ -265,13 +265,26 @@ export function detectMoves(previous:ManifestEntry[],next:ManifestEntry[]):Detec
   const result=new Map<string,string>(),usedCreated=new Set<string>();
   for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1)continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
 
-  // Exact matches reveal a folder-prefix move. Once at least two files agree
-  // on that prefix, carry edited siblings to their corresponding new paths.
-  const prefixCounts=new Map<string,{previous:string;next:string;count:number}>();
-  for(const [source,destination] of result){const prefixes=movedPrefix(source,destination);if(!prefixes)continue;const key=`${prefixes.previous}\0${prefixes.next}`,current=prefixCounts.get(key);if(current)current.count++;else prefixCounts.set(key,{...prefixes,count:1});}
-  const mappings=[...prefixCounts.values()].filter((item)=>item.count>=2).sort((left,right)=>right.previous.length-left.previous.length||right.count-left.count);
+  // Exact matches reveal a folder-prefix move. A batch whose bytes all changed
+  // can still reveal the same relocation through unique filenames and similar
+  // sizes. This is intentionally batch-only: three agreeing paths are needed
+  // before edited structural matches can establish a folder mapping.
+  const prefixCounts=new Map<string,{previous:string;next:string;count:number;exact:number}>();
+  const support=(source:string,destination:string,exact:boolean)=>{const prefixes=movedPrefix(source,destination);if(!prefixes)return;const key=`${prefixes.previous}\0${prefixes.next}`,current=prefixCounts.get(key);
+    if(current){current.count++;if(exact)current.exact++;}else prefixCounts.set(key,{...prefixes,count:1,exact:exact?1:0});};
+  for(const [source,destination] of result)support(source,destination,true);
+  const name=(path:string)=>path.slice(path.lastIndexOf("/")+1),extension=(path:string)=>{const value=name(path),index=value.lastIndexOf(".");return index<0?"":value.slice(index+1).toLowerCase();};
+  const remainingRemoved=removed.filter((entry)=>!result.has(entry.path)),remainingCreated=created.filter((entry)=>!usedCreated.has(entry.path));
+  const removedByName=new Map<string,ManifestEntry[]>(),createdByName=new Map<string,ManifestEntry[]>();
+  for(const entry of remainingRemoved){const group=removedByName.get(name(entry.path))??[];group.push(entry);removedByName.set(name(entry.path),group);}
+  for(const entry of remainingCreated){const group=createdByName.get(name(entry.path))??[];group.push(entry);createdByName.set(name(entry.path),group);}
+  for(const [filename,sources] of removedByName){const destinations=createdByName.get(filename)??[];if(sources.length!==1||destinations.length!==1)continue;
+    const source=sources[0],destination=destinations[0],largest=Math.max(source.size,destination.size),sizeDifference=Math.abs(source.size-destination.size);
+    if(extension(source.path)!==extension(destination.path)||sizeDifference>Math.max(64*1024,largest*0.5))continue;support(source.path,destination.path,false);
+  }
+  const mappings=[...prefixCounts.values()].filter((item)=>item.exact>=2||item.count>=3).sort((left,right)=>right.previous.length-left.previous.length||right.count-left.count);
   for(const source of removed){if(result.has(source.path))continue;
-    for(const mapping of mappings){const prefix=mapping.previous?`${mapping.previous}/`:"";if(prefix&&!source.path.startsWith(prefix))continue;if(!prefix&&source.path.includes("/"))continue;
+    for(const mapping of mappings){const prefix=mapping.previous?`${mapping.previous}/`:"";if(prefix&&!source.path.startsWith(prefix))continue;
       const suffix=prefix?source.path.slice(prefix.length):source.path,candidate=mapping.next?`${mapping.next}/${suffix}`:suffix;
       if(usedCreated.has(candidate)||before.has(candidate)||!after.has(candidate))continue;result.set(source.path,candidate);usedCreated.add(candidate);break;
     }

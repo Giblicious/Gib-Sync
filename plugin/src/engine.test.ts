@@ -178,6 +178,13 @@ describe("SyncEngine", () => {
     expect(result.conflicts).toBe(0);expect(api.head?.entries.every((entry)=>entry.path.startsWith("New/"))).toBe(true);expect([...adapter.files.keys()].some((path)=>path.startsWith("Old/"))).toBe(false);
     expect(new TextDecoder().decode(adapter.files.get("New/note-0.md"))).toBe("A\nb\nC\n");
   });
+  it("keeps a fully edited batch at its new folder without creating duplicates",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;const baseEntries:Snapshot["entries"]=[];
+    for(let index=0;index<10;index++){const baseBytes=new TextEncoder().encode(`journal ${index}\n`),localBytes=new TextEncoder().encode(`journal ${index}\nmetadata: moved\n`),hash=await hashBytes(baseBytes);baseEntries.push({path:`Journal/day-${index}.md`,hash,size:baseBytes.length,mtime:1});api.blobs.set(hash,await encryptBlob(baseBytes,config.vaultKey,hash));adapter.files.set(`Archive/Journal/day-${index}.md`,localBytes);}
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000730",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:baseEntries};api.snapshots.set(base.id,base);api.head=base;config.lastSnapshotId=base.id;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync(),paths=api.head!.entries.map((entry)=>entry.path);
+    expect(result.conflicts).toBe(0);expect(paths).toHaveLength(10);expect(paths.every((path)=>path.startsWith("Archive/Journal/"))).toBe(true);expect([...adapter.files.keys()].some((path)=>path.startsWith("Journal/"))).toBe(false);
+  });
   it("converges simultaneous moves to one destination instead of duplicating files",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;const entries:Snapshot["entries"]=[];
     for(let index=0;index<3;index++){const clear=new TextEncoder().encode(`note ${index}\n`),hash=await hashBytes(clear);entries.push({path:`Old/note-${index}.md`,hash,size:clear.length,mtime:1});api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash));adapter.files.set(`Local destination/note-${index}.md`,clear);}

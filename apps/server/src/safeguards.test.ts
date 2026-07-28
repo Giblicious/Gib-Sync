@@ -45,6 +45,18 @@ describe("safeguard assessment",()=>{
     const result=assessChanges(before,after,BALANCED_POLICY);
     expect(result.assessment).toMatchObject({created:0,deleted:0,modified:0,moved:50,totalChanged:50,reasons:[]});
   });
+  it("recognizes a routine batch move even when every note changed during relocation",()=>{
+    const before=Array.from({length:30},(_,index)=>entry(`Journal/2026-07-${String(index+1).padStart(2,"0")}.md`,`old-${index}`,1000));
+    const after=before.map((item,index)=>({...item,path:item.path.replace("Journal/","Archive/Journal/"),hash:`new-${index}`.padEnd(64,"0"),size:item.size+20}));
+    const result=assessChanges(before,after,BALANCED_POLICY,{staleBaseline:true});
+    expect(result.assessment).toMatchObject({created:0,deleted:0,modified:0,moved:30,totalChanged:30,reasons:[]});
+  });
+  it("does not disguise unrelated mass deletion and replacement as a move",()=>{
+    const before=Array.from({length:30},(_,index)=>entry(`Journal/entry-${index}.md`,`old-${index}`,1000));
+    const after=Array.from({length:30},(_,index)=>entry(`Imports/unrelated-${index}.md`,`new-${index}`,1000));
+    const result=assessChanges(before,after,BALANCED_POLICY,{staleBaseline:true});
+    expect(result.assessment).toMatchObject({created:30,deleted:30,moved:0});expect(result.assessment.reasons.length).toBeGreaterThan(0);
+  });
   it("still guards against extreme growth inside a recognized folder move",()=>{
     const before=[entry("Old/large.bin","old",1024*1024),entry("Old/a.md","a"),entry("Old/b.md","b")];
     const after=[entry("New/large.bin","rewritten",60*1024*1024),entry("New/a.md","a"),entry("New/b.md","b")];
