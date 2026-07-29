@@ -6,7 +6,12 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.26";
+export const CLIENT_VERSION="0.8.27";
+
+function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
+  if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
+  return bytes.slice().buffer;
+}
 
 export class GibSyncApi {
   constructor(private readonly settings: () => GibSyncSettings) {}
@@ -70,12 +75,12 @@ export class GibSyncApi {
     return bytes;
   }
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
-    const body = bytes.slice().buffer;
+    const body = exactArrayBuffer(bytes);
     const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "PUT", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream" }, body, throw: false });
     if (response.status < 200 || response.status >= 300) throw new ApiError(`Blob upload failed (${response.status})`, response.status, response.text);
   }
   async putMirrorFile(snapshotId:string,path:string,hash:string,bytes:Uint8Array):Promise<void>{
-    const response=await requestUrl({url:this.url(`/v1/mirror/file?path=${encodeURIComponent(path)}`),method:"PUT",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream","X-Gib-Sync-Snapshot":snapshotId,"X-Gib-Sync-Hash":hash},body:bytes.slice().buffer,throw:false});
+    const response=await requestUrl({url:this.url(`/v1/mirror/file?path=${encodeURIComponent(path)}`),method:"PUT",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream","X-Gib-Sync-Snapshot":snapshotId,"X-Gib-Sync-Hash":hash},body:exactArrayBuffer(bytes),throw:false});
     if(response.status<200||response.status>=300)throw new ApiError(`Readable mirror upload failed for ${path} (${response.status})`,response.status,response.json??response.text);
   }
 }

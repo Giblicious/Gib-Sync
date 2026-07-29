@@ -11,6 +11,8 @@ type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<stri
 const TEXT_EXTENSIONS = new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder = new TextDecoder(); const encoder = new TextEncoder();
 export const LOW_MEMORY_DOWNLOAD_BYTES=8*1024*1024;
+const MOBILE_WORK_BATCH=2;
+const DESKTOP_WORK_BATCH=8;
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
@@ -27,6 +29,9 @@ export class FileChangedDuringReadError extends Error {
 
 export class SyncEngine {
   private running: Promise<SyncResult> | null = null;
+  private workSinceYield=0;
+  private lastYieldAt=0;
+  private readonly workBatch=typeof navigator!=="undefined"&&/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)?MOBILE_WORK_BATCH:DESKTOP_WORK_BATCH;
   constructor(
     private readonly adapter: DataAdapter,
     private readonly api: GibSyncApi,
@@ -34,8 +39,17 @@ export class SyncEngine {
     private readonly saveSettings: () => Promise<void>,
     private readonly status: (progress: SyncProgress) => void,
     private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
-    private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{}
+    private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{},
+    private readonly yieldControl:()=>Promise<void>=()=>new Promise((resolve)=>globalThis.setTimeout(resolve,0))
   ) {}
+
+  private async cooperate(force=false):Promise<void>{
+    const now=typeof performance!=="undefined"?performance.now():Date.now();
+    this.workSinceYield++;
+    if(!force&&this.workSinceYield<this.workBatch&&now-this.lastYieldAt<8)return;
+    this.workSinceYield=0;this.lastYieldAt=now;await this.yieldControl();
+  }
+  private progress(current:number,total?:number):boolean{return current===1||current===total||current%10===0;}
 
   sync(): Promise<SyncResult> {
     if (this.running) return this.running;
@@ -45,13 +59,15 @@ export class SyncEngine {
   async restoreAcceptedSnapshot():Promise<{downloaded:number;deleted:number}>{
     const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
-    for(const [path,entry] of remote){if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
-    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
+    for(const [path,entry] of remote){await this.cooperate();if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
+    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){await this.cooperate();this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
     settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
   }
 
-  private entropy(bytes:Uint8Array):number{
-    if(bytes.length<1024)return 0;const counts=new Uint32Array(256);for(const value of bytes)counts[value]++;let result=0;
+  private async entropy(bytes:Uint8Array):Promise<number>{
+    if(bytes.length<1024)return 0;const counts=new Uint32Array(256);
+    for(let start=0;start<bytes.length;start+=64*1024){for(const value of bytes.subarray(start,start+64*1024))counts[value]++;await this.cooperate();}
+    let result=0;
     for(const count of counts)if(count){const probability=count/bytes.length;result-=probability*Math.log2(probability);}return result;
   }
 
@@ -61,7 +77,7 @@ export class SyncEngine {
 
   private async listFiles(path = ""): Promise<string[]> {
     const listing = await this.adapter.list(path); const files = listing.files.filter((file) => this.include(file));
-    for (const folder of listing.folders.filter((item) => this.include(item))) files.push(...await this.listFiles(folder));
+    for (const folder of listing.folders.filter((item) => this.include(item))) {await this.cooperate();files.push(...await this.listFiles(folder));}
     return files;
   }
 
@@ -69,6 +85,7 @@ export class SyncEngine {
     const output = new Map<string, FileState>(),unreadableConflictPaths=new Set<string>();
     const paths = await this.listFiles(); let current = 0;
     for (const path of paths) {
+      await this.cooperate();
       let bytes:Uint8Array,stat;try{bytes=new Uint8Array(await this.adapter.readBinary(path));stat=await this.adapter.stat(path);}catch(error){if(!isGibSyncConflictPath(path))throw error;unreadableConflictPaths.add(path);this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});current++;continue;}
       // Retain metadata rather than every file body. Mobile WebViews have much
       // tighter memory limits, so changed content is read lazily when required.
@@ -81,6 +98,7 @@ export class SyncEngine {
   private async scanIncremental(baseSnapshot:Snapshot,changedPaths:string[]):Promise<LocalScan>{
     const output=this.map(baseSnapshot),unreadableConflictPaths=new Set<string>();let current=0;
     for(const rawPath of changedPaths){
+      await this.cooperate();
       const path=normalizePath(rawPath);current++;
       if(!this.include(path)){output.delete(path);continue;}
       const stat=await this.adapter.stat(path);
@@ -92,7 +110,7 @@ export class SyncEngine {
         if(!isGibSyncConflictPath(path))throw error;output.delete(path);unreadableConflictPaths.add(path);
         this.status({phase:"scanning",message:`Isolated unreadable generated conflict copy · ${path} · accepted server version preserved`,level:"warning"});
       }
-      this.status({phase:"scanning",message:"Checking changed files",current,total:changedPaths.length});
+      if(this.progress(current,changedPaths.length))this.status({phase:"scanning",message:"Checking changed files",current,total:changedPaths.length});
     }
     return {files:output,unreadableConflictPaths};
   }
@@ -200,8 +218,8 @@ export class SyncEngine {
 
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
     this.status({phase:"mirroring",message:"Planning the readable Seafile recovery copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
-    let mirrored=0;for(const path of plan.uploadPaths){const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
-      await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}mirrored++;this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
+    let mirrored=0;for(const path of plan.uploadPaths){await this.cooperate();const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
+      await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}mirrored++;if(this.progress(mirrored,plan.uploadPaths.length))this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
     await this.api.mirrorComplete(snapshotId);this.status({phase:"mirroring",message:`Readable recovery copy is current · ${entries.length} files`});return mirrored;
   }
 
@@ -253,6 +271,7 @@ export class SyncEngine {
         try{const clear=source==="local"?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);return (JSON.parse(decoder.decode(clear)) as {version?:unknown}).version as string??null;}catch{return null;}
       };
       for(const id of [...pluginIds].sort()){
+        await this.cooperate();
         const baseline=packageFor(base,id),localPackage=packageFor(local,id),remotePackage=packageFor(remote,id);
         for(const path of new Set([...baseline.keys(),...localPackage.keys(),...remotePackage.keys()]))handledPluginPaths.add(path);
         const localChanged=!this.packageSame(localPackage,baseline),remoteChanged=!this.packageSame(remotePackage,baseline);
@@ -283,6 +302,7 @@ export class SyncEngine {
       }
     }
     for (const path of [...paths].sort()) {
+      await this.cooperate();
       if(handledPluginPaths.has(path))continue;
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
@@ -321,7 +341,9 @@ export class SyncEngine {
         const localText = decoder.decode(await this.localBytes(path,l,bytes)); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
         const preferred=l.mtime>=r.mtime?"local":"remote";
         this.status({phase:"merging",message:`Three-way merge · ${path} · base ${b?.size??0} B · local ${l.size} B · remote ${r.size} B`});
+        await this.cooperate(true);
         const merged = mergeText(baseText, localText, remoteText, preferred);
+        await this.cooperate(true);
         if(merged.kind==="large-conflict"||merged.kind==="merge-fallback"){
           const reason=merged.kind==="merge-fallback"?merged.reason??"merge engine fallback":`${merged.overlapWords} overlapping words across ${merged.overlapLines} lines`;
           console.warn("Gib Sync preserved both versions after merge fallback",{path,reason,baseBytes:b?.size??0,localBytes:l.size,remoteBytes:r.size});
@@ -361,12 +383,14 @@ export class SyncEngine {
       return rank(left,leftEntry)-rank(right,rightEntry)||left.localeCompare(right);
     });
     for (const [path, entry] of applyOrder) {
+      await this.cooperate();
       if (physicalLocal.get(path)?.hash === entry.hash) continue;
       if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
       const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
       await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);} downloaded++;
     }
     for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
+      await this.cooperate();
       if(scanned.unreadableConflictPaths.has(path)){
         this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});
         continue;
@@ -374,6 +398,7 @@ export class SyncEngine {
       this.expectLocalMutation(path,null);await this.adapter.remove(path); deleted++;
     }
     for(const path of orphanUnreadableConflicts){
+      await this.cooperate();
       try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}
       catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}
     }
@@ -385,6 +410,7 @@ export class SyncEngine {
     const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const clientCanMirrorAll=!preservedIgnored.length;
+    const remoteHashes=new Set(remoteEntries.map((entry)=>entry.hash)),remotePathHashes=new Map(remoteEntries.map((entry)=>[entry.path,entry.hash])),entryPaths=new Set(entries.map((entry)=>entry.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
       settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();let mirrored=0;
@@ -403,16 +429,20 @@ export class SyncEngine {
 
     this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;
     for (const entry of entries) {
-      if(remoteEntries.some((remoteEntry)=>remoteEntry.hash===entry.hash))continue;
+      await this.cooperate();
+      if(remoteHashes.has(entry.hash))continue;
       const localEntry=local.get(entry.path);const clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(entry.path,localEntry,bytes):undefined);if(!clear)throw new Error(`Unable to prepare changed file ${entry.path}`);
       await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
-      this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
+      if(this.progress(uploaded))this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
     }
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
     let snapshot:Snapshot;
-    const highEntropyPaths=entries.filter((entry)=>this.text(entry.path)&&!remoteEntries.some((remoteEntry)=>remoteEntry.path===entry.path&&remoteEntry.hash===entry.hash))
-      .filter((entry)=>{const clear=bytes.get(entry.hash);return clear?this.entropy(clear)>7.2:false;}).map((entry)=>entry.path);
-    const deviceLocalCleanupPaths=remoteEntries.filter((entry)=>isDeviceLocalObsidianPath(entry.path)&&!entries.some((next)=>next.path===entry.path)).slice(0,5000).map((entry)=>entry.path);
+    const highEntropyPaths:string[]=[];
+    for(const entry of entries){
+      if(!this.text(entry.path)||remotePathHashes.get(entry.path)===entry.hash)continue;
+      const clear=bytes.get(entry.hash);if(clear&&await this.entropy(clear)>7.2)highEntropyPaths.push(entry.path);
+    }
+    const deviceLocalCleanupPaths=remoteEntries.filter((entry)=>isDeviceLocalObsidianPath(entry.path)&&!entryPaths.has(entry.path)).slice(0,5000).map((entry)=>entry.path);
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,
       clientTime:new Date().toISOString(),signals:{highEntropyPaths,deviceLocalCleanupPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}

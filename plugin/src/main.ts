@@ -33,6 +33,9 @@ export default class GibSyncPlugin extends Plugin {
   private pathRevision=0;
   private journalSaveTimer:number|null=null;
   private readonly expectedLocalMutations=new Map<string,string|null>();
+  private readonly expectedVerificationQueue=new Map<string,string|null>();
+  private expectedVerificationTimer:number|null=null;
+  private expectedVerificationRunning=false;
   compatibility:ClientCompatibility|null=null;
   private compatibilityBlocked=false;
 
@@ -88,6 +91,8 @@ export default class GibSyncPlugin extends Plugin {
     if(this.timer!==null)window.clearInterval(this.timer);
     if(this.debounce!==null)window.clearTimeout(this.debounce);
     if(this.journalSaveTimer!==null)window.clearTimeout(this.journalSaveTimer);
+    if(this.expectedVerificationTimer!==null)window.clearTimeout(this.expectedVerificationTimer);
+    this.expectedVerificationQueue.clear();
     if(this.settings.pendingPaths.length||this.settings.fullScanRequired)void this.saveSettings();
     this.mobileObserver?.disconnect();this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();
     this.removeStaleMobileSidebarIndicators();
@@ -362,6 +367,7 @@ export default class GibSyncPlugin extends Plugin {
         else{this.report("error",`Sync failed: ${message}`,"error");this.notify("sync-error",`Gib Sync failed: ${message}`,8000,60_000);}
       }
     } finally {
+      this.scheduleExpectedVerification();
       if(changedDuringRead){this.fileChangePending=false;this.queueSync(2000,"File changed during sync; retrying");}
       else if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(genericFailure?15_000:2000,genericFailure?"Files changed; retrying with error backoff":"Files changed during sync");}
       else this.scheduleNextSyncLabel();
@@ -376,7 +382,7 @@ export default class GibSyncPlugin extends Plugin {
     if(!this.settings.deviceToken)return;
     const normalized=paths.map((path)=>normalizePath(path));
     const expected=normalized.filter((path)=>this.expectedLocalMutations.has(path));
-    if(expected.length){for(const path of expected)void this.verifyExpectedMutation(path,this.expectedLocalMutations.get(path)!);paths=normalized.filter((path)=>!expected.includes(path));}
+    if(expected.length){for(const path of expected)this.queueExpectedMutationVerification(path,this.expectedLocalMutations.get(path)!);paths=normalized.filter((path)=>!expected.includes(path));}
     const relevant=paths.map((path)=>normalizePath(path)).filter((path)=>shouldSyncChangedPath(path,this.settings));if(!relevant.length)return;
     for(const path of relevant)this.pathVersions.set(path,++this.pathRevision);
     this.settings.pendingPaths=[...this.pathVersions.keys()].sort();this.persistJournalSoon();
@@ -387,7 +393,6 @@ export default class GibSyncPlugin extends Plugin {
     this.queueSync(delay,"Vault file changed","file-change");
   }
   private async verifyExpectedMutation(path:string,expectedHash:string|null){
-    await new Promise<void>((resolve)=>window.setTimeout(resolve,50));
     try{
       const stat=await this.app.vault.adapter.stat(path);
       if(!stat&&expectedHash===null){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
@@ -395,6 +400,24 @@ export default class GibSyncPlugin extends Plugin {
     }catch{}
     if(this.expectedLocalMutations.get(path)!==expectedHash)return;this.expectedLocalMutations.delete(path);
     this.scheduleFileChangeSync(path);
+  }
+  private queueExpectedMutationVerification(path:string,expectedHash:string|null){
+    this.expectedVerificationQueue.set(path,expectedHash);this.scheduleExpectedVerification();
+  }
+  private scheduleExpectedVerification(){
+    if(this.liveStatus.running||this.expectedVerificationRunning||this.expectedVerificationTimer!==null||!this.expectedVerificationQueue.size)return;
+    this.expectedVerificationTimer=window.setTimeout(()=>{this.expectedVerificationTimer=null;void this.drainExpectedVerifications();},100);
+  }
+  private async drainExpectedVerifications(){
+    if(this.expectedVerificationRunning||this.liveStatus.running)return;
+    this.expectedVerificationRunning=true;
+    try{
+      while(this.expectedVerificationQueue.size&&!this.liveStatus.running){
+        const next=this.expectedVerificationQueue.entries().next().value as [string,string|null]|undefined;if(!next)break;
+        this.expectedVerificationQueue.delete(next[0]);await this.verifyExpectedMutation(next[0],next[1]);
+        await new Promise<void>((resolve)=>window.setTimeout(resolve,0));
+      }
+    }finally{this.expectedVerificationRunning=false;if(this.expectedVerificationQueue.size)this.scheduleExpectedVerification();}
   }
   requireFullScan(){
     this.settings.fullScanRequired=true;this.persistJournalSoon();

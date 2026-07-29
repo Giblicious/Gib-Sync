@@ -5,8 +5,10 @@ type Hunk = { start: number; remove: number; add: string[]; side: Side };
 export type MergeKind = "merged" | "small-overlap" | "large-conflict";
 export type MergeResult = { text: string; conflicted: boolean; kind: MergeKind|"merge-fallback"; overlapWords: number; overlapLines: number; reason?:string };
 
-const MAX_AUTO_MERGE_CHARACTERS=4_000_000;
-const MAX_AUTO_MERGE_TOKENS=250_000;
+// `diff` is synchronous in the Obsidian renderer. Keep its worst-case input
+// bounded so a pathological generated file cannot monopolize the UI thread.
+const MAX_AUTO_MERGE_CHARACTERS=750_000;
+const MAX_AUTO_MERGE_TOKENS=75_000;
 
 const word = /[\p{L}\p{N}_]/u;
 const tokenize = (value: string): string[] => value.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) ?? [];

@@ -49,6 +49,14 @@ function settings(): GibSyncSettings {
 }
 
 describe("SyncEngine", () => {
+  it("cooperatively yields and throttles UI progress during large sync work",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),progress:string[]=[];let yields=0;
+    for(let index=0;index<40;index++)adapter.files.set(`Journal/${index}.md`,new TextEncoder().encode(`entry ${index}\n`));
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},(item)=>progress.push(`${item.phase}:${item.current??0}`),async()=>{},()=>{},async()=>{yields++;});
+    const result=await engine.sync();
+    expect(result.uploaded).toBe(40);expect(yields).toBeGreaterThan(5);
+    expect(progress.filter((item)=>item.startsWith("mirroring:")).length).toBeLessThan(10);
+  });
   it("uses only the lightweight head check when neither side changed",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear);
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000010",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
