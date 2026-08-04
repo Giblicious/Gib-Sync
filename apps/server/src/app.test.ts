@@ -181,7 +181,7 @@ describe("Gib Sync API", () => {
     storage.files.set(`read:${credentials.vaultId}:Rewrite.md`,Buffer.from("seafile one\nseafile two\nseafile three\n"));
     const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported.conflicts).toBe(1);
     const entries=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.entries;expect(entries).toHaveLength(2);
-    const original=entries.find((entry:any)=>entry.path==="Rewrite.md"),copy=entries.find((entry:any)=>entry.path!=="Rewrite.md");expect(copy.path).toContain("conflict - Desktop");
+    const original=entries.find((entry:any)=>entry.path==="Rewrite.md"),copy=entries.find((entry:any)=>entry.path!=="Rewrite.md");expect(copy.path).toContain("conflict - Seafile");
     const clear=async(entry:any)=>Buffer.from(decryptVaultBlob(storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!,credentials.vaultKey,entry.hash)).toString();
     expect(await clear(original)).toContain(`[[${copy.path.slice(0,-3)}`);expect(await clear(copy)).toContain("[[Rewrite|Rewrite.md]]");
     await app.close();
@@ -300,6 +300,17 @@ describe("Gib Sync API", () => {
     const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:1,deletedFiles:0,conflicts:0});
     const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.parentId).toBe(second.id);expect(head.entries).toEqual([{path:"New/note.md",hash:editedHash,size:edited.length,mtime:expect.any(Number)}]);
     await app.close();
+  });
+  it("merges edits made on both sides while Seafile moves a folder",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
+    const base=Buffer.from("a\nb\nc\n"),local=Buffer.from("A\nb\nc\n"),external=Buffer.from("a\nb\nC\n"),baseHash=sha256(base),localHash=sha256(local);
+    for(const [hash,clear] of [[baseHash,base],[localHash,local]] as const)await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
+    const entries=Array.from({length:3},(_,index)=>({path:`Old/note-${index}.md`,hash:baseHash,size:base.length,mtime:1})),first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Base",entries}})).json(),now=new Date().toISOString();
+    for(const entry of entries){storage.files.set(`read:${credentials.vaultId}:${entry.path}`,base);store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?)",credentials.vaultId,entry.path,entry.hash,entry.size,now,`${entry.path}-id`,1);}store.run("UPDATE vaults SET mirror_head_id=? WHERE id=?",first.id,credentials.vaultId);
+    const secondEntries=entries.map((entry,index)=>index===0?{...entry,hash:localHash,size:local.length,mtime:2}:entry),second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Obsidian edit",entries:secondEntries}})).json();
+    for(let index=0;index<3;index++){storage.files.delete(`read:${credentials.vaultId}:Old/note-${index}.md`);storage.files.set(`read:${credentials.vaultId}:New/note-${index}.md`,index===0?external:base);}
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:3,conflicts:0});
+    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head,target=head.entries.find((entry:any)=>entry.path==="New/note-0.md"),encrypted=storage.files.get(`${credentials.vaultId}:blobs/${target.hash.slice(0,2)}/${target.hash}.gbs`)!;expect(head.parentId).toBe(second.id);expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,target.hash)).toString()).toBe("A\nb\nC\n");expect(head.entries.some((entry:any)=>entry.path.startsWith("Old/"))).toBe(false);await app.close();
   });
   it("does not import its own readable writes while the mirror is catching up",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);

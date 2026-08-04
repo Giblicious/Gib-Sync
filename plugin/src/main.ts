@@ -60,8 +60,8 @@ export default class GibSyncPlugin extends Plugin {
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("create", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
-    this.registerEvent(this.app.vault.on("delete", (file) => file instanceof TFolder?this.requireFullScan():this.scheduleFileChangeSync(file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder)this.requireFullScan();else this.scheduleFileChangeSync(file.path,oldPath);}));
+    this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){this.recordPathTime(file.path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder){this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
@@ -94,7 +94,7 @@ export default class GibSyncPlugin extends Plugin {
     if(this.journalSaveTimer!==null)window.clearTimeout(this.journalSaveTimer);
     if(this.expectedVerificationTimer!==null)window.clearTimeout(this.expectedVerificationTimer);
     this.expectedVerificationQueue.clear();
-    if(this.settings.pendingPaths.length||this.settings.fullScanRequired)void this.saveSettings();
+    if(this.settings.pendingPaths.length||Object.keys(this.settings.pendingPathTimes).length||this.settings.pendingApplyPaths.length||this.settings.fullScanRequired)void this.saveSettings();
     this.mobileObserver?.disconnect();this.mobileSidebarEl?.remove();this.mobileTopEl?.remove();
     this.removeStaleMobileSidebarIndicators();
   }
@@ -261,7 +261,7 @@ export default class GibSyncPlugin extends Plugin {
     catch(error){const message=error instanceof Error?error.message:String(error);this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],fullScanRequired:true,lastFullScanAt:null });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
@@ -336,10 +336,11 @@ export default class GibSyncPlugin extends Plugin {
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("scanning","Starting sync");
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
-    const startingVersions=new Map(this.pathVersions);
+    const startingVersions=new Map(this.pathVersions),startingPathTimes={...this.settings.pendingPathTimes};
     try {
       const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
       for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
+      for(const [path,time] of Object.entries(startingPathTimes))if(this.settings.pendingPathTimes[path]===time&&(result.fullScan||result.processedPaths.includes(path)))delete this.settings.pendingPathTimes[path];
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;this.liveStatus.lastError="";
       this.changedDuringReadFailures.clear();
@@ -385,13 +386,17 @@ export default class GibSyncPlugin extends Plugin {
     const expected=normalized.filter((path)=>this.expectedLocalMutations.has(path));
     if(expected.length){for(const path of expected)this.queueExpectedMutationVerification(path,this.expectedLocalMutations.get(path)!);paths=normalized.filter((path)=>!expected.includes(path));}
     const relevant=paths.map((path)=>normalizePath(path)).filter((path)=>shouldSyncChangedPath(path,this.settings));if(!relevant.length)return;
-    for(const path of relevant)this.pathVersions.set(path,++this.pathRevision);
+    const changedAt=Date.now();for(const path of relevant){this.pathVersions.set(path,++this.pathRevision);this.recordPathTime(path,false,changedAt);}
     this.settings.pendingPaths=[...this.pathVersions.keys()].sort();this.persistJournalSoon();
     this.lastRelevantVaultChangeAt=Date.now();
     if(!this.settings.syncOnFileChange)return;
     if(this.liveStatus.running){this.fileChangePending=true;return;}
     const delay=Date.now()-this.lastVaultRenameAt<30_000?5000:2000;
     this.queueSync(delay,"Vault file changed","file-change");
+  }
+  private recordPathTime(path:string,folder=false,at=Date.now()){
+    let normalized=normalizePath(path);if(!normalized)return;if(folder&&!normalized.endsWith("/"))normalized+="/";
+    this.settings.pendingPathTimes[normalized]=Math.max(this.settings.pendingPathTimes[normalized]??0,at);
   }
   private async verifyExpectedMutation(path:string,expectedHash:string|null){
     try{

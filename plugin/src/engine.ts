@@ -162,9 +162,9 @@ export class SyncEngine {
     const preserved=path.toLowerCase().endsWith(".md")?encoder.encode(this.deletionWarning(decoder.decode(clear),editor,deleter)):clear;
     const hash=await hashBytes(preserved);bytes.set(hash,preserved);final.set(path,{path,hash,size:preserved.length,mtime:Date.now(),bytes:preserved});
   }
-  private async preservePair(path:string,local:FileState,localBytes:Uint8Array,remote:FileState,localName:string,remoteName:string,final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,occupied:Set<string>):Promise<void>{
+  private async preservePair(path:string,local:FileState,localBytes:Uint8Array,remote:FileState,localName:string,remoteName:string,preferred:"local"|"remote",final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,occupied:Set<string>):Promise<void>{
     const remoteBytes=await this.remoteBytes(remote,remoteCache);
-    const localIsNewer=local.mtime>=remote.mtime;
+    const localIsNewer=preferred==="local";
     const loser=localIsNewer?remote:local;
     const winnerBytes=localIsNewer?localBytes:remoteBytes,loserBytes=localIsNewer?remoteBytes:localBytes;
     const loserName=localIsNewer?remoteName:localName;
@@ -180,7 +180,20 @@ export class SyncEngine {
     final.set(copyPath,{path:copyPath,hash:copyHash,size:copyClear.length,mtime:Date.now(),bytes:copyClear});
   }
   private same(a?: FileState, b?: FileState) { return a?.hash === b?.hash && (!!a === !!b); }
-  private canonicalizeMoves(base:Map<string,FileState>,local:Map<string,FileState>,remote:Map<string,FileState>):number{
+  private localChangeTime(path:string,entry:FileState|undefined,baseSnapshot:Snapshot|null):number{
+    const normalized=normalizePath(path),times=this.getSettings().pendingPathTimes;
+    let journaled=times[normalized]??0,longest=0;
+    for(const [prefix,time] of Object.entries(times))if(prefix.endsWith("/")&&normalized.startsWith(prefix)&&prefix.length>longest){longest=prefix.length;journaled=time;}
+    if(journaled)return journaled;
+    const mtime=entry?.mtime??0,baseline=baseSnapshot?Date.parse(baseSnapshot.createdAt):0,now=Date.now();
+    const plausible=Number.isFinite(mtime)&&mtime>0&&mtime<now+5*60_000?mtime:now;
+    return Math.max(plausible,Number.isFinite(baseline)?baseline:0);
+  }
+  private preferredSide(path:string,local:FileState|undefined,baseSnapshot:Snapshot|null,remoteSnapshot:Snapshot|null):"local"|"remote"{
+    const remoteTime=remoteSnapshot?Date.parse(remoteSnapshot.createdAt):0;
+    return this.localChangeTime(path,local,baseSnapshot)>(Number.isFinite(remoteTime)?remoteTime:0)?"local":"remote";
+  }
+  private canonicalizeMoves(base:Map<string,FileState>,local:Map<string,FileState>,remote:Map<string,FileState>,baseSnapshot:Snapshot|null,remoteSnapshot:Snapshot|null):number{
     const localMoves=new Map(detectMoves([...base.values()],[...local.values()]).map((item)=>[item.previousPath,item.path]));
     const remoteMoves=new Map(detectMoves([...base.values()],[...remote.values()]).map((item)=>[item.previousPath,item.path]));
     const sources=[...new Set([...localMoves.keys(),...remoteMoves.keys()])].sort(),claimed=new Set<string>();let recognized=0;
@@ -191,7 +204,7 @@ export class SyncEngine {
       if(remoteDestination&&!localDestination&&local.has(remoteDestination))continue;
       if(localDestination&&remoteDestination&&localDestination!==remoteDestination&&(remote.has(localDestination)||local.has(remoteDestination)))continue;
       let destination=localDestination??remoteDestination!;
-      if(localDestination&&remoteDestination&&localDestination!==remoteDestination)destination=(l?.mtime??0)>(r?.mtime??0)?localDestination:remoteDestination;
+      if(localDestination&&remoteDestination&&localDestination!==remoteDestination)destination=this.preferredSide(localDestination,l,baseSnapshot,remoteSnapshot)==="local"?localDestination:remoteDestination;
       if(!destination||claimed.has(destination)||base.has(destination))continue;claimed.add(destination);
       base.delete(source);local.delete(source);remote.delete(source);if(localDestination)local.delete(localDestination);if(remoteDestination)remote.delete(remoteDestination);
       base.set(destination,{...b,path:destination});
@@ -202,7 +215,6 @@ export class SyncEngine {
     return recognized;
   }
   private packageSame(left:Map<string,FileState>,right:Map<string,FileState>):boolean{return left.size===right.size&&[...left].every(([path,entry])=>right.get(path)?.hash===entry.hash);}
-  private packageMtime(entries:Map<string,FileState>):number{return Math.max(0,...[...entries.values()].map((entry)=>entry.mtime));}
   private compareVersions(left:string|null,right:string|null):number{
     if(left===right)return 0;if(!left)return -1;if(!right)return 1;
     const parse=(value:string)=>{const [core,pre]=value.split("-",2);return {parts:core.split(".").map((part)=>Number.parseInt(part,10)||0),pre:pre??""};},a=parse(left),b=parse(right);
@@ -239,6 +251,54 @@ export class SyncEngine {
     await this.api.mirrorComplete(snapshotId);this.status({phase:"mirroring",message:`Readable recovery copy is current · ${entries.length} files`});return mirrored;
   }
 
+  private async applyFinal(final:Map<string,FileState>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<{downloaded:number;deleted:number}>{
+    let downloaded=0,deleted=0;this.status({phase:"applying",message:"Applying the accepted snapshot to this device"});
+    const applyOrder=[...final].sort(([left,leftEntry],[right,rightEntry])=>{
+      const rank=(path:string,entry:FileState)=>path===".obsidian/community-plugins.json"?4:entry.size>=LOW_MEMORY_DOWNLOAD_BYTES?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
+      return rank(left,leftEntry)-rank(right,rightEntry)||left.localeCompare(right);
+    });
+    for(const [path,entry] of applyOrder){
+      await this.cooperate();let deviceEntry=entry,deviceClear:Uint8Array|undefined;
+      if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnlyPlugins.size){
+        const serverClear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);
+        try{const enabled=JSON.parse(decoder.decode(serverClear)) as unknown;if(Array.isArray(enabled)){deviceClear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnlyPlugins.has(id)),null,2)}\n`);const hash=await hashBytes(deviceClear);deviceEntry={...entry,hash,size:deviceClear.length};}}catch{}
+      }
+      if(physicalLocal.get(path)?.hash===deviceEntry.hash)continue;
+      if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
+      const clear=deviceClear??bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES&&!deviceClear)bytes.set(entry.hash,clear);
+      await this.ensureParent(path);this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}downloaded++;
+    }
+    for(const path of physicalLocal.keys())if(!final.has(path)&&this.include(path)){
+      await this.cooperate();if(scanned.unreadableConflictPaths.has(path)){this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});continue;}
+      this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;
+    }
+    for(const path of orphanUnreadableConflicts){await this.cooperate();try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}}
+    return {downloaded,deleted};
+  }
+
+  private async resumePendingApplication(remoteSnapshot:Snapshot|null):Promise<void>{
+    const settings=this.getSettings(),pending=[...new Set(settings.pendingApplyPaths.map((path)=>normalizePath(path)).filter(Boolean))];if(!pending.length)return;
+    if(!remoteSnapshot)throw new SyncSafetyError("An accepted device update is pending, but the server vault has no current snapshot.");
+    const userChanges=new Set(settings.pendingPaths),userChanged=(path:string)=>userChanges.has(path)||Object.keys(settings.pendingPathTimes).some((candidate)=>candidate===path||(candidate.endsWith("/")&&path.startsWith(candidate))),remote=this.map(remoteSnapshot),cache=new Map<string,Uint8Array>(),desktopOnly=new Set<string>();let completed=0;
+    if(this.isMobileDevice)for(const [path,entry] of remote){const plugin=obsidianPluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
+    this.status({phase:"applying",message:`Resuming ${pending.length} accepted file operation${pending.length===1?"":"s"} after an interrupted apply`});
+    for(const path of pending){
+      if(userChanged(path)){completed++;continue;}
+      const entry=remote.get(path),stat=await this.adapter.stat(path);
+      if(entry){let clear=await this.remoteBytes(entry,cache),expectedHash=entry.hash;if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnly.size)try{const enabled=JSON.parse(decoder.decode(clear)) as unknown;if(Array.isArray(enabled)){clear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnly.has(id)),null,2)}\n`);expectedHash=await hashBytes(clear);}}catch{}
+        const current=stat?.type==="file"?new Uint8Array(await this.adapter.readBinary(path)):null;if(current&&await hashBytes(current)===expectedHash){completed++;continue;}await this.ensureParent(path);this.expectLocalMutation(path,expectedHash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));}
+      else if(stat){this.expectLocalMutation(path,null);await this.adapter.remove(path);}
+      completed++;if(this.progress(completed,pending.length))this.status({phase:"applying",message:"Resuming accepted device state",current:completed,total:pending.length});
+    }
+    settings.pendingApplyPaths=[];await this.saveSettings();
+  }
+
+  private async stageAndApply(snapshotId:string,final:Map<string,FileState>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<{downloaded:number;deleted:number}>{
+    const changed=[...final].filter(([path,entry])=>physicalLocal.get(path)?.hash!==entry.hash).map(([path])=>path),removed=[...physicalLocal.keys()].filter((path)=>!final.has(path));
+    const settings=this.getSettings();settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[...new Set([...changed,...removed,...orphanUnreadableConflicts])].sort();settings.pendingPaths=[];settings.pendingPathTimes={};await this.saveSettings();
+    const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);settings.pendingApplyPaths=[];await this.saveSettings();return result;
+  }
+
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
     const requestedBaseId=settings.lastSnapshotId;
@@ -247,11 +307,12 @@ export class SyncEngine {
     this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
     let remoteHeadId:string|null;
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
-    if(settings.initialized&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
+    if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       this.status({phase:"up-to-date",message:"Up to date · no local or server changes"});
       return {uploaded:0,downloaded:0,deleted:0,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
     const remoteSnapshot=(await this.api.state()).head;
+    if(settings.pendingApplyPaths.length)await this.resumePendingApplication(remoteSnapshot);
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
     const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
     const fullScan=settings.fullScanRequired||!settings.initialized||!baseSnapshot||auditDue;
@@ -286,7 +347,7 @@ export class SyncEngine {
         this.status({phase:"merging",message:overlap>=0.9?`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`:`Interrupted onboarding recognized · ${exactUserMatches}/${localUserFiles.length} local user files already match; resuming the server-first download while preserving local-only files`,level:"success"});
       }
     }
-    const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
+    const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote,effectiveBaseSnapshot,remoteSnapshot),final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
@@ -295,6 +356,7 @@ export class SyncEngine {
     if(settings.syncPlugins){
       const pluginIds=new Set([...paths].map((path)=>obsidianPluginPath(path)?.id).filter((id):id is string=>Boolean(id)));
       const packageFor=(source:Map<string,FileState>,id:string)=>new Map([...source].filter(([path])=>{const plugin=obsidianPluginPath(path);return plugin?.id===id&&!isPluginDataPath(path);}));
+      const localPackageIsNewer=(entries:Map<string,FileState>)=>Math.max(0,...[...entries].map(([path,entry])=>this.localChangeTime(path,entry,effectiveBaseSnapshot)))>(remoteSnapshot?Date.parse(remoteSnapshot.createdAt):0);
       const versionFor=async(source:"local"|"remote",entries:Map<string,FileState>,id:string):Promise<string|null>=>{
         const entry=entries.get(`.obsidian/plugins/${id}/manifest.json`);if(!entry)return null;
         try{const clear=source==="local"?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);return (JSON.parse(decoder.decode(clear)) as {version?:unknown}).version as string??null;}catch{return null;}
@@ -310,7 +372,7 @@ export class SyncEngine {
         else if(!localPackage.size||!remotePackage.size){
           if(localChanged&&!remoteChanged){chosen=localPackage;side="local";reason=localPackage.size?"this device installed the package":"this device removed the package";}
           else if(!localChanged&&remoteChanged){reason=remotePackage.size?"the server installed the package":"the server removed the package";}
-          else{const useLocal=this.packageMtime(localPackage)>this.packageMtime(remotePackage);side=useLocal?"local":"remote";chosen=useLocal?localPackage:remotePackage;reason=`concurrent install/removal used the later ${side} package`;resolved++;}
+          else{const useLocal=localPackageIsNewer(localPackage);side=useLocal?"local":"remote";chosen=useLocal?localPackage:remotePackage;reason=`concurrent install/removal used the later ${side} change`;resolved++;}
         }else{
           const localComplete=localPackage.has(`.obsidian/plugins/${id}/manifest.json`)&&localPackage.has(`.obsidian/plugins/${id}/main.js`),remoteComplete=remotePackage.has(`.obsidian/plugins/${id}/manifest.json`)&&remotePackage.has(`.obsidian/plugins/${id}/main.js`);
           const versionOrder=this.compareVersions(localVersion,remoteVersion);
@@ -323,7 +385,7 @@ export class SyncEngine {
           }
           else if(localChanged&&!remoteChanged){chosen=localPackage;side="local";reason="only this device changed the package";}
           else if(!localChanged&&remoteChanged){reason="only the server package changed";}
-          else if(this.packageMtime(localPackage)>this.packageMtime(remotePackage)){side="local";chosen=localPackage;reason="same plugin version; local package was modified later";resolved++;}
+          else if(localPackageIsNewer(localPackage)){side="local";chosen=localPackage;reason="same plugin version; local package change was observed later";resolved++;}
           else{reason="same plugin version; server package was modified later";resolved++;}
         }
         for(const [path,entry] of chosen)final.set(path,entry);
@@ -343,7 +405,7 @@ export class SyncEngine {
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
       if(settings.syncPlugins&&path===".obsidian/community-plugins.json"&&b&&l&&r){
-        const baseText=decoder.decode(await this.remoteBytes(b,remoteCache)),localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache)),preferred=l.mtime>=r.mtime?"local":"remote";
+        const baseText=decoder.decode(await this.remoteBytes(b,remoteCache)),localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache)),preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot);
         const merged=mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});resolved++;
         this.status({phase:"merging",message:`Plugin enablement · ${merged.reason}`,level:"success"});continue;
       }
@@ -359,7 +421,7 @@ export class SyncEngine {
           const kept=l??r;if(kept)final.set(path,kept);resolved++;this.status({phase:"merging",message:`Obsidian system file · ${path} · kept the modified version instead of an overlapping deletion`,level:"warning"});continue;
         }
         if(l&&r){
-          const preferred=l.mtime>=r.mtime?"local":"remote";
+          const preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot);
           if(path.toLowerCase().endsWith(".json")){
             const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):"{}",localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache));
             const merged=path===".obsidian/community-plugins.json"?mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice):mergeSystemJson(baseText,localText,remoteText,preferred),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});
@@ -376,11 +438,11 @@ export class SyncEngine {
       }
       if (l && r && this.text(path)) {
         if(!b){
-          conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+          const preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot);conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",preferred,final,bytes,remoteCache,occupied);continue;
         }
         const baseText = b ? decoder.decode(await this.remoteBytes(b, remoteCache)) : "";
         const localText = decoder.decode(await this.localBytes(path,l,bytes)); const remoteText = decoder.decode(await this.remoteBytes(r, remoteCache));
-        const preferred=l.mtime>=r.mtime?"local":"remote";
+        const preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot);
         this.status({phase:"merging",message:`Three-way merge · ${path} · base ${b?.size??0} B · local ${l.size} B · remote ${r.size} B`});
         await this.cooperate(true);
         const merged = mergeText(baseText, localText, remoteText, preferred);
@@ -389,7 +451,7 @@ export class SyncEngine {
           const reason=merged.kind==="merge-fallback"?merged.reason??"merge engine fallback":`${merged.overlapWords} overlapping words across ${merged.overlapLines} lines`;
           console.warn("Gib Sync preserved both versions after merge fallback",{path,reason,baseBytes:b?.size??0,localBytes:l.size,remoteBytes:r.size});
           this.status({phase:"merging",message:`Preserving both · ${path} · ${reason}`,level:"warning"});
-          conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);continue;
+          conflicts++;await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",preferred,final,bytes,remoteCache,occupied);continue;
         }
         this.status({phase:"merging",message:merged.kind==="small-overlap"?`Resolved small overlap · ${path} · preferred ${preferred} version`:`Merged non-overlapping edits · ${path}`,level:"success"});
         const mergedBytes = encoder.encode(merged.text); const hash = await hashBytes(mergedBytes); bytes.set(hash, mergedBytes);
@@ -398,7 +460,7 @@ export class SyncEngine {
       }
       // A binary conflict never destroys either side; the newest stays at the intended path.
       conflicts++;
-      if(l&&r)await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",final,bytes,remoteCache,occupied);
+      if(l&&r)await this.preservePair(path,l,await this.localBytes(path,l,bytes),r,settings.deviceName,remoteSnapshot?.deviceName??"Remote device",this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot),final,bytes,remoteCache,occupied);
     }
 
     if(settings.syncPlugins){
@@ -417,44 +479,6 @@ export class SyncEngine {
       }
     }
 
-    let downloaded = 0, deleted = 0;
-    this.status({phase:"applying",message:"Applying merged changes to this device"});
-    const applyOrder=[...final].sort(([left,leftEntry],[right,rightEntry])=>{
-      const rank=(path:string,entry:FileState)=>path===".obsidian/community-plugins.json"?4:entry.size>=LOW_MEMORY_DOWNLOAD_BYTES?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
-      return rank(left,leftEntry)-rank(right,rightEntry)||left.localeCompare(right);
-    });
-    for (const [path, entry] of applyOrder) {
-      await this.cooperate();
-      let deviceEntry=entry,deviceClear:Uint8Array|undefined;
-      if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnlyPlugins.size){
-        const serverClear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);
-        try{
-          const enabled=JSON.parse(decoder.decode(serverClear)) as unknown;
-          if(Array.isArray(enabled)){
-            deviceClear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnlyPlugins.has(id)),null,2)}\n`);
-            const hash=await hashBytes(deviceClear);deviceEntry={...entry,hash,size:deviceClear.length};
-          }
-        }catch{/* Keep the accepted whole file when enablement JSON is non-standard. */}
-      }
-      if (physicalLocal.get(path)?.hash === deviceEntry.hash) continue;
-      if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
-      const clear = deviceClear??bytes.get(entry.hash)??await this.remoteBytes(entry, remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES&&!deviceClear)bytes.set(entry.hash,clear);
-      await this.ensureParent(path);this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);} downloaded++;
-    }
-    for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
-      await this.cooperate();
-      if(scanned.unreadableConflictPaths.has(path)){
-        this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});
-        continue;
-      }
-      this.expectLocalMutation(path,null);await this.adapter.remove(path); deleted++;
-    }
-    for(const path of orphanUnreadableConflicts){
-      await this.cooperate();
-      try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}
-      catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}
-    }
-
     // An ignored path is device-local: keep its accepted remote manifest entry
     // even though this device neither reads nor writes the file. This is
     // essential when phones intentionally omit desktop-only plugins.
@@ -465,7 +489,7 @@ export class SyncEngine {
     const remoteHashes=new Set(remoteEntries.map((entry)=>entry.hash)),remotePathHashes=new Map(remoteEntries.map((entry)=>[entry.path,entry.hash])),entryPaths=new Set(entries.map((entry)=>entry.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
-      settings.lastSnapshotId = remoteSnapshot?.id ?? null; settings.initialized = true; await this.saveSettings();let mirrored=0;
+      let downloaded=0,deleted=0;if(remoteSnapshot)({downloaded,deleted}=await this.stageAndApply(remoteSnapshot.id,final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache));else{settings.lastSnapshotId=null;settings.initialized=true;await this.saveSettings();}let mirrored=0;
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
@@ -498,7 +522,7 @@ export class SyncEngine {
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,
       clientTime:new Date().toISOString(),signals:{highEntropyPaths,deviceLocalCleanupPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
-    settings.lastSnapshotId = snapshot.id; settings.initialized = true; await this.saveSettings();let mirrored:number;
+    const {downloaded,deleted}=await this.stageAndApply(snapshot.id,final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);let mirrored:number;
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});

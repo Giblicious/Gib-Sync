@@ -12,4 +12,8 @@ describe("external text merge",()=>{
     const merged=mergeText("one\ntwo\nthree\n","local one\nlocal two\nlocal three\n","remote one\nremote two\nremote three\n","external");
     expect(merged).toMatchObject({kind:"large-conflict",conflicted:true});
   });
+  it("falls back safely instead of deeply diffing oversized external documents",()=>{
+    const text="word ".repeat(160_000),merged=mergeText(text,`${text}current`,`${text}external`,"external");
+    expect(merged).toMatchObject({kind:"merge-fallback",conflicted:true});expect(merged.reason).toContain("too large");
+  });
 });

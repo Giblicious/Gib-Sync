@@ -3,6 +3,7 @@ import { detectMoves, type ManifestEntry,type Snapshot } from "@gib-sync/protoco
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { mergeText } from "./merge.js";
+import { mergeSystemJson } from "./system-merge.js";
 import { decryptVaultBlob,encryptVaultBlob,openJson,sha256 } from "./security.js";
 import { SeafileStorage,type ReadableStorageEntry,type VaultStorageRow } from "./seafile.js";
 import { SafeguardService } from "./safeguards.js";
@@ -64,8 +65,8 @@ export class ExternalImporter{
     const hash=sha256(preserved);newBytes.set(hash,preserved);final.set(path,{path,hash,size:preserved.length,mtime:Date.now()});
   }
 
-  private preservePair(path:string,current:ManifestEntry,currentBytes:Uint8Array,external:ManifestEntry,externalBytes:Uint8Array,currentName:string,final:Map<string,ManifestEntry>,newBytes:Map<string,Uint8Array>,occupied:Set<string>):void{
-    const currentIsNewer=current.mtime>external.mtime,loser=currentIsNewer?external:current;
+  private preservePair(path:string,current:ManifestEntry,currentBytes:Uint8Array,external:ManifestEntry,externalBytes:Uint8Array,currentName:string,preferred:"current"|"external",final:Map<string,ManifestEntry>,newBytes:Map<string,Uint8Array>,occupied:Set<string>):void{
+    const currentIsNewer=preferred==="current",loser=currentIsNewer?external:current;
     const winnerBytes=currentIsNewer?currentBytes:externalBytes,loserBytes=currentIsNewer?externalBytes:currentBytes;
     const loserName=currentIsNewer?"Seafile":currentName,copyPath=this.conflictPath(path,loserName,loser.mtime,occupied);occupied.add(copyPath);
     let originalClear=winnerBytes,copyClear=loserBytes;
@@ -80,13 +81,14 @@ export class ExternalImporter{
   }
 
   private text(path:string):boolean{return textExtensions.has(path.split(".").pop()?.toLowerCase()??"");}
+  private systemJson(path:string):boolean{return path.replace(/\\/g,"/").toLowerCase().startsWith(".obsidian/")&&path.toLowerCase().endsWith(".json");}
 
   private async run(vaultId:string):Promise<ExternalImportResult>{
     const row=this.storageRow(vaultId),remote=await this.storage.listReadable(row);
     if(remote.length>200_000)throw new Error("Readable Seafile vault exceeds 200,000 files");
     const remoteByPath=new Map(remote.map((entry)=>[entry.path,entry]));
     const mirrored=new Map(this.store.all<MirrorEntry>("SELECT path,hash,size,storage_id,storage_mtime FROM mirror_entries WHERE vault_id=?",vaultId).map((entry)=>[entry.path,entry]));
-    const candidates=remote.filter((entry)=>mirrored.get(entry.path)?.storage_id!==entry.id);
+    const candidates=remote.filter((entry)=>{const previous=mirrored.get(entry.path);return !previous||previous.storage_id!==entry.id||previous.storage_mtime!==entry.mtime||previous.size!==entry.size;});
     const deleted=[...mirrored.values()].filter((entry)=>!remoteByPath.has(entry.path));
     const scannedAt=new Date().toISOString();
     if(!candidates.length&&!deleted.length){
@@ -96,6 +98,7 @@ export class ExternalImporter{
 
     const vault=this.store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;
     const head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
+    const externalPreferred=(entry:ManifestEntry):"current"|"external"=>entry.mtime>=(head?Date.parse(head.createdAt):0)?"external":"current";
     const final=new Map((head?.entries??[]).map((entry)=>[entry.path,{...entry}])),occupied=new Set(final.keys());
     const key=openJson<string>(vault.wrapped_key,this.config.GIBSYNC_SERVER_SECRET,vaultId);
     const downloaded=new Map<string,{metadata:ReadableStorageEntry;bytes:Uint8Array;hash:string}>();
@@ -114,8 +117,18 @@ export class ExternalImporter{
     for(const move of externalMoves){
       const item=downloaded.get(move.path)!;if(final.has(move.path))continue;
       const current=final.get(move.previousPath),externalEntry:ManifestEntry={path:move.path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000};
-      final.delete(move.previousPath);final.set(move.path,current?{...current,path:move.path,mtime:Math.max(current.mtime,externalEntry.mtime)}:externalEntry);
-      newBytes.set(item.hash,item.bytes);handledDownloads.add(move.path);handledDeletes.add(move.previousPath);changedFiles++;
+      const base=mirrored.get(move.previousPath);final.delete(move.previousPath);newBytes.set(item.hash,item.bytes);
+      if(!current||!base||current.hash===base.hash)final.set(move.path,externalEntry);
+      else if(externalEntry.hash===base.hash)final.set(move.path,{...current,path:move.path,mtime:Date.now()});
+      else if(this.text(move.path)){
+        const currentBytes=await this.clear(row,key,current),baseEntry:ManifestEntry={path:move.previousPath,hash:base.hash,size:base.size,mtime:0},preferred=externalPreferred(externalEntry);
+        const baseText=decoder.decode(await this.clear(row,key,baseEntry)),currentText=decoder.decode(currentBytes),externalText=decoder.decode(item.bytes),merged=this.systemJson(move.path)?{text:mergeSystemJson(baseText,currentText,externalText,preferred),kind:"merged" as const}:mergeText(baseText,currentText,externalText,preferred);
+        if(merged.kind==="large-conflict"||merged.kind==="merge-fallback"){conflicts++;this.preservePair(move.path,{...current,path:move.path},currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",preferred,final,newBytes,occupied);}
+        else{const mergedBytes=encoder.encode(merged.text),hash=sha256(mergedBytes);newBytes.set(hash,mergedBytes);final.set(move.path,{path:move.path,hash,size:mergedBytes.length,mtime:Date.now()});}
+      }else{
+        conflicts++;const currentBytes=await this.clear(row,key,current);this.preservePair(move.path,{...current,path:move.path},currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",externalPreferred(externalEntry),final,newBytes,occupied);
+      }
+      handledDownloads.add(move.path);handledDeletes.add(move.previousPath);changedFiles++;
     }
     for(const [path,item] of downloaded){
       if(handledDownloads.has(path))continue;
@@ -131,22 +144,22 @@ export class ExternalImporter{
       }
       if(!base){
         conflicts++;const currentBytes=await this.clear(row,key,current);
-        this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);continue;
+        this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",externalPreferred(externalEntry),final,newBytes,occupied);continue;
       }
       if(current.hash===base.hash){final.set(path,externalEntry);continue;}
       if(this.text(path)){
         const baseEntry:ManifestEntry={path,hash:base.hash,size:base.size,mtime:0};
         const currentBytes=await this.clear(row,key,current);
-        const merged=mergeText(decoder.decode(await this.clear(row,key,baseEntry)),decoder.decode(currentBytes),decoder.decode(item.bytes),externalEntry.mtime>=current.mtime?"external":"current");
-        if(merged.kind==="large-conflict"){
-          conflicts++;this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);continue;
+        const preferred=externalPreferred(externalEntry),baseText=decoder.decode(await this.clear(row,key,baseEntry)),currentText=decoder.decode(currentBytes),externalText=decoder.decode(item.bytes),merged=this.systemJson(path)?{text:mergeSystemJson(baseText,currentText,externalText,preferred),kind:"merged" as const}:mergeText(baseText,currentText,externalText,preferred);
+        if(merged.kind==="large-conflict"||merged.kind==="merge-fallback"){
+          conflicts++;this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",preferred,final,newBytes,occupied);continue;
         }
         const bytes=encoder.encode(merged.text),hash=sha256(bytes);newBytes.set(hash,bytes);
         final.set(path,{path,hash,size:bytes.length,mtime:Date.now()});continue;
       }
       conflicts++;
       const currentBytes=await this.clear(row,key,current);
-      this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",final,newBytes,occupied);
+      this.preservePair(path,current,currentBytes,externalEntry,item.bytes,head?.deviceName??"Obsidian",externalPreferred(externalEntry),final,newBytes,occupied);
     }
     for(const missing of deleted){
       if(handledDeletes.has(missing.path))continue;

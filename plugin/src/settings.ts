@@ -18,7 +18,7 @@ export interface GibSyncSettings {
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
-  pendingPaths: string[]; fullScanRequired: boolean; lastFullScanAt: string | null;
+  pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[]; fullScanRequired: boolean; lastFullScanAt: string | null;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
@@ -26,7 +26,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
   lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncObsidianConfig: false, syncPlugins: false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
-  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],fullScanRequired:true,lastFullScanAt:null,
+  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],fullScanRequired:true,lastFullScanAt:null,
   storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -55,6 +55,9 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   // silently remove their remotely synchronized plugin directories.
   if(stored?.syncPlugins===undefined&&stored?.syncObsidianConfig===true)settings.syncPlugins=true;
   settings.pendingPaths=Array.isArray(stored?.pendingPaths)?[...new Set(stored.pendingPaths.filter((path):path is string=>typeof path==="string"))]:[];
+  settings.pendingPathTimes=stored?.pendingPathTimes&&typeof stored.pendingPathTimes==="object"&&!Array.isArray(stored.pendingPathTimes)
+    ?Object.fromEntries(Object.entries(stored.pendingPathTimes).filter(([path,time])=>Boolean(path)&&typeof time==="number"&&Number.isFinite(time)&&time>0)):{};
+  settings.pendingApplyPaths=Array.isArray(stored?.pendingApplyPaths)?[...new Set(stored.pendingApplyPaths.filter((path):path is string=>typeof path==="string"&&Boolean(path)))]:[];
   return settings;
 }
 
