@@ -1,5 +1,5 @@
 import {describe,expect,it} from "vitest";
-import {mergeSystemJson} from "./system-merge";
+import {mergeCommunityPluginEnablement,mergeSystemJson} from "./system-merge";
 
 describe("Obsidian system JSON merge",()=>{
   it("deep-merges independent setting changes without conflict files",()=>{
@@ -12,5 +12,20 @@ describe("Obsidian system JSON merge",()=>{
   });
   it("uses last-writer whole-file behavior for invalid JSON",()=>{
     expect(mergeSystemJson("{}","local","remote","local")).toMatchObject({text:"local",semantic:false});
+  });
+});
+
+describe("community plugin enablement merge",()=>{
+  it("does not let mobile disable a desktop-only plugin",()=>{
+    const result=mergeCommunityPluginEnablement('["desktop-tool","mobile-tool"]','["mobile-tool"]','["desktop-tool","mobile-tool"]',"local",new Set(["desktop-tool"]),true);
+    expect(JSON.parse(result.text)).toEqual(["mobile-tool","desktop-tool"]);expect(result.reason).toContain("desktop-only");
+  });
+  it("still syncs ordinary plugin toggles from mobile",()=>{
+    const result=mergeCommunityPluginEnablement('["desktop-tool","mobile-tool"]','[]','["desktop-tool","mobile-tool"]',"local",new Set(["desktop-tool"]),true);
+    expect(JSON.parse(result.text)).toEqual(["desktop-tool"]);
+  });
+  it("allows desktop to toggle desktop-only plugins normally",()=>{
+    const result=mergeCommunityPluginEnablement('["desktop-tool"]','[]','["desktop-tool"]',"local",new Set(["desktop-tool"]),false);
+    expect(JSON.parse(result.text)).toEqual([]);
   });
 });

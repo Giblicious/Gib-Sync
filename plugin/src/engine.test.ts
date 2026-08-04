@@ -220,6 +220,22 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.conflicts).toBe(0);expect(result.resolved).toBeGreaterThanOrEqual(2);expect(adapter.files.get(".obsidian/plugins/demo/main.js")).toEqual(localMain);expect(api.head?.entries.map((entry)=>entry.path).sort()).toEqual([".obsidian/community-plugins.json",".obsidian/plugins/demo/main.js",".obsidian/plugins/demo/manifest.json"]);expect(JSON.parse(new TextDecoder().decode(adapter.files.get(".obsidian/community-plugins.json")))).toEqual(["demo","gib-sync"]);expect(api.blobs.has(localMainHash)).toBe(true);
   });
+  it("keeps desktop-only enablement server-side while mobile syncs compatible plugin toggles",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;
+    const files=new Map<string,Uint8Array>([
+      [".obsidian/plugins/desktop-tool/manifest.json",new TextEncoder().encode('{"id":"desktop-tool","version":"1.0.0","isDesktopOnly":true}')],
+      [".obsidian/plugins/desktop-tool/main.js",new TextEncoder().encode("desktop")],
+      [".obsidian/plugins/mobile-tool/manifest.json",new TextEncoder().encode('{"id":"mobile-tool","version":"1.0.0","isDesktopOnly":false}')],
+      [".obsidian/plugins/mobile-tool/main.js",new TextEncoder().encode("mobile")],
+      [".obsidian/community-plugins.json",new TextEncoder().encode('["desktop-tool","mobile-tool","gib-sync"]')]
+    ]),entries:Snapshot["entries"]=[];
+    for(const [path,clear] of files){const hash=await hashBytes(clear);entries.push({path,hash,size:clear.length,mtime:1});api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash));adapter.files.set(path,clear);}
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000212",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Enabled on desktop",entries};
+    config.lastSnapshotId=base.id;api.head=base;api.snapshots.set(base.id,base);adapter.files.set(".obsidian/community-plugins.json",new TextEncoder().encode('["gib-sync"]'));
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},undefined,undefined,undefined,true).sync();
+    const enabledEntry=api.head!.entries.find((entry)=>entry.path===".obsidian/community-plugins.json")!,serverEnabled=JSON.parse(new TextDecoder().decode(await decryptBlob(api.blobs.get(enabledEntry.hash)!,config.vaultKey,enabledEntry.hash)));
+    expect(result.conflicts).toBe(0);expect(serverEnabled).toEqual(["gib-sync","desktop-tool"]);expect(JSON.parse(new TextDecoder().decode(adapter.files.get(".obsidian/community-plugins.json")))).toEqual(["gib-sync"]);
+  });
   it("repairs a locally incomplete plugin from the unchanged complete server package",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=true;
     const manifest=new TextEncoder().encode('{"id":"demo","version":"1.0.0"}'),main=new TextEncoder().encode("working code"),manifestHash=await hashBytes(manifest),mainHash=await hashBytes(main);

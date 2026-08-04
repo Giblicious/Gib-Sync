@@ -46,7 +46,7 @@ export default class GibSyncPlugin extends Plugin {
     this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total),undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash));
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total),undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash),undefined,Platform.isMobile);
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });

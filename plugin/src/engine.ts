@@ -4,7 +4,7 @@ import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
 import { isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
-import { mergeSystemJson } from "./system-merge";
+import { mergeCommunityPluginEnablement, mergeSystemJson } from "./system-merge";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array; sourcePath?:string };
 type LocalScan = { files:Map<string,FileState>; unreadableConflictPaths:Set<string> };
@@ -40,7 +40,8 @@ export class SyncEngine {
     private readonly status: (progress: SyncProgress) => void,
     private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
     private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{},
-    private readonly yieldControl:()=>Promise<void>=()=>new Promise((resolve)=>globalThis.setTimeout(resolve,0))
+    private readonly yieldControl:()=>Promise<void>=()=>new Promise((resolve)=>globalThis.setTimeout(resolve,0)),
+    private readonly isMobileDevice=false
   ) {}
 
   private async cooperate(force=false):Promise<void>{
@@ -290,7 +291,7 @@ export class SyncEngine {
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});
     if(recognizedMoves)this.status({phase:"merging",message:`Recognized ${recognizedMoves} file move${recognizedMoves===1?"":"s"} by content identity; edits will follow the destination`,level:"success"});
-    const handledPluginPaths=new Set<string>();
+    const handledPluginPaths=new Set<string>(),desktopOnlyPlugins=new Set<string>();
     if(settings.syncPlugins){
       const pluginIds=new Set([...paths].map((path)=>obsidianPluginPath(path)?.id).filter((id):id is string=>Boolean(id)));
       const packageFor=(source:Map<string,FileState>,id:string)=>new Map([...source].filter(([path])=>{const plugin=obsidianPluginPath(path);return plugin?.id===id&&!isPluginDataPath(path);}));
@@ -328,12 +329,24 @@ export class SyncEngine {
         for(const [path,entry] of chosen)final.set(path,entry);
         if(localChanged||remoteChanged)this.status({phase:"merging",message:`Plugin package · ${id} · chose ${side}${(side==="local"?localVersion:remoteVersion)?` v${side==="local"?localVersion:remoteVersion}`:""} · ${reason}`,level:"info"});
       }
+      for(const id of pluginIds){
+        const path=`.obsidian/plugins/${id}/manifest.json`,entry=final.get(path);if(!entry)continue;
+        try{
+          const localEntry=local.get(path),clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(path,localEntry,bytes):await this.remoteBytes(entry,remoteCache));
+          if((JSON.parse(decoder.decode(clear)) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnlyPlugins.add(id);
+        }catch{/* Malformed manifests remain governed by normal package repair. */}
+      }
     }
     for (const path of [...paths].sort()) {
       await this.cooperate();
       if(handledPluginPaths.has(path))continue;
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (this.same(l, r)) { if (l) final.set(path, l); continue; }
+      if(settings.syncPlugins&&path===".obsidian/community-plugins.json"&&b&&l&&r){
+        const baseText=decoder.decode(await this.remoteBytes(b,remoteCache)),localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache)),preferred=l.mtime>=r.mtime?"local":"remote";
+        const merged=mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});resolved++;
+        this.status({phase:"merging",message:`Plugin enablement · ${merged.reason}`,level:"success"});continue;
+      }
       if (!b && l && !r && isGibSyncConflictPath(path)) { resolved++;this.status({phase:"merging",message:`Removing orphaned generated conflict copy · ${path}`,level:"success"});continue; }
       if (!settings.initialized && !b && !l && r) { final.set(path, r); continue; }
       if (this.same(l, b)) { if (r) final.set(path, r); continue; }
@@ -349,7 +362,7 @@ export class SyncEngine {
           const preferred=l.mtime>=r.mtime?"local":"remote";
           if(path.toLowerCase().endsWith(".json")){
             const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):"{}",localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache));
-            const merged=mergeSystemJson(baseText,localText,remoteText,preferred),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});
+            const merged=path===".obsidian/community-plugins.json"?mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice):mergeSystemJson(baseText,localText,remoteText,preferred),clear=encoder.encode(merged.text),hash=await hashBytes(clear);bytes.set(hash,clear);final.set(path,{path,hash,size:clear.length,mtime:Date.now(),bytes:clear});
             this.status({phase:"merging",message:`Obsidian settings · ${path} · ${merged.reason}`,level:merged.overlaps?"warning":"success"});
           }else{const chosen=preferred==="local"?l:r;final.set(path,chosen);this.status({phase:"merging",message:`Obsidian system file · ${path} · used newer ${preferred} whole file`,level:"info"});}
           resolved++;continue;
@@ -412,10 +425,21 @@ export class SyncEngine {
     });
     for (const [path, entry] of applyOrder) {
       await this.cooperate();
-      if (physicalLocal.get(path)?.hash === entry.hash) continue;
+      let deviceEntry=entry,deviceClear:Uint8Array|undefined;
+      if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnlyPlugins.size){
+        const serverClear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);
+        try{
+          const enabled=JSON.parse(decoder.decode(serverClear)) as unknown;
+          if(Array.isArray(enabled)){
+            deviceClear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnlyPlugins.has(id)),null,2)}\n`);
+            const hash=await hashBytes(deviceClear);deviceEntry={...entry,hash,size:deviceClear.length};
+          }
+        }catch{/* Keep the accepted whole file when enablement JSON is non-standard. */}
+      }
+      if (physicalLocal.get(path)?.hash === deviceEntry.hash) continue;
       if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
-      const clear = bytes.get(entry.hash) ?? await this.remoteBytes(entry, remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
-      await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);} downloaded++;
+      const clear = deviceClear??bytes.get(entry.hash)??await this.remoteBytes(entry, remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES&&!deviceClear)bytes.set(entry.hash,clear);
+      await this.ensureParent(path);this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);} downloaded++;
     }
     for (const path of physicalLocal.keys()) if (!final.has(path) && this.include(path)) {
       await this.cooperate();
