@@ -11,6 +11,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Manual multi-device setup plus short-lived, one-time quick codes that are easy to type between devices.
 - Live phases, progress, timestamps, path-aware merge decisions, errors, remote inventory, mirror health, device counts, compact activity history, and both detailed and privacy-safe diagnostics.
 - Server-enforced mass-change safeguards for both Obsidian devices and direct Seafile/WebDAV edits.
+- Optional Obsidian bookmark synchronization, enabled by default without requiring full `.obsidian` configuration sync.
 
 ## Safety center
 

@@ -84,6 +84,12 @@ describe("SyncEngine", () => {
     const engine = new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}); const result=await engine.sync();
     expect(result.downloaded).toBe(1);expect(result.mirrored).toBe(1);expect(api.commits).toBe(0);expect(adapter.files.get("folder/note.md")).toEqual(clear);expect(api.mirror.get("folder/note.md")).toEqual(clear);expect(config.lastSnapshotId).toBe(api.head.id);
   });
+  it("syncs bookmarks by default without pulling unrelated Obsidian configuration",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),bookmarks=new TextEncoder().encode('{"items":[{"type":"file","path":"Notes/Important.md"}]}'),appConfig=new TextEncoder().encode('{"theme":"moonstone"}'),bookmarkHash=await hashBytes(bookmarks),appHash=await hashBytes(appConfig);
+    api.blobs.set(bookmarkHash,await encryptBlob(bookmarks,config.vaultKey,bookmarkHash));api.blobs.set(appHash,await encryptBlob(appConfig,config.vaultKey,appHash));api.head={id:"00000000-0000-4000-8000-000000000129",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Bookmarks",entries:[{path:".obsidian/bookmarks.json",hash:bookmarkHash,size:bookmarks.length,mtime:1},{path:".obsidian/app.json",hash:appHash,size:appConfig.length,mtime:1}]};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.downloaded).toBe(1);expect(adapter.files.get(".obsidian/bookmarks.json")).toEqual(bookmarks);expect(adapter.files.has(".obsidian/app.json")).toBe(false);expect(api.commits).toBe(0);
+  });
   it("uses the verified low-memory content path for a large mobile onboarding file",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new Uint8Array(LOW_MEMORY_DOWNLOAD_BYTES),hash=await hashBytes(clear);
     api.contents.set(hash,clear);api.head={id:"00000000-0000-4000-8000-000000000124",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Initial",entries:[{path:"audio/large.mp3",hash,size:clear.length,mtime:1}]};

@@ -270,12 +270,16 @@ export class GibSyncSettingTab extends PluginSettingTab {
   }
   private renderContentPage(){const configured=Boolean(this.plugin.settings.deviceToken);
     new Setting(this.pageEl).setName("Vault content").setHeading();
+    new Setting(this.pageEl).setName("Sync bookmarks").setDesc("Synchronizes Obsidian bookmarks across devices. Enabled by default and independent of other Obsidian configuration files.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncBookmarks).onChange(async(value)=>{
+      if(!value&&this.plugin.settings.syncBookmarks&&!await this.confirmFilterChange(this.plugin.settings.exclusions,value,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
+      this.plugin.settings.syncBookmarks=value;this.plugin.requireFullScan();await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
+    }));
     new Setting(this.pageEl).setName("Sync Obsidian configuration").setDesc("Includes portable themes, snippets, hotkeys, and other .obsidian settings. JSON settings merge by key; overlapping values use the newer version without creating conflict files. Workspace state remains device-local.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async(value)=>{
-      if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,value,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
+      if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncBookmarks,value,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
       this.plugin.settings.syncObsidianConfig=value;this.plugin.requireFullScan();await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
     new Setting(this.pageEl).setName("Sync installed plugins").setDesc("Synchronizes each community plugin as one version-aware package, repairs incomplete enablement, and leaves generated caches, indexes, embeddings, logs, and temporary data on their device. Plugin data.json settings merge by key and may contain API keys visible in readable Seafile. Reload Obsidian after plugin updates.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncPlugins).onChange(async(value)=>{
-      if(!value&&this.plugin.settings.syncPlugins&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig,value)){toggle.setValue(true);return;}
+      if(!value&&this.plugin.settings.syncPlugins&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncBookmarks,this.plugin.settings.syncObsidianConfig,value)){toggle.setValue(true);return;}
       this.plugin.settings.syncPlugins=value;this.plugin.requireFullScan();await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
     new Setting(this.pageEl).setName("Filters").setHeading();
@@ -283,7 +287,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
     new Setting(this.pageEl).setName("Excluded path prefixes").setDesc("The device-local ignore list. Ignored remote files remain safe for other devices. Changes are previewed; use one prefix per line.")
       .addTextArea((area)=>area.setValue(proposedExclusions).onChange((value)=>proposedExclusions=value))
       .addButton((button)=>button.setButtonText("Preview and apply").onClick(async()=>{const next=proposedExclusions.split("\n").map((line)=>line.trim()).filter(Boolean);button.setDisabled(true);
-        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){this.plugin.settings.exclusions=next;this.plugin.requireFullScan();await this.plugin.saveSettings();new Notice("Ignore list updated; ignored remote files remain safe for other devices");if(configured)void this.plugin.runSync();}}finally{button.setDisabled(false);}}));
+        try{if(await this.confirmFilterChange(next,this.plugin.settings.syncBookmarks,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)){this.plugin.settings.exclusions=next;this.plugin.requireFullScan();await this.plugin.saveSettings();new Notice("Ignore list updated; ignored remote files remain safe for other devices");if(configured)void this.plugin.runSync();}}finally{button.setDisabled(false);}}));
     this.pageEl.createDiv({cls:"gib-sync-settings-note",text:"Filters apply only to this device. Accepted remote files remain available to other connected devices."});
   }
   private renderSafetyPage(){const configured=Boolean(this.plugin.settings.deviceToken);
@@ -311,12 +315,12 @@ export class GibSyncSettingTab extends PluginSettingTab {
     this.liveRoot=this.pageEl.createDiv({cls:"gib-sync-console",attr:{role:"log","aria-live":"polite"}});this.renderConsole();
   }
   hide(){this.unsubscribe?.();this.unsubscribe=null;if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;}
-  private included(path:string,exclusions:string[],syncConfig:boolean,syncPlugins:boolean):boolean{
-    return shouldSyncChangedPath(path,{...this.plugin.settings,exclusions,syncObsidianConfig:syncConfig,syncPlugins});
+  private included(path:string,exclusions:string[],syncBookmarks:boolean,syncConfig:boolean,syncPlugins:boolean):boolean{
+    return shouldSyncChangedPath(path,{...this.plugin.settings,exclusions,syncBookmarks,syncObsidianConfig:syncConfig,syncPlugins});
   }
-  private async confirmFilterChange(exclusions:string[],syncConfig:boolean,syncPlugins:boolean):Promise<boolean>{
+  private async confirmFilterChange(exclusions:string[],syncBookmarks:boolean,syncConfig:boolean,syncPlugins:boolean):Promise<boolean>{
     if(!this.plugin.settings.deviceToken)return true;const head=(await this.plugin.api.state()).head;if(!head)return true;
-    const affected=head.entries.filter((entry)=>this.included(entry.path,this.plugin.settings.exclusions,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)&&!this.included(entry.path,exclusions,syncConfig,syncPlugins));
+    const affected=head.entries.filter((entry)=>this.included(entry.path,this.plugin.settings.exclusions,this.plugin.settings.syncBookmarks,this.plugin.settings.syncObsidianConfig,this.plugin.settings.syncPlugins)&&!this.included(entry.path,exclusions,syncBookmarks,syncConfig,syncPlugins));
     if(!affected.length)return true;const examples=affected.slice(0,10).map((entry)=>`- ${entry.path}`).join("\n");
     return confirmAction(this.app,"Apply sync filter",`This device will stop syncing ${affected.length} file${affected.length===1?"":"s"}:\n\n${examples}${affected.length>10?`\n- …and ${affected.length-10} more`:""}\n\nTheir accepted remote versions remain safe and available to other devices.`,"Apply filter");
   }

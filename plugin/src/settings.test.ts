@@ -12,6 +12,19 @@ describe("file-change sync filtering",()=>{
     expect(shouldSyncChangedPath("Notes\\today.md",DEFAULT_SETTINGS)).toBe(true);
   });
 
+  it("syncs Obsidian bookmarks by default without enabling other configuration",()=>{
+    expect(DEFAULT_SETTINGS.syncBookmarks).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian",DEFAULT_SETTINGS)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/bookmarks.json",DEFAULT_SETTINGS)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/app.json",DEFAULT_SETTINGS)).toBe(false);
+  });
+
+  it("can disable bookmarks independently even when configuration sync is enabled",()=>{
+    const settings={...DEFAULT_SETTINGS,syncBookmarks:false,syncObsidianConfig:true};
+    expect(shouldSyncChangedPath(".obsidian/bookmarks.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath(".obsidian/app.json",settings)).toBe(true);
+  });
+
   it("ignores Gib Sync data, Obsidian config, and excluded paths",()=>{
     expect(shouldSyncChangedPath(".gib-sync/state.json",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/workspace.json",DEFAULT_SETTINGS)).toBe(false);
@@ -57,7 +70,7 @@ describe("file-change sync filtering",()=>{
     const plugin={loadData:async()=>({deviceName:"Existing device"})} as unknown as Plugin;
     await expect(loadSettings(plugin)).resolves.toMatchObject({
       deviceName:"Existing device",desktopStatusIcon:true,desktopStatusText:true,
-      mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false
+      mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false,syncBookmarks:true
     });
   });
 });

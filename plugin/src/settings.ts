@@ -14,7 +14,7 @@ export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
   lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean; paused:boolean;
-  syncIntervalSeconds: number; syncObsidianConfig: boolean; syncPlugins: boolean; exclusions: string[];
+  syncIntervalSeconds: number; syncBookmarks: boolean; syncObsidianConfig: boolean; syncPlugins: boolean; exclusions: string[];
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
@@ -24,7 +24,7 @@ export interface GibSyncSettings {
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncObsidianConfig: false, syncPlugins: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],fullScanRequired:true,lastFullScanAt:null,
   storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
@@ -109,10 +109,12 @@ export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): 
   if(isDeviceLocalObsidianPath(normalized))return false;
   if(normalized===".obsidian/core-plugins.json")return false;
   const obsidianRoot=normalized===".obsidian";
+  const bookmarks=normalized.toLowerCase()===".obsidian/bookmarks.json";
   const pluginPath=normalized===".obsidian/plugins"||normalized.startsWith(".obsidian/plugins/")||normalized===".obsidian/community-plugins.json";
-  if(obsidianRoot&&!settings.syncObsidianConfig&&!settings.syncPlugins)return false;
+  if(obsidianRoot&&!settings.syncBookmarks&&!settings.syncObsidianConfig&&!settings.syncPlugins)return false;
+  if(bookmarks&&!settings.syncBookmarks)return false;
   if(pluginPath&&!settings.syncPlugins)return false;
-  if(!pluginPath&&!obsidianRoot&&!settings.syncObsidianConfig&&normalized.startsWith(".obsidian/"))return false;
+  if(!bookmarks&&!pluginPath&&!obsidianRoot&&!settings.syncObsidianConfig&&normalized.startsWith(".obsidian/"))return false;
   return !settings.exclusions.some((prefix)=>{
     const excluded=prefix.replace(/\\/g,"/").replace(/^\/+/,"").replace(/\/+$/,"");
     return Boolean(excluded)&&(normalized===excluded||normalized.startsWith(`${excluded}/`));
