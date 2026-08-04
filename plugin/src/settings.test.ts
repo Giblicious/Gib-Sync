@@ -1,6 +1,6 @@
 import { describe,expect,it } from "vitest";
 import type { Plugin } from "obsidian";
-import { DEFAULT_SETTINGS,isGibSyncConflictPath,loadSettings,shouldSyncChangedPath } from "./settings";
+import { createSerializedSettingsWriter,DEFAULT_SETTINGS,isGibSyncConflictPath,loadSettings,shouldSyncChangedPath } from "./settings";
 
 describe("file-change sync filtering",()=>{
   it("recognizes only timestamped Gib Sync conflict-copy names",()=>{
@@ -59,5 +59,22 @@ describe("file-change sync filtering",()=>{
       deviceName:"Existing device",desktopStatusIcon:true,desktopStatusText:true,
       mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false
     });
+  });
+});
+
+describe("settings persistence",()=>{
+  it("serializes mobile writes so an older checkpoint cannot finish last",async()=>{
+    let state={lastSnapshotId:"old"},releaseFirst!:()=>void,markStarted!:()=>void;const writes:string[]=[];
+    const firstGate=new Promise<void>((resolve)=>{releaseFirst=resolve;}),firstStarted=new Promise<void>((resolve)=>{markStarted=resolve;});let calls=0;
+    const save=createSerializedSettingsWriter(()=>state,async(snapshot)=>{calls++;if(calls===1){markStarted();await firstGate;}writes.push(snapshot.lastSnapshotId);});
+    const older=save();await firstStarted;state={lastSnapshotId:"new"};const newer=save();
+    expect(calls).toBe(1);releaseFirst();await Promise.all([older,newer]);
+    expect(writes).toEqual(["old","new"]);expect(writes.at(-1)).toBe("new");
+  });
+
+  it("continues saving after an earlier storage failure",async()=>{
+    let state={value:1},calls=0;const writes:number[]=[];
+    const save=createSerializedSettingsWriter(()=>state,async(snapshot)=>{calls++;if(calls===1)throw new Error("temporary failure");writes.push(snapshot.value);});
+    await expect(save()).rejects.toThrow("temporary failure");state={value:2};await expect(save()).resolves.toBeUndefined();expect(writes).toEqual([2]);
   });
 });

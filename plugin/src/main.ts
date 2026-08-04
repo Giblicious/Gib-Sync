@@ -4,7 +4,7 @@ import { ApiError,GibSyncApi } from "./api";
 import { FileChangedDuringReadError, SyncEngine, SyncSafetyError } from "./engine";
 import { NotificationGate } from "./notifications";
 import { hashBytes } from "./crypto";
-import { DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
+import { createSerializedSettingsWriter, DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
 
@@ -38,6 +38,7 @@ export default class GibSyncPlugin extends Plugin {
   private expectedVerificationRunning=false;
   compatibility:ClientCompatibility|null=null;
   private compatibilityBlocked=false;
+  private readonly persistSettings=createSerializedSettingsWriter(()=>this.settings,(snapshot)=>this.saveData(snapshot));
 
   async onload() {
     this.settings = await loadSettings(this);this.settings.fullScanRequired=true;
@@ -247,7 +248,7 @@ export default class GibSyncPlugin extends Plugin {
     try{const result=await this.api.compatibility();this.applyCompatibility(result);if(!result.compatible&&showNotice)this.notify("compatibility",`${result.reason} Update Gib Sync through BRAT before syncing.`,12000,60_000);return result.compatible;}
     catch(error){if(error instanceof ApiError&&error.status===404){this.compatibilityBlocked=false;return true;}const message=error instanceof Error?error.message:String(error);this.report("error",`Compatibility check failed: ${message}`,"error");if(showNotice)this.notify("compatibility-check",`Gib Sync could not verify server compatibility: ${message}`,8000,60_000);return false;}
   }
-  async saveSettings() { await this.saveData(this.settings); }
+  async saveSettings() { await this.persistSettings(); }
   currentVaultIdentity():string {
     const adapter=this.app.vault.adapter as unknown as {getBasePath?:()=>string};
     return `${this.app.vault.getName()}|${adapter.getBasePath?.()??"mobile-adapter"}`.replace(/\\/g,"/").toLowerCase();

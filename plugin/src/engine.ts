@@ -214,6 +214,21 @@ export class SyncEngine {
     this.status({phase:"merging",message:`${reason}; converging again in ${(delay/1000).toFixed(1)}s`});
     await this.wait(delay);return this.run(attempt+1);
   }
+  private async ownDescendantCount(requestedBaseId:string|null,remote:Snapshot|null,deviceId:string):Promise<number>{
+    if(!requestedBaseId||!remote||remote.id===requestedBaseId||remote.deviceId!==deviceId)return 0;
+    let cursor=remote,count=0;
+    // A stale local checkpoint can lag by several successful saves. Only
+    // recover across an unbroken chain authored by this registered device;
+    // another device or Seafile in the chain keeps normal three-way merging.
+    while(count<64){
+      if(cursor.deviceId!==deviceId)return 0;
+      count++;
+      if(cursor.parentId===requestedBaseId)return count;
+      if(!cursor.parentId)return 0;
+      try{cursor=await this.api.snapshot(cursor.parentId);}catch{return 0;}
+    }
+    return 0;
+  }
   private retryableMirrorError(error:unknown):boolean{return error instanceof ApiError&&(error.status===409||error.status===422);}
 
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
@@ -237,9 +252,22 @@ export class SyncEngine {
     }
     const remoteSnapshot=(await this.api.state()).head;
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
+    const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
     const fullScan=settings.fullScanRequired||!settings.initialized||!baseSnapshot||auditDue;
     this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
-    const scanned=fullScan?await this.scan():await this.scanIncremental(baseSnapshot!,pendingPaths),local=scanned.files;
+    const scanBaseline=ownDescendants&&remoteSnapshot?remoteSnapshot:baseSnapshot;
+    const scanned=fullScan?await this.scan():await this.scanIncremental(scanBaseline!,pendingPaths),local=scanned.files;
+    let effectiveBaseSnapshot=baseSnapshot;
+    if(ownDescendants&&remoteSnapshot){
+      const remoteMap=this.map(remoteSnapshot),allPaths=new Set([...local.keys(),...remoteMap.keys()]),pending=new Set(pendingPaths);
+      const differences=[...allPaths].filter((path)=>local.get(path)?.hash!==remoteMap.get(path)?.hash||local.has(path)!==remoteMap.has(path));
+      if(!fullScan||differences.every((path)=>pending.has(path))){
+        effectiveBaseSnapshot=remoteSnapshot;
+        this.status({phase:"merging",message:`Recovered a stale local checkpoint across ${ownDescendants} prior sync${ownDescendants===1?"":"s"} from this device; applying only newly observed local changes`,level:"success"});
+      }else{
+        this.status({phase:"merging",message:"A stale local checkpoint followed this device's own sync, but unjournaled vault differences require normal lossless reconciliation",level:"warning"});
+      }
+    }
     let onboardingReconcile=false;
     if(settings.initialized&&requestedBaseId&&!baseSnapshot&&local.size){
       throw new SyncSafetyError("Stale-device protection paused sync because this device's last verified server snapshot is unavailable. No files were uploaded or deleted. Reconnect this device to establish a safe baseline.");
@@ -257,7 +285,7 @@ export class SyncEngine {
         this.status({phase:"merging",message:overlap>=0.9?`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`:`Interrupted onboarding recognized · ${exactUserMatches}/${localUserFiles.length} local user files already match; resuming the server-first download while preserving local-only files`,level:"success"});
       }
     }
-    const base = this.map(baseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
+    const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote),final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});

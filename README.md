@@ -51,6 +51,7 @@ Simultaneous edits use a lossless three-way policy:
 - Edit-versus-delete conflicts retain the edited note with a warning so a deletion never silently destroys concurrent work.
 - Binary conflicts preserve both files.
 - Automatic three-way merging is bounded for mobile stability. Oversized, unusually complex, or failed text comparisons preserve both complete versions with linked warnings instead of stopping synchronization.
+- If a mobile settings write finishes out of order and its saved checkpoint temporarily lags, Gib Sync recognizes an uninterrupted chain of that same device's own snapshots and rebases only explicitly journaled local changes. Cross-device ancestry or unjournaled full-scan differences still use the normal lossless conflict policy.
 
 When a newly paired device already contains a vault, Gib Sync compares content hashes before writing anything. If at least 90% of the included files match the server exactly, it treats the vaults as copies: it downloads and verifies the current server head, keeps files unique to either side, and preserves both versions of every differing same-path file before publishing the union. Lower-overlap vaults remain blocked as likely mismatches.
 

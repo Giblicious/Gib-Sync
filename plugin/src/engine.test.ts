@@ -277,6 +277,53 @@ describe("SyncEngine", () => {
     let plans=0;api.mirrorPlan=async(_snapshotId:string,entries:Snapshot["entries"])=>{plans++;if(plans<=3)throw new ApiError("Mirror snapshot is no longer the vault head",409,{});return {uploadPaths:entries.map((entry)=>entry.path),deletePaths:[],alreadyCurrent:false};};
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},async()=>{});await expect(engine.sync()).resolves.toMatchObject({snapshotId:head.id});expect(plans).toBe(4);
   });
+  it("rebases a journaled edit onto this device's own newer snapshot without self-bifurcation",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=true;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["note.md"];
+    const baseBytes=new TextEncoder().encode("base\n"),firstBytes=new TextEncoder().encode("first saved edit\n"),latestBytes=new TextEncoder().encode("latest local edit\n");
+    const baseHash=await hashBytes(baseBytes),firstHash=await hashBytes(firstBytes),base:Snapshot={id:"00000000-0000-4000-8000-000000000330",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"note.md",hash:baseHash,size:baseBytes.length,mtime:1}]};
+    const ownHead:Snapshot={...base,id:"00000000-0000-4000-8000-000000000331",parentId:base.id,message:"Sync",entries:[{path:"note.md",hash:firstHash,size:firstBytes.length,mtime:2}]};
+    config.lastSnapshotId=base.id;api.snapshots.set(base.id,base);api.snapshots.set(ownHead.id,ownHead);api.head=ownHead;api.blobs.set(firstHash,await encryptBlob(firstBytes,config.vaultKey,firstHash));adapter.files.set("note.md",latestBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(api.head?.parentId).toBe(ownHead.id);expect(api.head?.entries).toHaveLength(1);expect(api.head?.entries[0].path).toBe("note.md");expect([...adapter.files.keys()].some((path)=>path.includes("conflict"))).toBe(false);
+  });
+  it("recovers across several consecutive own snapshots when the saved checkpoint lags",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["note.md"];
+    const versions=await Promise.all(["base\n","one\n","two\n"].map(async(text)=>{const bytes=new TextEncoder().encode(text);return {bytes,hash:await hashBytes(bytes)}}));
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000340",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"note.md",hash:versions[0].hash,size:versions[0].bytes.length,mtime:1}]};
+    const first:Snapshot={...base,id:"00000000-0000-4000-8000-000000000341",parentId:base.id,entries:[{path:"note.md",hash:versions[1].hash,size:versions[1].bytes.length,mtime:2}]},second:Snapshot={...base,id:"00000000-0000-4000-8000-000000000342",parentId:first.id,entries:[{path:"note.md",hash:versions[2].hash,size:versions[2].bytes.length,mtime:3}]};
+    for(const snapshot of [base,first,second])api.snapshots.set(snapshot.id,snapshot);api.head=second;api.blobs.set(versions[2].hash,await encryptBlob(versions[2].bytes,config.vaultKey,versions[2].hash));config.lastSnapshotId=base.id;adapter.files.set("note.md",new TextEncoder().encode("three\n"));
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(0);expect(api.head?.parentId).toBe(second.id);expect(api.head?.entries).toHaveLength(1);
+  });
+  it("applies a journaled deletion after this device's own newer snapshot",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["delete.md"];
+    const baseBytes=new TextEncoder().encode("base\n"),newBytes=new TextEncoder().encode("new\n"),baseHash=await hashBytes(baseBytes),newHash=await hashBytes(newBytes);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000350",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"delete.md",hash:baseHash,size:baseBytes.length,mtime:1}]},ownHead:Snapshot={...base,id:"00000000-0000-4000-8000-000000000351",parentId:base.id,entries:[{path:"delete.md",hash:newHash,size:newBytes.length,mtime:2}]};
+    api.snapshots.set(base.id,base);api.snapshots.set(ownHead.id,ownHead);api.head=ownHead;config.lastSnapshotId=base.id;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(0);expect(api.head?.entries).toEqual([]);expect(api.head?.parentId).toBe(ownHead.id);
+  });
+  it("applies a journaled move and edit after this device's own newer snapshot",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["Old/note.md","New/note.md"];
+    const baseBytes=new TextEncoder().encode("base\n"),remoteBytes=new TextEncoder().encode("first edit\n"),localBytes=new TextEncoder().encode("moved and edited again\n"),baseHash=await hashBytes(baseBytes),remoteHash=await hashBytes(remoteBytes);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000355",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"Old/note.md",hash:baseHash,size:baseBytes.length,mtime:1}]},ownHead:Snapshot={...base,id:"00000000-0000-4000-8000-000000000356",parentId:base.id,entries:[{path:"Old/note.md",hash:remoteHash,size:remoteBytes.length,mtime:2}]};
+    api.snapshots.set(base.id,base);api.snapshots.set(ownHead.id,ownHead);api.head=ownHead;config.lastSnapshotId=base.id;adapter.files.set("New/note.md",localBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(0);expect(api.head?.entries.map((entry)=>entry.path)).toEqual(["New/note.md"]);expect(adapter.files.has("Old/note.md")).toBe(false);
+  });
+  it("keeps normal conflict protection when another device interrupts the ancestry",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["note.md"];
+    const text=(prefix:string)=>new TextEncoder().encode(Array.from({length:30},(_,index)=>`${prefix}${index}`).join(" ")+"\n"),baseBytes=text("base"),ownBytes=text("own"),remoteBytes=text("remote"),localBytes=text("local");
+    const baseHash=await hashBytes(baseBytes),ownHash=await hashBytes(ownBytes),remoteHash=await hashBytes(remoteBytes),base:Snapshot={id:"00000000-0000-4000-8000-000000000360",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"note.md",hash:baseHash,size:baseBytes.length,mtime:1}]};
+    const own:Snapshot={...base,id:"00000000-0000-4000-8000-000000000361",parentId:base.id,entries:[{path:"note.md",hash:ownHash,size:ownBytes.length,mtime:2}]},other:Snapshot={...base,id:"00000000-0000-4000-8000-000000000362",parentId:own.id,deviceId:"mobile",deviceName:"Mobile",entries:[{path:"note.md",hash:remoteHash,size:remoteBytes.length,mtime:3}]};
+    for(const snapshot of [base,own,other])api.snapshots.set(snapshot.id,snapshot);for(const [hash,bytes] of [[baseHash,baseBytes],[remoteHash,remoteBytes]] as const)api.blobs.set(hash,await encryptBlob(bytes,config.vaultKey,hash));api.head=other;config.lastSnapshotId=base.id;adapter.files.set("note.md",localBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(1);expect(api.head?.entries).toHaveLength(2);expect(api.head?.entries.some((entry)=>entry.path.includes("conflict"))).toBe(true);
+  });
+  it("does not self-rebase a full scan containing unjournaled differences",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=true;config.pendingPaths=["observed.md"];
+    const text=(prefix:string)=>new TextEncoder().encode(Array.from({length:24},(_,index)=>`${prefix}${index}`).join(" ")+"\n"),baseBytes=text("base"),remoteBytes=text("remote"),localBytes=text("local");
+    const baseHash=await hashBytes(baseBytes),remoteHash=await hashBytes(remoteBytes),base:Snapshot={id:"00000000-0000-4000-8000-000000000370",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:["observed.md","unjournaled.md"].map((path)=>({path,hash:baseHash,size:baseBytes.length,mtime:1}))};
+    const ownHead:Snapshot={...base,id:"00000000-0000-4000-8000-000000000371",parentId:base.id,entries:["observed.md","unjournaled.md"].map((path)=>({path,hash:remoteHash,size:remoteBytes.length,mtime:2}))};
+    api.snapshots.set(base.id,base);api.snapshots.set(ownHead.id,ownHead);api.head=ownHead;api.blobs.set(baseHash,await encryptBlob(baseBytes,config.vaultKey,baseHash));api.blobs.set(remoteHash,await encryptBlob(remoteBytes,config.vaultKey,remoteHash));config.lastSnapshotId=base.id;adapter.files.set("observed.md",localBytes);adapter.files.set("unjournaled.md",localBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(2);expect(api.head?.entries.filter((entry)=>entry.path.includes("conflict"))).toHaveLength(2);
+  });
   it("converges simultaneous disjoint edits from two devices",async()=>{
     const adapter=new MemoryAdapter();const api=new MemoryApi();const config=settings();config.initialized=true;
     const baseBytes=new TextEncoder().encode("a\nb\nc\n");const baseHash=await hashBytes(baseBytes);const base:Snapshot={id:"00000000-0000-4000-8000-000000000401",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"note.md",hash:baseHash,size:baseBytes.length,mtime:1}]};

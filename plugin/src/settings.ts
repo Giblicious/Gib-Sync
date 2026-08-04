@@ -33,6 +33,20 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
 export const initialLiveStatus = (configured:boolean): LiveSyncStatus => ({ phase:configured?"idle":"not-configured",message:configured?"Ready":"Not configured",running:false,
   startedAt:null,completedAt:null,lastSuccessAt:null,lastErrorAt:null,lastError:"",lastResult:"",nextSyncAt:null,activities:[] });
 
+export function createSerializedSettingsWriter<T>(read:()=>T,write:(snapshot:T)=>Promise<void>):()=>Promise<void>{
+  let tail=Promise.resolve();
+  return ()=>{
+    const queued=tail.catch(()=>undefined).then(async()=>{
+      // Obsidian may complete overlapping saveData calls out of order on mobile.
+      // Serialize writes and snapshot at execution time so an older journal save
+      // can never overwrite a newer accepted server checkpoint.
+      const snapshot=JSON.parse(JSON.stringify(read())) as T;
+      await write(snapshot);
+    });
+    tail=queued;return queued;
+  };
+}
+
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
   const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
