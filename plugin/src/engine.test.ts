@@ -11,7 +11,7 @@ import { DEFAULT_SETTINGS, type GibSyncSettings } from "./settings";
 beforeAll(() => Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true }));
 
 class MemoryAdapter {
-  files = new Map<string, Uint8Array>(); dirs = new Set<string>();dirMtimes=new Map<string,number>();listCalls=0;readCalls:string[]=[];writeCalls:string[]=[];
+  files = new Map<string, Uint8Array>(); dirs = new Set<string>();dirMtimes=new Map<string,number>();listCalls=0;readCalls:string[]=[];writeCalls:string[]=[];rmdirCalls:{path:string;recursive:boolean}[]=[];
   async list(path: string) {
     this.listCalls++;
     const prefix = path ? `${path}/` : ""; const files: string[] = [], folders = new Set<string>();
@@ -25,7 +25,7 @@ class MemoryAdapter {
   async exists(path: string) { return this.files.has(path) || this.dirs.has(path); }
   async mkdir(path: string) { this.dirs.add(path);this.dirMtimes.set(path,Date.now()); }
   async remove(path: string) { this.files.delete(path); }
-  async rmdir(path:string,_recursive:boolean){const prefix=`${path}/`;if([...this.files.keys()].some((name)=>name.startsWith(prefix))||[...this.dirs].some((name)=>name.startsWith(prefix)))throw new Error("folder is not empty");this.dirs.delete(path);this.dirMtimes.delete(path);}
+  async rmdir(path:string,recursive:boolean){this.rmdirCalls.push({path,recursive});if(!recursive)throw new Error("platform requires verified recursive folder removal");const prefix=`${path}/`;if([...this.files.keys()].some((name)=>name.startsWith(prefix))||[...this.dirs].some((name)=>name.startsWith(prefix)))throw new Error("folder is not empty");this.dirs.delete(path);this.dirMtimes.delete(path);}
 }
 
 class MemoryApi {
@@ -72,7 +72,7 @@ describe("SyncEngine", () => {
     api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Legacy/Nested/old.md":{hash,snapshotId:head.id,retiredAt}};
     adapter.files.set("stable.md",clear);for(const path of ["Legacy","Legacy/Nested"]){adapter.dirs.add(path);adapter.dirMtimes.set(path,retiredAt-1000);}
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
-    expect(result).toMatchObject({uploaded:0,downloaded:0,prunedFolders:2,fullScan:false});expect(adapter.dirs.has("Legacy")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(config.lastFolderCleanupAt).toBe(retiredAt);expect(adapter.readCalls).toEqual([]);
+    expect(result).toMatchObject({uploaded:0,downloaded:0,prunedFolders:2,fullScan:false});expect(adapter.dirs.has("Legacy")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(adapter.rmdirCalls.every((call)=>call.recursive)).toBe(true);expect(config.lastFolderCleanupAt).toBe(retiredAt);expect(config.lastFolderCleanupError).toBe("");expect(adapter.readCalls).toEqual([]);
   });
   it("preserves an empty retired folder explicitly recreated after the accepted deletion",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
@@ -89,6 +89,21 @@ describe("SyncEngine", () => {
     adapter.files.set("stable.md",clear);adapter.dirs.add("Stale");adapter.dirMtimes.set("Stale",retiredAt+60_000);
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.prunedFolders).toBe(1);expect(adapter.dirs.has("Stale")).toBe(false);expect(config.lastFolderCleanupAt).toBe(retiredAt);
+  });
+  it("preserves a file created between the two empty-folder checks",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000017",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Race/old.md":{hash,snapshotId:head.id,retiredAt}};adapter.files.set("stable.md",clear);adapter.dirs.add("Race");
+    const list=adapter.list.bind(adapter);let raceLists=0;adapter.list=async(path:string)=>{const result=await list(path);if(path==="Race"&&++raceLists===1)adapter.files.set("Race/new.md",new TextEncoder().encode("new\n"));return result;};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(0);expect(adapter.files.has("Race/new.md")).toBe(true);expect(adapter.dirs.has("Race")).toBe(true);expect(adapter.rmdirCalls).toEqual([]);
+  });
+  it("persists the exact platform error when empty-folder removal fails",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000018",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Blocked/old.md":{hash,snapshotId:head.id,retiredAt}};adapter.files.set("stable.md",clear);adapter.dirs.add("Blocked");adapter.rmdir=async()=>{throw new Error("Access denied by test adapter");};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(0);expect(config.lastFolderCleanupAt).toBe(0);expect(config.lastFolderCleanupError).toContain("Blocked: Access denied by test adapter");
   });
   it("removes only the empty source branch after an accepted folder move",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("moved\n"),keep=new TextEncoder().encode("keep\n"),noteHash=await hashBytes(note),keepHash=await hashBytes(keep),createdAt=new Date().toISOString();

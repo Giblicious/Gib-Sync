@@ -161,11 +161,18 @@ export class SyncEngine {
     for(const path of ordered){
       await this.cooperate();
       try{
-        const listing=await this.adapter.list(path);if(listing.files.length||listing.folders.length)continue;
-        this.expectLocalMutation(path,null);await this.adapter.rmdir(path,false);removed++;
+        const first=await this.adapter.list(path);if(first.files.length||first.folders.length)continue;
+        // Obsidian's adapters do not implement non-recursive folder removal
+        // consistently. Match Obsidian Sync's cross-platform behavior, but add
+        // a second empty check after yielding so a newly created child is never
+        // recursively removed with the retired folder.
+        await this.cooperate(true);const second=await this.adapter.list(path);if(second.files.length||second.folders.length)continue;
+        const stat=await this.adapter.stat(path);if(stat?.type!=="folder")continue;
+        this.expectLocalMutation(path,null);await this.adapter.rmdir(path,true);removed++;
       }catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    if(!failures)settings.lastFolderCleanupAt=newest;
+    if(!failures){settings.lastFolderCleanupAt=newest;settings.lastFolderCleanupError="";}
+    else settings.lastFolderCleanupError=failureDetails.slice(0,8).join(" · ").slice(0,2000);
     if(removed)this.status({phase:"applying",message:`Removed ${removed} empty retired folder${removed===1?"":"s"} left by accepted moves or deletions`,level:"success"});
     if(failures)this.status({phase:"applying",message:`Empty-folder cleanup deferred for ${failures} path${failures===1?"":"s"}; ${failureDetails.slice(0,3).join(" · ")}; file reconciliation can continue and cleanup will retry`,level:"warning"});
     return {removed,attempted:true};

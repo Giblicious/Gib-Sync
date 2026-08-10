@@ -80,10 +80,10 @@ describe("file-change sync filtering",()=>{
   });
 
   it("retries folder cleanup once when upgrading from the timestamp-based implementation",async()=>{
-    const oldPlugin={loadData:async()=>({lastFolderCleanupAt:12345})} as unknown as Plugin;
-    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:2,lastFolderCleanupAt:0});
-    const currentPlugin={loadData:async()=>({folderCleanupVersion:2,lastFolderCleanupAt:12345})} as unknown as Plugin;
-    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:2,lastFolderCleanupAt:12345});
+    const oldPlugin={loadData:async()=>({folderCleanupVersion:2,lastFolderCleanupAt:12345})} as unknown as Plugin;
+    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:3,lastFolderCleanupAt:0});
+    const currentPlugin={loadData:async()=>({folderCleanupVersion:3,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied"})} as unknown as Plugin;
+    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:3,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied"});
   });
 });
 
