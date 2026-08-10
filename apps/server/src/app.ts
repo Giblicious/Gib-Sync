@@ -85,7 +85,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return {missing,lingering};
   }
 
-  const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Map<string,{timer:NodeJS.Timeout;due:number}>();
+  const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Map<string,{timer:NodeJS.Timeout;due:number}>(),mirrorFailureCounts=new Map<string,number>(),mirrorRetryNotBefore=new Map<string,number>();
   async function ingestExternalChanges(vaultId:string,fresh=false):Promise<ExternalImportResult>{
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
     const activeMirror=fresh?mirrorJobs.get(vaultId):undefined;
@@ -152,12 +152,15 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       await writeGeneration(config,storage,row,snapshot);const completed=store.run("UPDATE vaults SET mirror_head_id=?,mirror_generation_id=? WHERE id=? AND head_id=?",snapshot.id,snapshot.id,vaultId,snapshot.id);
       if(completed.changes){store.run("DELETE FROM external_absences WHERE vault_id=?",vaultId);mirrorWriteSettles.delete(vaultId);return;}
       skipExternalOnce.add(vaultId);mirrorWriteSettles.delete(vaultId);
-    }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);})().catch((error)=>{app.log.error({err:error,vaultId},"Readable mirror reconciliation failed");scheduleMirror(vaultId,5000);}).finally(()=>mirrorJobs.delete(vaultId));
+    }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);})().then(()=>{mirrorFailureCounts.delete(vaultId);mirrorRetryNotBefore.delete(vaultId);}).catch((error)=>{
+      const failures=(mirrorFailureCounts.get(vaultId)??0)+1,retryMs=Math.min(60_000,5000*(2**Math.min(failures-1,4)));mirrorFailureCounts.set(vaultId,failures);mirrorRetryNotBefore.set(vaultId,Date.now()+retryMs);
+      app.log.error({err:error,vaultId,retryMs},"Readable mirror reconciliation failed");scheduleMirror(vaultId,retryMs);
+    }).finally(()=>mirrorJobs.delete(vaultId));
     mirrorJobs.set(vaultId,job);return job;
   }
   function scheduleMirror(vaultId:string,delay=2000){
-    if(closing)return;const due=Date.now()+delay,scheduled=mirrorTimers.get(vaultId);if(scheduled&&scheduled.due<=due)return;if(scheduled)clearTimeout(scheduled.timer);
-    const timer=setTimeout(()=>{mirrorTimers.delete(vaultId);if(!closing)void reconcileReadableMirror(vaultId);},delay);timer.unref();mirrorTimers.set(vaultId,{timer,due});
+    if(closing)return;const effectiveDelay=Math.max(delay,(mirrorRetryNotBefore.get(vaultId)??0)-Date.now(),0),due=Date.now()+effectiveDelay,scheduled=mirrorTimers.get(vaultId);if(scheduled&&scheduled.due<=due)return;if(scheduled)clearTimeout(scheduled.timer);
+    const timer=setTimeout(()=>{mirrorTimers.delete(vaultId);if(!closing)void reconcileReadableMirror(vaultId);},effectiveDelay);timer.unref();mirrorTimers.set(vaultId,{timer,due});
   }
 
   function setupResponse(vaultId: string, vaultName: string, deviceId: string, deviceToken: string): SetupResponse {

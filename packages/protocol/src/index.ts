@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = 6;
-export const MINIMUM_SAFE_SERVER_VERSION = "0.8.35";
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.36";
 export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1"] as const;
 
 export interface ClientCompatibility {
