@@ -2,7 +2,7 @@ import {describe,expect,it} from "vitest";
 import type {ClientCompatibility} from "@gib-sync/protocol";
 import {assertSetupServerCompatible,enforceServerCompatibility,staleServerReason} from "./server-compatibility";
 
-const compatible:ClientCompatibility={clientVersion:"0.8.37",clientProtocol:6,minimumVersion:"0.8.36",recommendedVersion:"0.8.37",serverProtocol:6,serverVersion:"0.8.37",serverCapabilities:["readable-generation-v1","external-delete-proof-v1"],compatible:true,updateAvailable:false,reason:null};
+const compatible:ClientCompatibility={clientVersion:"0.8.38",clientProtocol:6,minimumVersion:"0.8.36",recommendedVersion:"0.8.38",serverProtocol:6,serverVersion:"0.8.38",serverCapabilities:["readable-generation-v1","external-delete-proof-v1"],compatible:true,updateAvailable:false,reason:null};
 
 describe("server compatibility gate",()=>{
   it("blocks an old server even when it claims the client is compatible",()=>{

@@ -15,7 +15,6 @@ const MOBILE_WORK_BATCH=2;
 const DESKTOP_WORK_BATCH=8;
 const RETIRED_PATH_MAX_AGE=90*24*60*60*1000;
 const RETIRED_PATH_LIMIT=5000;
-const FOLDER_RECREATE_GRACE_MS=30_000;
 const PROTECTED_FOLDER_ROOTS=new Set([".obsidian",".obsidian/plugins",".obsidian/themes",".trash",".git",".gib-sync"]);
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
@@ -153,9 +152,10 @@ export class SyncEngine {
         candidates.set(current,Math.max(candidates.get(current)??0,state.retiredAt));
       }
     }
-    const eligible=new Set<string>();let failures=0,removed=0;
+    const eligible=new Set<string>();let failures=0,removed=0;const failureDetails:string[]=[];
     for(const [path,retiredAt] of candidates){
-      try{const stat=await this.adapter.stat(path);if(stat?.type==="folder"&&(!stat.mtime||stat.mtime<=retiredAt+FOLDER_RECREATE_GRACE_MS))eligible.add(path);}catch{failures++;}
+      if((settings.folderCreateTimes[path]??0)>retiredAt)continue;
+      try{const stat=await this.adapter.stat(path);if(stat?.type==="folder")eligible.add(path);}catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
     const ordered=[...eligible].sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left));
     for(const path of ordered){
@@ -163,11 +163,11 @@ export class SyncEngine {
       try{
         const listing=await this.adapter.list(path);if(listing.files.length||listing.folders.length)continue;
         this.expectLocalMutation(path,null);await this.adapter.rmdir(path,false);removed++;
-      }catch{failures++;}
+      }catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
     if(!failures)settings.lastFolderCleanupAt=newest;
     if(removed)this.status({phase:"applying",message:`Removed ${removed} empty retired folder${removed===1?"":"s"} left by accepted moves or deletions`,level:"success"});
-    if(failures)this.status({phase:"applying",message:`Empty-folder cleanup deferred for ${failures} path${failures===1?"":"s"}; file reconciliation can continue and cleanup will retry`,level:"warning"});
+    if(failures)this.status({phase:"applying",message:`Empty-folder cleanup deferred for ${failures} path${failures===1?"":"s"}; ${failureDetails.slice(0,3).join(" · ")}; file reconciliation can continue and cleanup will retry`,level:"warning"});
     return {removed,attempted:true};
   }
 
@@ -314,6 +314,7 @@ export class SyncEngine {
     const settings=this.getSettings(),cutoff=Date.now()-RETIRED_PATH_MAX_AGE;
     const kept=Object.entries(settings.retiredPaths).filter(([,value])=>value.retiredAt>=cutoff).sort((left,right)=>right[1].retiredAt-left[1].retiredAt).slice(0,RETIRED_PATH_LIMIT);
     settings.retiredPaths=Object.fromEntries(kept);
+    settings.folderCreateTimes=Object.fromEntries(Object.entries(settings.folderCreateTimes).filter(([,createdAt])=>createdAt>=cutoff).sort((left,right)=>right[1]-left[1]).slice(0,RETIRED_PATH_LIMIT));
   }
   private async deviceBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>,desktopOnly:Set<string>):Promise<{clear:Uint8Array;hash:string}>{
     let clear=await this.remoteBytes(entry,cache),hash=entry.hash;

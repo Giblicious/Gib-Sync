@@ -73,6 +73,18 @@ describe("file-change sync filtering",()=>{
       mobileSidebarIndicator:true,mobileTopIndicator:false,paused:false,syncBookmarks:true
     });
   });
+
+  it("keeps only valid observed folder creation timestamps",async()=>{
+    const plugin={loadData:async()=>({folderCreateTimes:{"Intentional empty folder":12345,"Bad folder":"yesterday"}})} as unknown as Plugin;
+    await expect(loadSettings(plugin)).resolves.toMatchObject({folderCreateTimes:{"Intentional empty folder":12345}});
+  });
+
+  it("retries folder cleanup once when upgrading from the timestamp-based implementation",async()=>{
+    const oldPlugin={loadData:async()=>({lastFolderCleanupAt:12345})} as unknown as Plugin;
+    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:2,lastFolderCleanupAt:0});
+    const currentPlugin={loadData:async()=>({folderCleanupVersion:2,lastFolderCleanupAt:12345})} as unknown as Plugin;
+    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:2,lastFolderCleanupAt:12345});
+  });
 });
 
 describe("settings persistence",()=>{

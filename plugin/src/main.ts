@@ -59,10 +59,10 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){this.settings.folderCreateTimes[normalizePath(file.path)]=Date.now();this.persistJournalSoon();}else this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path),expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
-    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder){this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder){this.settings.folderCreateTimes[normalizePath(file.path)]=Date.now();this.persistJournalSoon();this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
@@ -263,7 +263,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     assertSetupServerCompatible(setup);
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},lastFolderCleanupAt:0,fullScanRequired:true,lastFullScanAt:null });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:2,lastFolderCleanupAt:0,fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }

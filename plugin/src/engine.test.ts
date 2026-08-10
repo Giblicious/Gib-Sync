@@ -74,13 +74,21 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result).toMatchObject({uploaded:0,downloaded:0,prunedFolders:2,fullScan:false});expect(adapter.dirs.has("Legacy")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(config.lastFolderCleanupAt).toBe(retiredAt);expect(adapter.readCalls).toEqual([]);
   });
-  it("preserves an empty retired folder that was recreated after the accepted deletion",async()=>{
+  it("preserves an empty retired folder explicitly recreated after the accepted deletion",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000013",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
     api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Recreated/old.md":{hash,snapshotId:head.id,retiredAt}};
-    adapter.files.set("stable.md",clear);adapter.dirs.add("Recreated");adapter.dirMtimes.set("Recreated",retiredAt+60_000);
+    adapter.files.set("stable.md",clear);adapter.dirs.add("Recreated");adapter.dirMtimes.set("Recreated",retiredAt+60_000);config.folderCreateTimes={Recreated:retiredAt+60_000};
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.prunedFolders).toBe(0);expect(adapter.dirs.has("Recreated")).toBe(true);expect(config.lastFolderCleanupAt).toBe(retiredAt);
+  });
+  it("prunes a stale empty folder even when filesystem metadata changed after retirement",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000016",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Stale/old.md":{hash,snapshotId:head.id,retiredAt}};
+    adapter.files.set("stable.md",clear);adapter.dirs.add("Stale");adapter.dirMtimes.set("Stale",retiredAt+60_000);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(1);expect(adapter.dirs.has("Stale")).toBe(false);expect(config.lastFolderCleanupAt).toBe(retiredAt);
   });
   it("removes only the empty source branch after an accepted folder move",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("moved\n"),keep=new TextEncoder().encode("keep\n"),noteHash=await hashBytes(note),keepHash=await hashBytes(keep),createdAt=new Date().toISOString();
