@@ -1,4 +1,6 @@
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.34";
+export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1"] as const;
 
 export interface ClientCompatibility {
   clientVersion: string | null;
@@ -6,6 +8,8 @@ export interface ClientCompatibility {
   minimumVersion: string;
   recommendedVersion: string;
   serverProtocol: number;
+  serverVersion?: string | null;
+  serverCapabilities?: string[];
   compatible: boolean;
   updateAvailable: boolean;
   reason: string | null;
@@ -31,6 +35,8 @@ export interface Snapshot {
 
 export interface SetupResponse {
   protocolVersion: number;
+  serverVersion?: string | null;
+  serverCapabilities?: string[];
   serverUrl: string;
   vaultId: string;
   vaultName: string;
@@ -83,6 +89,8 @@ export interface StorageSetupRequest {
 
 export interface ServerStatus {
   protocolVersion: number;
+  serverVersion?: string | null;
+  serverCapabilities?: string[];
   vaultId: string;
   vaultName: string;
   deviceId: string;

@@ -74,7 +74,7 @@ export class SetupModal extends Modal {
     existingSelect.onchange=()=>{const index=Number(existingSelect.value);if(Number.isInteger(index)&&index>=0)useExisting(index);else existingVaultId=undefined;};
     librarySetting.addButton((button)=>button.setButtonText("Load libraries").onClick(async()=>{
       button.setDisabled(true).setButtonText("Loading…");
-      try { const result=await this.plugin.api.discover(server,seafileUrl,username,password);libraries=result.libraries;existingVaults=result.existingVaults;select.empty();for(const library of libraries)select.createEl("option",{text:library.name,value:library.id});select.disabled=false;
+      try { await this.plugin.verifyServerBeforeSetup(server);const result=await this.plugin.api.discover(server,seafileUrl,username,password);libraries=result.libraries;existingVaults=result.existingVaults;select.empty();for(const library of libraries)select.createEl("option",{text:library.name,value:library.id});select.disabled=false;
         const preferred=this.plugin.settings.storage?.libraryId;libraryId=libraries.find((item)=>item.id===preferred)?.id||libraries[0]?.id||"";select.value=libraryId;libraryName=libraries.find((item)=>item.id===libraryId)?.name||"";button.setButtonText("Reload");
         existingSelect.empty();existingSelect.createEl("option",{text:existingVaults.length?"Create or use the location below":"No existing vaults found",value:"-1"});for(const [index,vault] of existingVaults.entries())existingSelect.createEl("option",{text:`${vault.vaultName} — ${vault.libraryName}:${vault.basePath}`,value:String(index)});existingSelect.disabled=!existingVaults.length;if(existingVaults.length===1){existingSelect.value="0";useExisting(0);}
         if(!libraries.length)new Notice("This Seafile account has no accessible libraries.");
@@ -86,7 +86,7 @@ export class SetupModal extends Modal {
     new Setting(this.contentEl).setName("Device name").addText((text)=>text.setValue(deviceName).onChange((value)=>deviceName=value.trim()));
     new Setting(this.contentEl).addButton((button)=>button.setCta().setButtonText("Connect").onClick(async()=>{
       if(!libraryId){new Notice("Load and select a Seafile library first.");return;}button.setDisabled(true).setButtonText("Connecting…");
-      try { const setup=await this.plugin.api.setup(server,{vaultName,deviceName,seafileUrl,seafileUsername:username,seafilePassword:password,libraryId,libraryName,basePath,existingVaultId});await this.plugin.acceptSetup(setup,deviceName);this.close();new Notice("Gib Sync connected. Starting first sync…");void this.plugin.runSync(); }
+      try { await this.plugin.verifyServerBeforeSetup(server);const setup=await this.plugin.api.setup(server,{vaultName,deviceName,seafileUrl,seafileUsername:username,seafilePassword:password,libraryId,libraryName,basePath,existingVaultId});await this.plugin.acceptSetup(setup,deviceName);this.close();new Notice("Gib Sync connected. Starting first sync…");void this.plugin.runSync(); }
       catch(error){new Notice(`Setup failed: ${error instanceof Error?error.message:String(error)}`,10000);button.setDisabled(false).setButtonText("Connect");}
     }));
   }
@@ -350,7 +350,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
     const header=root.createDiv({cls:`gib-sync-status-head is-${state.tone}`});header.createDiv({cls:"gib-sync-status-dot"});const copy=header.createDiv();copy.createEl("strong",{text:state.label});copy.createEl("div",{cls:"gib-sync-muted",text:state.description});header.createDiv({cls:"gib-sync-status-freshness",text:live.running?"Working now":live.lastSuccessAt?`Checked ${when(live.lastSuccessAt)}`:"Not checked yet"});
     const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${live.total?Math.min(100,((live.current||0)/live.total)*100):0}%`}});
     const issues=server?.healthAlerts.filter((alert)=>alert.level==="warning"||alert.level==="error")??[];
-    if(this.plugin.compatibility&&!this.plugin.compatibility.compatible){const update=root.createDiv({cls:"gib-sync-attention-card is-warning"});update.createEl("strong",{text:"Gib Sync update required"});update.createEl("p",{text:`${this.plugin.compatibility.reason} Update through BRAT before syncing.`});}
+    if(this.plugin.compatibility&&!this.plugin.compatibility.compatible){const update=root.createDiv({cls:"gib-sync-attention-card is-warning"});update.createEl("strong",{text:"Gib Sync compatibility update required"});update.createEl("p",{text:`${this.plugin.compatibility.reason} Synchronization is disabled until compatibility is restored.`});}
     if(live.phase==="error"||issues.length){const attention=root.createDiv({cls:`gib-sync-attention-card is-${live.phase==="error"||issues.some((notice)=>notice.level==="error")?"error":"warning"}`});attention.createEl("strong",{text:live.phase==="error"?"Sync needs help":issues.length===1?"One item needs attention":`${issues.length} items need attention`});attention.createEl("p",{text:live.phase==="error"?(live.lastError||live.message):issues[0].message});if(issues.length>1)attention.createEl("div",{cls:"gib-sync-muted",text:`${issues.length-1} more ${issues.length-1===1?"item":"items"} in technical details`});}
     const grid=root.createDiv({cls:"gib-sync-status-grid gib-sync-status-summary"});const item=(host:HTMLElement,label:string,value:string,tone?:string)=>{const el=host.createDiv({cls:tone?`is-${tone}`:""});el.createEl("span",{text:label});el.createEl("strong",{text:value,attr:{title:value}});};
     item(grid,"Current operation",live.running?live.message:"Idle");item(grid,"Last successful sync",when(live.lastSuccessAt));item(grid,"Next automatic check",when(live.nextSyncAt));item(grid,"Server copy",server?server.mirrorCurrent?`${server.mirrorFileCount} files · current`:`${server.mirrorFileCount} files · catching up`:"Checking…",server&&!server.mirrorCurrent?"warning":undefined);item(grid,"Held changes",server?server.safeguards.pendingQuarantines?`${server.safeguards.pendingQuarantines} need review`:"None":"Checking…",server?.safeguards.pendingQuarantines?"warning":undefined);item(grid,"Connected devices",server?String(server.deviceCount):"Checking…");
@@ -369,6 +369,6 @@ export class GibSyncSettingTab extends PluginSettingTab {
 }
 
 export async function claimQuickCodeSetup(plugin:GibSyncPlugin,server:string,value:string,deviceName:string):Promise<SetupResponse>{
-  const code=normalizeQuickCode(value);const response=await plugin.api.claimQuickCode(server,code,deviceName);
+  await plugin.verifyServerBeforeSetup(server);const code=normalizeQuickCode(value);const response=await plugin.api.claimQuickCode(server,code,deviceName);
   return openPairingEnvelope<SetupResponse>(response.envelope,code,response.pairingId);
 }

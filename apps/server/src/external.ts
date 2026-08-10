@@ -90,7 +90,7 @@ export class ExternalImporter{
     // creations and edits can still be imported while a newer generation is
     // being written, but absence is deletion evidence only for a path that
     // existed in a successfully completed generation.
-    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id);
+    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id),mirrorCurrent=Boolean(generationCurrent&&vault.head_id===vault.mirror_head_id);
     const completedEntries=new Map((generationSnapshot?.entries??[]).map((entry)=>[entry.path,entry]));
     this.store.run("UPDATE vaults SET trusted_until=NULL,trusted_device_id=NULL WHERE id=? AND trusted_device_id=?",vaultId,`seafile:${vaultId}`);
     const remote=await this.storage.listReadable(row);
@@ -107,6 +107,11 @@ export class ExternalImporter{
     }
 
     const head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
+    const mergeBase=(path:string):MirrorEntry|undefined=>{
+      if(mirrorCurrent)return mirrored.get(path);
+      const completed=completedEntries.get(path);
+      return completed?{path:completed.path,hash:completed.hash,size:completed.size,updated_at:generationSnapshot?.createdAt??"",storage_id:null,storage_mtime:completed.mtime/1000}:undefined;
+    };
     const externalPreferred=(entry:ManifestEntry):"current"|"external"=>entry.mtime>=(head?Date.parse(head.createdAt):0)?"external":"current";
     const final=new Map((head?.entries??[]).map((entry)=>[entry.path,{...entry}])),occupied=new Set(final.keys());
     const key=openJson<string>(vault.wrapped_key,this.config.GIBSYNC_SERVER_SECRET,vaultId);
@@ -125,17 +130,22 @@ export class ExternalImporter{
     const movedSources=new Set(externalMoves.map((move)=>move.previousPath)),deleted:MirrorEntry[]=[];let deferredDeletions=0;
     for(const missing of missingAll){
       if(movedSources.has(missing.path)){deleted.push(missing);this.store.run("DELETE FROM external_absences WHERE vault_id=? AND path=?",vaultId,missing.path);continue;}
+      const completed=completedEntries.get(missing.path);
+      // A path written only into the mutable/incomplete mirror database was
+      // never proven visible in Seafile. Its absence is an interrupted upload,
+      // not an external deletion, so reconciliation must be allowed to resume.
+      if(!completed||completed.hash!==missing.hash){this.store.run("DELETE FROM external_absences WHERE vault_id=? AND path=?",vaultId,missing.path);continue;}
       const previous=this.store.one<{hash:string;mirror_head_id:string;first_seen_at:string;observations:number}>("SELECT hash,mirror_head_id,first_seen_at,observations FROM external_absences WHERE vault_id=? AND path=?",vaultId,missing.path),same=previous?.hash===missing.hash&&previous.mirror_head_id===(vault.mirror_head_id??"");
       const firstSeen=same?previous.first_seen_at:scannedAt,observations=same?(previous.observations+1):1;
       this.store.run("INSERT INTO external_absences(vault_id,path,hash,mirror_head_id,first_seen_at,last_seen_at,observations) VALUES(?,?,?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,mirror_head_id=excluded.mirror_head_id,first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,observations=excluded.observations",vaultId,missing.path,missing.hash,vault.mirror_head_id??"",firstSeen,scannedAt,observations);
-      const completed=completedEntries.get(missing.path),confirmed=completed?.hash===missing.hash&&observations>=2&&Date.parse(firstSeen)<=Date.now()-DELETION_CONFIRMATION_MS;
+      const confirmed=observations>=2&&Date.parse(firstSeen)<=Date.now()-DELETION_CONFIRMATION_MS;
       if(confirmed)deleted.push(missing);else deferredDeletions++;
     }
     const handledDownloads=new Set<string>(),handledDeletes=new Set<string>(),newBytes=new Map<string,Uint8Array>();let changedFiles=0,deletedFiles=0,conflicts=0;
     for(const move of externalMoves){
       const item=downloaded.get(move.path)!;if(final.has(move.path))continue;
       const current=final.get(move.previousPath),externalEntry:ManifestEntry={path:move.path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000};
-      const base=mirrored.get(move.previousPath);final.delete(move.previousPath);newBytes.set(item.hash,item.bytes);
+      const base=mergeBase(move.previousPath);final.delete(move.previousPath);newBytes.set(item.hash,item.bytes);
       if(!current||!base||current.hash===base.hash)final.set(move.path,externalEntry);
       else if(externalEntry.hash===base.hash)final.set(move.path,{...current,path:move.path,mtime:Date.now()});
       else if(this.text(move.path)){
@@ -150,7 +160,7 @@ export class ExternalImporter{
     }
     for(const [path,item] of downloaded){
       if(handledDownloads.has(path))continue;
-      const base=mirrored.get(path),current=final.get(path);
+      const base=mergeBase(path),current=final.get(path);
       if(item.hash===base?.hash||item.hash===current?.hash)continue;
       changedFiles++;
       const externalEntry:ManifestEntry={path,hash:item.hash,size:item.bytes.length,mtime:item.metadata.mtime*1000};

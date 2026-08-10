@@ -10,6 +10,12 @@ export interface LiveSyncStatus {
   lastResult:string; nextSyncAt:string|null; activities:SyncActivity[];
 }
 
+export interface RetiredPathState {
+  hash:string;
+  snapshotId:string;
+  retiredAt:number;
+}
+
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
@@ -18,7 +24,9 @@ export interface GibSyncSettings {
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
-  pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[]; fullScanRequired: boolean; lastFullScanAt: string | null;
+  pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[];
+  pendingApplySnapshotId:string|null; pendingApplyBaseSnapshotId:string|null; pendingApplyPriorHashes:Record<string,string|null>; retiredPaths:Record<string,RetiredPathState>;
+  fullScanRequired: boolean; lastFullScanAt: string | null;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
@@ -26,7 +34,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
   lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
-  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],fullScanRequired:true,lastFullScanAt:null,
+  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},fullScanRequired:true,lastFullScanAt:null,
   storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -58,6 +66,12 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   settings.pendingPathTimes=stored?.pendingPathTimes&&typeof stored.pendingPathTimes==="object"&&!Array.isArray(stored.pendingPathTimes)
     ?Object.fromEntries(Object.entries(stored.pendingPathTimes).filter(([path,time])=>Boolean(path)&&typeof time==="number"&&Number.isFinite(time)&&time>0)):{};
   settings.pendingApplyPaths=Array.isArray(stored?.pendingApplyPaths)?[...new Set(stored.pendingApplyPaths.filter((path):path is string=>typeof path==="string"&&Boolean(path)))]:[];
+  settings.pendingApplySnapshotId=typeof stored?.pendingApplySnapshotId==="string"&&stored.pendingApplySnapshotId?stored.pendingApplySnapshotId:null;
+  settings.pendingApplyBaseSnapshotId=typeof stored?.pendingApplyBaseSnapshotId==="string"&&stored.pendingApplyBaseSnapshotId?stored.pendingApplyBaseSnapshotId:null;
+  settings.pendingApplyPriorHashes=stored?.pendingApplyPriorHashes&&typeof stored.pendingApplyPriorHashes==="object"&&!Array.isArray(stored.pendingApplyPriorHashes)
+    ?Object.fromEntries(Object.entries(stored.pendingApplyPriorHashes).filter(([path,hash])=>Boolean(path)&&(hash===null||(typeof hash==="string"&&/^[a-f0-9]{64}$/i.test(hash))))):{};
+  settings.retiredPaths=stored?.retiredPaths&&typeof stored.retiredPaths==="object"&&!Array.isArray(stored.retiredPaths)
+    ?Object.fromEntries(Object.entries(stored.retiredPaths).filter(([path,value])=>Boolean(path)&&Boolean(value)&&typeof value==="object"&&typeof value.hash==="string"&&/^[a-f0-9]{64}$/i.test(value.hash)&&typeof value.snapshotId==="string"&&Boolean(value.snapshotId)&&typeof value.retiredAt==="number"&&Number.isFinite(value.retiredAt)&&value.retiredAt>0)):{};
   return settings;
 }
 

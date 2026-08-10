@@ -1,5 +1,5 @@
-export interface ClientCompatibilityInput{clientVersion:string|null;clientProtocol:number|null;minimumVersion:string;recommendedVersion:string;serverProtocol:number;}
-export interface ClientCompatibilityResult{clientVersion:string|null;clientProtocol:number|null;minimumVersion:string;recommendedVersion:string;serverProtocol:number;compatible:boolean;updateAvailable:boolean;reason:string|null;}
+export interface ClientCompatibilityInput{clientVersion:string|null;clientProtocol:number|null;minimumVersion:string;recommendedVersion:string;serverProtocol:number;serverVersion:string;serverCapabilities:string[];}
+export interface ClientCompatibilityResult{clientVersion:string|null;clientProtocol:number|null;minimumVersion:string;recommendedVersion:string;serverProtocol:number;serverVersion:string;serverCapabilities:string[];compatible:boolean;updateAvailable:boolean;reason:string|null;}
 
 type Version={parts:[number,number,number];prerelease:string[]};
 export function parseVersion(value:string):Version|null{

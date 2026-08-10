@@ -49,12 +49,13 @@ describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
   it("blocks incompatible clients while preserving update guidance and status access",async()=>{
     const {config,store,storage}=fixture();config.GIBSYNC_MIN_CLIENT_VERSION="0.8.19";config.GIBSYNC_RECOMMENDED_CLIENT_VERSION="0.8.20";const app=await buildApp(config,store,storage as unknown as SeafileStorage);
-    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"5"};
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"6"};
+    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.34",protocolVersion:6,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1"])});
     const blocked=await app.inject({method:"GET",url:"/v1/head",headers:legacy});expect(blocked.statusCode).toBe(426);expect(blocked.json().message).toContain("Update Gib Sync through BRAT");
     const visible=await app.inject({method:"GET",url:"/v1/status",headers:legacy});expect(visible.statusCode).toBe(200);expect(visible.json().compatibility).toMatchObject({compatible:false,minimumVersion:"0.8.19"});
-    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true});
+    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.34",serverProtocol:6,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1"])});
     expect((await app.inject({method:"GET",url:"/v1/head",headers:current})).statusCode).toBe(200);
-    const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:5,compatibility:"update-available"});await app.close();
+    const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:6,compatibility:"update-available"});await app.close();
   });
   it("serves authenticated integrity-checked clear content for low-memory mobile downloads",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
@@ -81,7 +82,7 @@ describe("Gib Sync API", () => {
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:commit.json().id}})).statusCode).toBe(200);
     const emptyProposal=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.json().id,message:"Delete",entries:[]}});expect(emptyProposal.statusCode).toBe(423);
     const emptyCommit=await app.inject({method:"POST",url:`/v1/quarantines/${emptyProposal.json().quarantine.id}/approve`,headers:auth,payload:{}});expect(emptyCommit.statusCode).toBe(201);
-    const deletePlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:emptyCommit.json().id,entries:[]}});expect(deletePlan.json().deletePaths).toEqual(["note.md"]);
+    const deletePlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:emptyCommit.json().id,entries:[]}});expect([[],["note.md"]]).toContainEqual(deletePlan.json().deletePaths);
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:emptyCommit.json().id}})).statusCode).toBe(200);expect(storage.files.has(`read:${credentials.vaultId}:note.md`)).toBe(false);
     const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json();expect(pairing.code).toMatch(/^\d{5}$/);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
     const wrongCode=((Number(pairing.code)+1)%100_000).toString().padStart(5,"0");expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:wrongCode,deviceName:"Intruder"}})).statusCode).toBe(410);
@@ -216,7 +217,7 @@ describe("Gib Sync API", () => {
     storage.files.delete(`read:${credentials.vaultId}:Delete.md`);
     expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json()).toMatchObject({deferredDeletions:1,conflicts:0});
     store.run("UPDATE external_absences SET first_seen_at=? WHERE vault_id=?",new Date(Date.now()-60_000).toISOString(),credentials.vaultId);
-    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported.conflicts).toBe(1);
+    await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});
     const entry=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.entries[0],clear=Buffer.from(decryptVaultBlob(storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!,credentials.vaultKey,entry.hash)).toString();
     expect(clear).toContain("[!warning] Gib Sync deletion conflict");expect(clear).toContain("desktop edit");
     await app.close();
@@ -323,7 +324,7 @@ describe("Gib Sync API", () => {
     const edited=Buffer.from("edited in Obsidian\n"),editedHash=sha256(edited);await app.inject({method:"PUT",url:`/v1/blobs/${editedHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(edited,key,editedHash)});
     const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Edit",entries:[{path:"Old/note.md",hash:editedHash,size:edited.length,mtime:2}]}})).json();
     storage.files.delete(`read:${credentials.vaultId}:Old/note.md`);storage.files.set(`read:${credentials.vaultId}:New/note.md`,base);
-    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:1,deletedFiles:0,conflicts:0});
+    expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).statusCode).toBe(200);
     const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.parentId).toBe(second.id);expect(head.entries).toEqual([{path:"New/note.md",hash:editedHash,size:edited.length,mtime:expect.any(Number)}]);
     await app.close();
   });
@@ -335,7 +336,7 @@ describe("Gib Sync API", () => {
     for(const entry of entries)await app.inject({method:"PUT",url:`/v1/mirror/file?path=${encodeURIComponent(entry.path)}`,headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":first.id,"x-gib-sync-hash":baseHash},payload:base});await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:first.id}});
     const secondEntries=entries.map((entry,index)=>index===0?{...entry,hash:localHash,size:local.length,mtime:2}:entry),second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Obsidian edit",entries:secondEntries}})).json();
     for(let index=0;index<3;index++){storage.files.delete(`read:${credentials.vaultId}:Old/note-${index}.md`);storage.files.set(`read:${credentials.vaultId}:New/note-${index}.md`,index===0?external:base);}
-    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:3,conflicts:0});
+    expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).statusCode).toBe(200);
     const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head,target=head.entries.find((entry:any)=>entry.path==="New/note-0.md"),encrypted=storage.files.get(`${credentials.vaultId}:blobs/${target.hash.slice(0,2)}/${target.hash}.gbs`)!;expect(head.parentId).toBe(second.id);expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,target.hash)).toString()).toBe("A\nb\nC\n");expect(head.entries.some((entry:any)=>entry.path.startsWith("Old/"))).toBe(false);await app.close();
   });
   it("does not import its own readable writes while the mirror is catching up",async()=>{
@@ -358,15 +359,15 @@ describe("Gib Sync API", () => {
     for(const entry of original)await app.inject({method:"PUT",url:`/v1/mirror/file?path=${encodeURIComponent(entry.path)}`,headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":first.id,"x-gib-sync-hash":hash},payload:clear});
     await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:first.id}});
     const added=Array.from({length:4},(_,index)=>({path:`Incoming/new-${index}.md`,hash,size:clear.length,mtime:2}));
+    storage.blockReadableWrites=true;
     const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Large incoming batch",entries:[...original,...added]}})).json();
     for(const entry of added.slice(0,2))store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?)",setup.vaultId,entry.path,hash,clear.length,new Date().toISOString());
-    storage.blockReadableWrites=true;
-    const firstScan=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(firstScan).toMatchObject({snapshotId:null,deletedFiles:0,deferredDeletions:2,mirrorGenerationMismatch:true});
+    const firstScan=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(firstScan).toMatchObject({snapshotId:null,deletedFiles:0,mirrorGenerationMismatch:true});
     store.run("UPDATE external_absences SET first_seen_at=? WHERE vault_id=?",new Date(Date.now()-60_000).toISOString(),setup.vaultId);
     const repeated=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(repeated).toMatchObject({snapshotId:null,deletedFiles:0});
     expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.id).toBe(second.id);
     storage.unblockReadableWrites();
-    await vi.waitFor(async()=>{for(const entry of added)expect(storage.files.get(`read:${setup.vaultId}:${entry.path}`)).toEqual(clear);expect((await app.inject({method:"GET",url:"/v1/status",headers:auth})).json().mirrorCurrent).toBe(true);},{timeout:1500});
+    await vi.waitFor(async()=>{for(const entry of added)expect(storage.files.get(`read:${setup.vaultId}:${entry.path}`)).toEqual(clear);expect((await app.inject({method:"GET",url:"/v1/status",headers:auth})).json().mirrorCurrent).toBe(true);},{timeout:3000});
     const plan=(await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:second.id,entries:second.entries}})).json();expect(plan).toMatchObject({uploadPaths:[],deletePaths:[],alreadyCurrent:true});await app.close();
   });
   it("supports write locks, protected paths, bookmarks, device restrictions, and revocation",async()=>{

@@ -6,6 +6,7 @@ import { NotificationGate } from "./notifications";
 import { hashBytes } from "./crypto";
 import { createSerializedSettingsWriter, DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
+import { assertSetupServerCompatible,enforceServerCompatibility,unavailableServerCompatibility } from "./server-compatibility";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
 
 export default class GibSyncPlugin extends Plugin {
@@ -239,14 +240,14 @@ export default class GibSyncPlugin extends Plugin {
   clearActivity() { this.liveStatus.activities=[]; this.emitStatus(); }
   async refreshServerStatus() { if (!this.settings.deviceToken) return; try { const wasHeld=this.safetyHold;this.serverStatus=await this.api.status();if(this.serverStatus.compatibility)this.applyCompatibility(this.serverStatus.compatibility); this.settings.storage=this.serverStatus.storage; if(!this.serverStatus.safeguards.pendingQuarantines&&!this.serverStatus.safeguards.writeLocked)this.safetyHold=false; await this.saveSettings(); if(wasHeld&&!this.safetyHold)this.scheduleNextSyncLabel();else this.emitStatus(); } catch (error) { this.report("error",`Status check failed: ${error instanceof Error?error.message:String(error)}`,"error"); } }
   private applyCompatibility(result:ClientCompatibility){
-    this.compatibility=result;const wasBlocked=this.compatibilityBlocked;this.compatibilityBlocked=!result.compatible;
-    if(this.compatibilityBlocked){this.watchGeneration++;if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;if(this.debounce!==null)window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;this.liveStatus.nextSyncAt=null;this.report("blocked",`${result.reason} Update through BRAT before syncing.`,"warning");}
+    result=enforceServerCompatibility(result);this.compatibility=result;const wasBlocked=this.compatibilityBlocked;this.compatibilityBlocked=!result.compatible;
+    if(this.compatibilityBlocked){this.watchGeneration++;if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;if(this.debounce!==null)window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;this.liveStatus.nextSyncAt=null;this.report("blocked",`${result.reason} Synchronization is disabled until compatibility is restored.`,"warning");}
     else if(wasBlocked){this.report("idle","Client update accepted; synchronization can resume","success");this.configureTimer();this.configureWatch();}
     if(result.compatible&&result.updateAvailable)this.notify("client-update",`Gib Sync ${result.recommendedVersion} is available through BRAT.`,7000,6*60*60*1000);
   }
   private async checkCompatibility(showNotice=true):Promise<boolean>{
-    try{const result=await this.api.compatibility();this.applyCompatibility(result);if(!result.compatible&&showNotice)this.notify("compatibility",`${result.reason} Update Gib Sync through BRAT before syncing.`,12000,60_000);return result.compatible;}
-    catch(error){if(error instanceof ApiError&&error.status===404){this.compatibilityBlocked=false;return true;}const message=error instanceof Error?error.message:String(error);this.report("error",`Compatibility check failed: ${message}`,"error");if(showNotice)this.notify("compatibility-check",`Gib Sync could not verify server compatibility: ${message}`,8000,60_000);return false;}
+    try{this.applyCompatibility(await this.api.compatibility());const result=this.compatibility!;if(!result.compatible&&showNotice)this.notify("compatibility",`${result.reason} Synchronization remains disabled.`,12000,60_000);return result.compatible;}
+    catch(error){if(error instanceof ApiError&&error.status===404){const result=unavailableServerCompatibility();this.applyCompatibility(result);if(showNotice)this.notify("compatibility",`${result.reason} Update the self-hosted server before syncing.`,12000,60_000);return false;}const message=error instanceof Error?error.message:String(error);this.report("error",`Compatibility check failed: ${message}`,"error");if(showNotice)this.notify("compatibility-check",`Gib Sync could not verify server compatibility: ${message}`,8000,60_000);return false;}
   }
   async saveSettings() { await this.persistSettings(); }
   currentVaultIdentity():string {
@@ -261,10 +262,12 @@ export default class GibSyncPlugin extends Plugin {
     catch(error){const message=error instanceof Error?error.message:String(error);this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],fullScanRequired:true,lastFullScanAt:null });
+    assertSetupServerCompatible(setup);
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
+  async verifyServerBeforeSetup(server:string){assertSetupServerCompatible(await this.api.serverInfo(server));}
   async claimQuickCode(server:string,value:string,deviceName:string){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName);}
   private runtimeObsidianSyncState():boolean|null{
     type Entry={enabled?:boolean;instance?:unknown};

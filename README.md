@@ -87,7 +87,7 @@ Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. I
 4. Set `SEAFILE_ALLOWED_HOSTS` to the public Seafile hostnames users may select.
 5. Set `GIBSYNC_MIN_CLIENT_VERSION` to the oldest plugin release allowed to sync and `GIBSYNC_RECOMMENDED_CLIENT_VERSION` to the current release. Incompatible clients are blocked before vault access and remain able to read compatibility status.
 6. Run `docker compose up -d --build`.
-7. Verify `/healthz` reports `readableMirrors: true` and the intended client-version policy.
+7. Verify `/healthz` reports the expected `serverVersion`, protocol, safety capabilities, `readableMirrors: true`, and client-version policy. The plugin refuses setup or synchronization when the server is too old or omits required safety capabilities.
 
 Persist and back up `/data`. Existing encrypted vaults migrate without moving their sidecar objects. Their readable recovery path is created automatically under `Obsidian/<vault name>` and materialized by the first v0.3 sync.
 

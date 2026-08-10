@@ -13,6 +13,8 @@ const decoder = new TextDecoder(); const encoder = new TextEncoder();
 export const LOW_MEMORY_DOWNLOAD_BYTES=8*1024*1024;
 const MOBILE_WORK_BATCH=2;
 const DESKTOP_WORK_BATCH=8;
+const RETIRED_PATH_MAX_AGE=90*24*60*60*1000;
+const RETIRED_PATH_LIMIT=5000;
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
@@ -61,8 +63,8 @@ export class SyncEngine {
     const settings=this.getSettings();if(!settings.deviceToken||!settings.vaultKey)throw new Error("Gib Sync is not configured");
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
     for(const [path,entry] of remote){await this.cooperate();if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
-    for(const path of local.keys())if(!remote.has(path)&&this.include(path)){await this.cooperate();this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
-    settings.lastSnapshotId=head?.id??null;settings.initialized=true;await this.saveSettings();return {downloaded,deleted};
+    for(const [path,entry] of local)if(!remote.has(path)&&this.include(path)){await this.cooperate();if(head)settings.retiredPaths[path]={hash:entry.hash,snapshotId:head.id,retiredAt:Date.now()};this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
+    settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted};
   }
 
   private async entropy(bytes:Uint8Array):Promise<number>{
@@ -276,32 +278,61 @@ export class SyncEngine {
     return {downloaded,deleted};
   }
 
-  private async resumePendingApplication(remoteSnapshot:Snapshot|null):Promise<void>{
+  private trimRetiredPaths(){
+    const settings=this.getSettings(),cutoff=Date.now()-RETIRED_PATH_MAX_AGE;
+    const kept=Object.entries(settings.retiredPaths).filter(([,value])=>value.retiredAt>=cutoff).sort((left,right)=>right[1].retiredAt-left[1].retiredAt).slice(0,RETIRED_PATH_LIMIT);
+    settings.retiredPaths=Object.fromEntries(kept);
+  }
+  private async deviceBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>,desktopOnly:Set<string>):Promise<{clear:Uint8Array;hash:string}>{
+    let clear=await this.remoteBytes(entry,cache),hash=entry.hash;
+    if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnly.size)try{
+      const enabled=JSON.parse(decoder.decode(clear)) as unknown;
+      if(Array.isArray(enabled)){clear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnly.has(id)),null,2)}\n`);hash=await hashBytes(clear);}
+    }catch{}
+    return {clear,hash};
+  }
+  private async resumePendingApplication():Promise<void>{
     const settings=this.getSettings(),pending=[...new Set(settings.pendingApplyPaths.map((path)=>normalizePath(path)).filter(Boolean))];if(!pending.length)return;
-    if(!remoteSnapshot)throw new SyncSafetyError("An accepted device update is pending, but the server vault has no current snapshot.");
-    const userChanges=new Set(settings.pendingPaths),userChanged=(path:string)=>userChanges.has(path)||Object.keys(settings.pendingPathTimes).some((candidate)=>candidate===path||(candidate.endsWith("/")&&path.startsWith(candidate))),remote=this.map(remoteSnapshot),cache=new Map<string,Uint8Array>(),desktopOnly=new Set<string>();let completed=0;
-    if(this.isMobileDevice)for(const [path,entry] of remote){const plugin=obsidianPluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
-    this.status({phase:"applying",message:`Resuming ${pending.length} accepted file operation${pending.length===1?"":"s"} after an interrupted apply`});
+    // v0.8.33 recorded lastSnapshotId before applying. Treat it as the staged
+    // target when upgrading an interrupted journal that predates explicit ids.
+    const targetId=settings.pendingApplySnapshotId??settings.lastSnapshotId;if(!targetId)throw new SyncSafetyError("An accepted device update is pending, but its target snapshot was not recorded.");
+    const target=await this.api.snapshot(targetId).catch(()=>null);if(!target)throw new SyncSafetyError("An accepted device update is pending, but its exact server snapshot is unavailable. No local files were uploaded or deleted.");
+    const priorId=settings.pendingApplyBaseSnapshotId??target.parentId,prior=priorId?await this.api.snapshot(priorId).catch(()=>null):null,targetMap=this.map(target),priorMap=this.map(prior),cache=new Map<string,Uint8Array>(),desktopOnly=new Set<string>();let completed=0,preserved=0;
+    if(this.isMobileDevice)for(const [path,entry] of targetMap){const plugin=obsidianPluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
+    for(const path of pending){const old=priorMap.get(path);if(!targetMap.has(path)&&old)settings.retiredPaths[path]={hash:old.hash,snapshotId:target.id,retiredAt:Date.now()};}
+    this.trimRetiredPaths();await this.saveSettings();
+    this.status({phase:"applying",message:`Resuming ${pending.length} accepted file operation${pending.length===1?"":"s"} from its exact snapshot`});
     for(const path of pending){
-      if(userChanged(path)){completed++;continue;}
-      const entry=remote.get(path),stat=await this.adapter.stat(path);
-      if(entry){let clear=await this.remoteBytes(entry,cache),expectedHash=entry.hash;if(this.isMobileDevice&&path===".obsidian/community-plugins.json"&&desktopOnly.size)try{const enabled=JSON.parse(decoder.decode(clear)) as unknown;if(Array.isArray(enabled)){clear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnly.has(id)),null,2)}\n`);expectedHash=await hashBytes(clear);}}catch{}
-        const current=stat?.type==="file"?new Uint8Array(await this.adapter.readBinary(path)):null;if(current&&await hashBytes(current)===expectedHash){completed++;continue;}await this.ensureParent(path);this.expectLocalMutation(path,expectedHash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));}
-      else if(stat){this.expectLocalMutation(path,null);await this.adapter.remove(path);}
+      await this.cooperate();const entry=targetMap.get(path),old=priorMap.get(path),stat=await this.adapter.stat(path);let currentHash:string|null=null;
+      if(stat?.type==="file")currentHash=await hashBytes(new Uint8Array(await this.adapter.readBinary(path)));
+      const priorHash=Object.prototype.hasOwnProperty.call(settings.pendingApplyPriorHashes,path)?settings.pendingApplyPriorHashes[path]:(old?.hash??null);
+      if(entry){
+        const expected=await this.deviceBytes(path,entry,cache,desktopOnly);if(currentHash===expected.hash){completed++;continue;}
+        if(currentHash!==null&&currentHash!==priorHash){preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);completed++;continue;}
+        await this.ensureParent(path);this.expectLocalMutation(path,expected.hash);await this.adapter.writeBinary(path,exactArrayBuffer(expected.clear));
+      }else if(stat){
+        if(old&&currentHash===old.hash){this.expectLocalMutation(path,null);await this.adapter.remove(path);}
+        else{preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);}
+      }
       completed++;if(this.progress(completed,pending.length))this.status({phase:"applying",message:"Resuming accepted device state",current:completed,total:pending.length});
     }
-    settings.pendingApplyPaths=[];await this.saveSettings();
+    settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();await this.saveSettings();
+    if(preserved)this.status({phase:"applying",message:`Preserved ${preserved} genuine local change${preserved===1?"":"s"} made during the interrupted download; they will reconcile normally`,level:"success"});
   }
 
   private async stageAndApply(snapshotId:string,final:Map<string,FileState>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<{downloaded:number;deleted:number}>{
     const changed=[...final].filter(([path,entry])=>physicalLocal.get(path)?.hash!==entry.hash).map(([path])=>path),removed=[...physicalLocal.keys()].filter((path)=>!final.has(path));
-    const settings=this.getSettings();settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[...new Set([...changed,...removed,...orphanUnreadableConflicts])].sort();settings.pendingPaths=[];settings.pendingPathTimes={};await this.saveSettings();
-    const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);settings.pendingApplyPaths=[];await this.saveSettings();return result;
+    const settings=this.getSettings(),baseId=settings.lastSnapshotId;settings.pendingApplySnapshotId=snapshotId;settings.pendingApplyBaseSnapshotId=baseId;settings.pendingApplyPaths=[...new Set([...changed,...removed,...orphanUnreadableConflicts])].sort();
+    settings.pendingApplyPriorHashes=Object.fromEntries(settings.pendingApplyPaths.map((path)=>[path,physicalLocal.get(path)?.hash??null]));
+    for(const path of removed){const previous=physicalLocal.get(path);if(previous)settings.retiredPaths[path]={hash:previous.hash,snapshotId,retiredAt:Date.now()};}
+    settings.pendingPaths=[];settings.pendingPathTimes={};this.trimRetiredPaths();await this.saveSettings();
+    const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);
+    settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};await this.saveSettings();return result;
   }
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
-    const requestedBaseId=settings.lastSnapshotId;
+    let requestedBaseId=settings.lastSnapshotId;
     const pendingPaths=[...new Set(settings.pendingPaths.map((path)=>normalizePath(path)).filter(Boolean))];
     const lastAudit=settings.lastFullScanAt?Date.parse(settings.lastFullScanAt):0,auditDue=!lastAudit||Date.now()-lastAudit>=6*60*60*1000;
     this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
@@ -312,7 +343,7 @@ export class SyncEngine {
       return {uploaded:0,downloaded:0,deleted:0,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
     const remoteSnapshot=(await this.api.state()).head;
-    if(settings.pendingApplyPaths.length)await this.resumePendingApplication(remoteSnapshot);
+    if(settings.pendingApplyPaths.length){await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;}
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
     const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
     const fullScan=settings.fullScanRequired||!settings.initialized||!baseSnapshot||auditDue;
@@ -347,7 +378,17 @@ export class SyncEngine {
         this.status({phase:"merging",message:overlap>=0.9?`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`:`Interrupted onboarding recognized · ${exactUserMatches}/${localUserFiles.length} local user files already match; resuming the server-first download while preserving local-only files`,level:"success"});
       }
     }
-    const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);} const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local),recognizedMoves=this.canonicalizeMoves(base,local,remote,effectiveBaseSnapshot,remoteSnapshot),final = new Map<string, FileState>();
+    const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);}
+    const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local);let suppressedRetired=0,retiredStateChanged=false;
+    for(const [path,retired] of Object.entries(settings.retiredPaths)){
+      const current=local.get(path);
+      if(remote.has(path)){delete settings.retiredPaths[path];retiredStateChanged=true;continue;}
+      if(current?.hash===retired.hash){local.delete(path);suppressedRetired++;continue;}
+      if(current){delete settings.retiredPaths[path];retiredStateChanged=true;}
+    }
+    this.trimRetiredPaths();if(retiredStateChanged)await this.saveSettings();
+    if(suppressedRetired)this.status({phase:"merging",message:`Removed ${suppressedRetired} stale retired path${suppressedRetired===1?"":"s"} that reappeared after an earlier accepted move or deletion`,level:"success"});
+    const recognizedMoves=this.canonicalizeMoves(base,local,remote,effectiveBaseSnapshot,remoteSnapshot),final = new Map<string, FileState>();
     const bytes = new Map<string, Uint8Array>(); const remoteCache = new Map<string, Uint8Array>();
     const paths = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);const occupied=new Set(paths);
     let conflicts = 0,resolved=0; this.status({phase:"merging",message:`Comparing ${paths.size} paths · ${local.size} local · ${remote.size} remote · ${base.size} baseline`});

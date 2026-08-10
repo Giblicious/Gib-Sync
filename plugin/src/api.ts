@@ -6,7 +6,7 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.33";
+export const CLIENT_VERSION="0.8.34";
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
@@ -27,6 +27,7 @@ export class GibSyncApi {
     return response.json as T;
   }
   discover(server:string,seafileUrl:string,seafileUsername:string,seafilePassword:string) { return this.json<StorageDiscovery>("POST","/v1/storage/discover",{seafileUrl,seafileUsername,seafilePassword},undefined,server); }
+  serverInfo(server:string){return this.json<Pick<SetupResponse,"protocolVersion"|"serverVersion"|"serverCapabilities">>("GET","/healthz",undefined,undefined,server);}
   setup(server: string, body: StorageSetupRequest) { return this.json<SetupResponse>("POST", "/v1/setup", body, undefined, server); }
   state() { return this.json<SyncState>("GET", "/v1/state", undefined, this.settings().deviceToken); }
   headState() { return this.json<{headId:string|null}>("GET", "/v1/head", undefined, this.settings().deviceToken); }
