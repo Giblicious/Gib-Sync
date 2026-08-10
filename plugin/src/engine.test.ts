@@ -11,19 +11,21 @@ import { DEFAULT_SETTINGS, type GibSyncSettings } from "./settings";
 beforeAll(() => Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true }));
 
 class MemoryAdapter {
-  files = new Map<string, Uint8Array>(); dirs = new Set<string>();listCalls=0;readCalls:string[]=[];writeCalls:string[]=[];
+  files = new Map<string, Uint8Array>(); dirs = new Set<string>();dirMtimes=new Map<string,number>();listCalls=0;readCalls:string[]=[];writeCalls:string[]=[];
   async list(path: string) {
     this.listCalls++;
     const prefix = path ? `${path}/` : ""; const files: string[] = [], folders = new Set<string>();
     for (const name of this.files.keys()) if (name.startsWith(prefix)) { const rest = name.slice(prefix.length); const slash = rest.indexOf("/"); if (slash < 0) files.push(name); else folders.add(`${prefix}${rest.slice(0,slash)}`); }
+    for(const name of this.dirs)if(name.startsWith(prefix)&&name!==path){const rest=name.slice(prefix.length),slash=rest.indexOf("/");folders.add(slash<0?name:`${prefix}${rest.slice(0,slash)}`);}
     return { files, folders:[...folders] };
   }
   async readBinary(path: string) { this.readCalls.push(path);return this.files.get(path)!.slice().buffer; }
   async writeBinary(path: string, data: ArrayBuffer) { this.writeCalls.push(path);this.files.set(path, new Uint8Array(data)); }
-  async stat(path: string) { const bytes = this.files.get(path); return bytes ? {type:"file" as const,ctime:1,mtime:1,size:bytes.length} : null; }
+  async stat(path: string) { const bytes = this.files.get(path); if(bytes)return {type:"file" as const,ctime:1,mtime:1,size:bytes.length};return this.dirs.has(path)?{type:"folder" as const,ctime:1,mtime:this.dirMtimes.get(path)??1,size:0}:null; }
   async exists(path: string) { return this.files.has(path) || this.dirs.has(path); }
-  async mkdir(path: string) { this.dirs.add(path); }
+  async mkdir(path: string) { this.dirs.add(path);this.dirMtimes.set(path,Date.now()); }
   async remove(path: string) { this.files.delete(path); }
+  async rmdir(path:string,_recursive:boolean){const prefix=`${path}/`;if([...this.files.keys()].some((name)=>name.startsWith(prefix))||[...this.dirs].some((name)=>name.startsWith(prefix)))throw new Error("folder is not empty");this.dirs.delete(path);this.dirMtimes.delete(path);}
 }
 
 class MemoryApi {
@@ -63,6 +65,31 @@ describe("SyncEngine", () => {
     api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();adapter.files.set("stable.md",clear);
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result).toMatchObject({uploaded:0,downloaded:0,fullScan:false});expect(adapter.listCalls).toBe(0);expect(adapter.readCalls).toEqual([]);
+  });
+  it("prunes persisted empty retired folders during an otherwise lightweight sync",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000012",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Legacy/Nested/old.md":{hash,snapshotId:head.id,retiredAt}};
+    adapter.files.set("stable.md",clear);for(const path of ["Legacy","Legacy/Nested"]){adapter.dirs.add(path);adapter.dirMtimes.set(path,retiredAt-1000);}
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,downloaded:0,prunedFolders:2,fullScan:false});expect(adapter.dirs.has("Legacy")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(config.lastFolderCleanupAt).toBe(retiredAt);expect(adapter.readCalls).toEqual([]);
+  });
+  it("preserves an empty retired folder that was recreated after the accepted deletion",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000013",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Recreated/old.md":{hash,snapshotId:head.id,retiredAt}};
+    adapter.files.set("stable.md",clear);adapter.dirs.add("Recreated");adapter.dirMtimes.set("Recreated",retiredAt+60_000);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(0);expect(adapter.dirs.has("Recreated")).toBe(true);expect(config.lastFolderCleanupAt).toBe(retiredAt);
+  });
+  it("removes only the empty source branch after an accepted folder move",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("moved\n"),keep=new TextEncoder().encode("keep\n"),noteHash=await hashBytes(note),keepHash=await hashBytes(keep),createdAt=new Date().toISOString();
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000014",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt,message:"Base",entries:[{path:"Legacy/Nested/note.md",hash:noteHash,size:note.length,mtime:1},{path:"Legacy/keep.md",hash:keepHash,size:keep.length,mtime:1}]};
+    const remote:Snapshot={id:"00000000-0000-4000-8000-000000000015",vaultId:"vault",parentId:base.id,deviceId:"mobile",deviceName:"Mobile",createdAt:new Date(Date.now()+1000).toISOString(),message:"Move",entries:[{path:"Current/note.md",hash:noteHash,size:note.length,mtime:2},{path:"Legacy/keep.md",hash:keepHash,size:keep.length,mtime:1}]};
+    api.head=remote;api.snapshots.set(base.id,base);api.blobs.set(noteHash,await encryptBlob(note,config.vaultKey,noteHash));api.blobs.set(keepHash,await encryptBlob(keep,config.vaultKey,keepHash));config.initialized=true;config.lastSnapshotId=base.id;
+    adapter.files.set("Legacy/Nested/note.md",note);adapter.files.set("Legacy/keep.md",keep);for(const path of ["Legacy","Legacy/Nested"]){adapter.dirs.add(path);adapter.dirMtimes.set(path,1);}
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(1);expect(adapter.files.get("Current/note.md")).toEqual(note);expect(adapter.files.has("Legacy/Nested/note.md")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(adapter.dirs.has("Legacy")).toBe(true);expect(adapter.files.get("Legacy/keep.md")).toEqual(keep);
   });
   it("hashes only journaled paths and preserves the rest of the baseline",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),oldChanged=new TextEncoder().encode("old\n"),changed=new TextEncoder().encode("new\n"),stable=new TextEncoder().encode("stable\n");
@@ -157,7 +184,7 @@ describe("SyncEngine", () => {
     config.initialized=true;adapter.files.set("note.md",new TextEncoder().encode("suspicious rewrite\n"));adapter.files.set("extra.md",new TextEncoder().encode("delete me\n"));
     api.blobs.set(hash,await encryptBlob(accepted,config.vaultKey,hash));api.head={id:"00000000-0000-4000-8000-000000000202",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Accepted",entries:[{path:"note.md",hash,size:accepted.length,mtime:1}]};
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
-    await expect(engine.restoreAcceptedSnapshot()).resolves.toEqual({downloaded:1,deleted:1});expect(adapter.files.get("note.md")).toEqual(accepted);expect(adapter.files.has("extra.md")).toBe(false);expect(config.lastSnapshotId).toBe(api.head.id);
+    await expect(engine.restoreAcceptedSnapshot()).resolves.toEqual({downloaded:1,deleted:1,prunedFolders:0});expect(adapter.files.get("note.md")).toEqual(accepted);expect(adapter.files.has("extra.md")).toBe(false);expect(config.lastSnapshotId).toBe(api.head.id);
   });
   it("lets mobile ignore desktop plugins without deleting their remote copies",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.syncPlugins=false;

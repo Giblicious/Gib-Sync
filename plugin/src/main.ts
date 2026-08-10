@@ -61,7 +61,7 @@ export default class GibSyncPlugin extends Plugin {
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("create", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
-    this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){this.recordPathTime(file.path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path),expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder){this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
@@ -263,7 +263,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     assertSetupServerCompatible(setup);
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken, deviceName, storage:setup.storage, lastSnapshotId: null, initialized: false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},fullScanRequired:true,lastFullScanAt:null });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},lastFolderCleanupAt:0,fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
@@ -341,7 +341,7 @@ export default class GibSyncPlugin extends Plugin {
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     const startingVersions=new Map(this.pathVersions),startingPathTimes={...this.settings.pendingPathTimes};
     try {
-      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.prunedFolders} empty folders removed · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
       for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
       for(const [path,time] of Object.entries(startingPathTimes))if(this.settings.pendingPathTimes[path]===time&&(result.fullScan||result.processedPaths.includes(path)))delete this.settings.pendingPathTimes[path];
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
@@ -349,7 +349,7 @@ export default class GibSyncPlugin extends Plugin {
       this.changedDuringReadFailures.clear();
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
-      this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
+      this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
       await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
       runSucceeded=true;
