@@ -44,7 +44,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     closing=true;
     for(const [vaultId] of watchWaiters)notifyVault(vaultId,null);
     if(externalTimer)clearInterval(externalTimer);if(externalStartupTimer)clearTimeout(externalStartupTimer);
-    for(const timer of mirrorTimers)clearTimeout(timer);await Promise.allSettled([...mirrorJobs.values()]);await externalImporter.settle();store.db.close();
+    for(const {timer} of mirrorTimers.values())clearTimeout(timer);mirrorTimers.clear();await Promise.allSettled([...mirrorJobs.values()]);await externalImporter.settle();store.db.close();
   });
   await app.register(cors, { origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],exposedHeaders:["X-Content-SHA256"] });
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
@@ -85,7 +85,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return {missing,lingering};
   }
 
-  const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Set<NodeJS.Timeout>();
+  const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Map<string,{timer:NodeJS.Timeout;due:number}>();
   async function ingestExternalChanges(vaultId:string,fresh=false):Promise<ExternalImportResult>{
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
     const activeMirror=fresh?mirrorJobs.get(vaultId):undefined;
@@ -141,7 +141,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
       const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>headStillCurrent()&&!externalScanRequests.has(vaultId);let superseded=false;
       for(const entry of snapshot.entries){if(!mayContinue()){superseded=true;break;}const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash&&visible.get(entry.path)?.size===entry.size)continue;
-        const encrypted=await storage.get(row,`blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`);const clear=decryptVaultBlob(encrypted,key,entry.hash);mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.putReadable(row,entry.path,clear);
+        const encrypted=await loadEncryptedBlob(vaultId,entry.hash);if(!encrypted)throw new Error(`Encrypted blob is unavailable for ${entry.path}`);const clear=decryptVaultBlob(encrypted,key,entry.hash);mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.putReadable(row,entry.path,clear);
         if(!mayContinue()){superseded=true;break;}
         store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",vaultId,entry.path,entry.hash,clear.length,new Date().toISOString());}
       if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
@@ -155,7 +155,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);})().catch((error)=>{app.log.error({err:error,vaultId},"Readable mirror reconciliation failed");scheduleMirror(vaultId,5000);}).finally(()=>mirrorJobs.delete(vaultId));
     mirrorJobs.set(vaultId,job);return job;
   }
-  function scheduleMirror(vaultId:string,delay=2000){if(closing)return;const timer=setTimeout(()=>{mirrorTimers.delete(timer);if(!closing)void reconcileReadableMirror(vaultId);},delay);timer.unref();mirrorTimers.add(timer);}
+  function scheduleMirror(vaultId:string,delay=2000){
+    if(closing)return;const due=Date.now()+delay,scheduled=mirrorTimers.get(vaultId);if(scheduled&&scheduled.due<=due)return;if(scheduled)clearTimeout(scheduled.timer);
+    const timer=setTimeout(()=>{mirrorTimers.delete(vaultId);if(!closing)void reconcileReadableMirror(vaultId);},delay);timer.unref();mirrorTimers.set(vaultId,{timer,due});
+  }
 
   function setupResponse(vaultId: string, vaultName: string, deviceId: string, deviceToken: string): SetupResponse {
     const vault = store.one<{wrapped_key: string; head_id: string | null}>("SELECT wrapped_key,head_id FROM vaults WHERE id=?", vaultId)!;
