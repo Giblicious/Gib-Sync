@@ -42,15 +42,21 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
   const modified=[...after.values()].filter((entry)=>before.has(entry.path)&&before.get(entry.path)!.hash!==entry.hash)
     .map<ChangeItem>((entry)=>({path:entry.path,kind:"modified",previousSize:before.get(entry.path)!.size,size:entry.size}));
   const changes=[...deleted,...created,...modified,...moved].sort((left,right)=>left.path.localeCompare(right.path));
-  const relevantPrevious=previous.length-(allRawDeleted.length-rawDeleted.length),baseline=Math.max(1,relevantPrevious),totalChanged=changes.length,riskyChanged=deleted.length+created.length+modified.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
+  const relevantPrevious=previous.length-(allRawDeleted.length-rawDeleted.length),baseline=Math.max(1,relevantPrevious),totalChanged=changes.length,affectedPercent=Math.round(totalChanged/baseline*1000)/10;
   const resized=[...modified,...moved];
   const bytesRemoved=deleted.reduce((sum,item)=>sum+(item.previousSize??0),0)+resized.reduce((sum,item)=>sum+Math.max(0,(item.previousSize??0)-(item.size??0)),0);
   const bytesAdded=created.reduce((sum,item)=>sum+(item.size??0),0)+resized.reduce((sum,item)=>sum+Math.max(0,(item.size??0)-(item.previousSize??0)),0);
   const reasons:string[]=[];
   if(deleted.length>=policy.deletionCount)reasons.push(`${deleted.length} files would be deleted`);
   if(deleted.length>=policy.smallVaultDeletionCount&&deleted.length/baseline*100>=policy.smallVaultDeletionPercent)reasons.push(`${Math.round(deleted.length/baseline*100)}% of the vault would be deleted`);
-  if(riskyChanged>=policy.changedCount)reasons.push(`${riskyChanged} files would change beyond recognized moves`);
-  if(riskyChanged/baseline*100>=policy.changedPercent&&riskyChanged>=5)reasons.push(`${Math.round(riskyChanged/baseline*1000)/10}% of the vault would change beyond recognized moves`);
+  // Large additions and ordinary edits are normal synchronization, not data
+  // loss. The broad change thresholds apply only to deletes and files that
+  // have been mostly emptied; snapshots remain the quiet recovery layer for
+  // non-destructive bulk work.
+  const mostlyEmptied=modified.filter((item)=>(item.previousSize??0)>=1024&&(item.size??0)<(item.previousSize??0)*0.25);
+  const destructiveChanged=deleted.length+mostlyEmptied.length;
+  if(destructiveChanged>=policy.changedCount)reasons.push(`${destructiveChanged} files would be deleted or mostly emptied`);
+  if(destructiveChanged/baseline*100>=policy.changedPercent&&destructiveChanged>=5)reasons.push(`${Math.round(destructiveChanged/baseline*1000)/10}% of the vault would be deleted or mostly emptied`);
   const folderCounts=new Map<string,number>();for(const item of deleted){const folder=item.path.split("/")[0];folderCounts.set(folder,(folderCounts.get(folder)??0)+1);}
   for(const [folder,count] of folderCounts)if(count>=policy.folderImpactCount)reasons.push(`${count} files would leave ${folder||"the vault root"}`);
   const growth=resized.filter((item)=>(item.size??0)-(item.previousSize??0)>=policy.fileGrowthBytes||((item.previousSize??0)>=1024*1024&&(item.size??0)/(item.previousSize??1)*100>=policy.fileGrowthPercent));
@@ -83,20 +89,22 @@ export class SafeguardService{
       trustedUntil:row.trusted_device_id===deviceId&&row.trusted_until&&Date.parse(row.trusted_until)>Date.now()?row.trusted_until:null,
       pendingQuarantines:this.store.one<{count:number}>("SELECT COUNT(*) count FROM quarantines WHERE vault_id=? AND status='pending'",vaultId)?.count??0};
   }
-  propose(proposal:Proposal):{allowed:boolean;locked:boolean;assessment:ChangeAssessment;quarantine:QuarantineItem|null;created:boolean}{
+  propose(proposal:Proposal):{allowed:boolean;locked:boolean;assessment:ChangeAssessment;quarantine:QuarantineItem|null;created:boolean;authorization:"policy"|"trusted_window"|"quarantine"|"locked"}{
     const vault=this.store.one<VaultSafetyRow&{head_id:string|null}>("SELECT head_id,safeguard_policy,write_locked_at,write_locked_by,trusted_until,trusted_device_id FROM vaults WHERE id=?",proposal.vaultId)!;
     const previous=vault.head_id?this.store.getSnapshot(vault.head_id)?.entries??[]:[];
     const {assessment,changes}=assessChanges(previous,proposal.entries,this.policy(proposal.vaultId),proposal.signals);
-    if(vault.write_locked_at)return {allowed:false,locked:true,assessment,quarantine:null,created:false};
+    if(vault.write_locked_at)return {allowed:false,locked:true,assessment,quarantine:null,created:false,authorization:"locked"};
     const trusted=vault.trusted_device_id===proposal.deviceId&&vault.trusted_until&&Date.parse(vault.trusted_until)>Date.now();
-    if(!assessment.reasons.length||!previous.length||trusted)return {allowed:true,locked:false,assessment,quarantine:null,created:false};
+    const hardReason=assessment.reasons.some((reason)=>/out-of-date device|completely empty|Protected path|grew unexpectedly|mostly emptied|high-entropy/i.test(reason));
+    const explicitReview=Boolean(assessment.reasons.length&&(proposal.source==="seafile"||assessment.deleted>0||hardReason));
+    if(!assessment.reasons.length||!previous.length||(trusted&&!explicitReview))return {allowed:true,locked:false,assessment,quarantine:null,created:false,authorization:trusted?"trusted_window":"policy"};
     const manifest=JSON.stringify([...proposal.entries].sort((a,b)=>a.path.localeCompare(b.path)));
     const proposalHash=sha256(Buffer.from(JSON.stringify({parentId:proposal.parentId,message:proposal.message,manifest})));
     const existing=this.store.one<{id:string}>("SELECT id FROM quarantines WHERE vault_id=? AND proposal_hash=? AND status='pending'",proposal.vaultId,proposalHash);
     const id=existing?.id??randomUUID(),createdAt=new Date().toISOString(),expiresAt=new Date(Date.now()+7*24*60*60*1000).toISOString();
     if(!existing)this.store.run("INSERT INTO quarantines(id,vault_id,proposal_hash,source,device_id,device_name,parent_id,created_at,expires_at,status,message,manifest_json,assessment_json,changes_json) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
       id,proposal.vaultId,proposalHash,proposal.source,proposal.deviceId,proposal.deviceName,proposal.parentId,createdAt,expiresAt,proposal.message,manifest,JSON.stringify(assessment),JSON.stringify(changes));
-    return {allowed:false,locked:false,assessment,created:!existing,quarantine:{id,proposalHash,source:proposal.source,deviceId:proposal.deviceId,deviceName:proposal.deviceName,parentId:proposal.parentId,
+    return {allowed:false,locked:false,assessment,created:!existing,authorization:"quarantine",quarantine:{id,proposalHash,source:proposal.source,deviceId:proposal.deviceId,deviceName:proposal.deviceName,parentId:proposal.parentId,
       createdAt,expiresAt,status:"pending",message:proposal.message,assessment,changes}};
   }
   list(vaultId:string):QuarantineItem[]{

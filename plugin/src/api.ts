@@ -1,12 +1,12 @@
 import { requestUrl } from "obsidian";
-import { PROTOCOL_VERSION, type ClientCompatibility, type CommitRequest, type HealthRepairResult, type HistoryItem, type ManifestEntry, type MirrorCompleteResponse, type MirrorPlanResponse, type QuarantineItem, type QuickCodeClaim, type QuickCodePairing, type RestorePreview, type SafeguardPolicy, type SafeguardState, type ServerStatus, type SetupResponse, type Snapshot, type StorageDiscovery, type StorageSetupRequest, type SyncState, type WatchResponse } from "@gib-sync/protocol";
+import { PROTOCOL_VERSION, type ClientCompatibility, type CommitRequest, type HealthRepairResult, type HistoryItem, type ManifestEntry, type MirrorCompleteResponse, type MirrorPlanResponse, type QuarantineItem, type QuickCodeClaim, type QuickCodePairing, type RestorePreview, type SafeguardPolicy, type SafeguardState, type SelectiveRestorePlan, type SelectiveRestorePreview, type ServerStatus, type SetupResponse, type Snapshot, type StorageDiscovery, type StorageSetupRequest, type SyncState, type WatchResponse } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.32";
+export const CLIENT_VERSION="0.8.33";
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
@@ -38,6 +38,9 @@ export class GibSyncApi {
   commit(body: CommitRequest) { return this.json<Snapshot>("POST", "/v1/commit", body, this.settings().deviceToken); }
   restorePreview(id:string){return this.json<RestorePreview>("GET",`/v1/restore/${id}/preview`,undefined,this.settings().deviceToken);}
   restore(id: string,confirmToken:string) { return this.json<Snapshot>("POST", `/v1/restore/${id}`, {confirmToken}, this.settings().deviceToken); }
+  selectiveRestorePlan(id:string){return this.json<SelectiveRestorePlan>("GET",`/v1/restore/${id}/changes`,undefined,this.settings().deviceToken);}
+  selectiveRestorePreview(id:string,changeIds:string[]){return this.json<SelectiveRestorePreview>("POST",`/v1/restore/${id}/paths/preview`,{changeIds},this.settings().deviceToken);}
+  selectiveRestore(id:string,changeIds:string[],confirmToken:string){return this.json<Snapshot>("POST",`/v1/restore/${id}/paths`,{changeIds,confirmToken},this.settings().deviceToken);}
   safeguards(){return this.json<SafeguardState>("GET","/v1/safeguards",undefined,this.settings().deviceToken);}
   updateSafeguardPolicy(policy:SafeguardPolicy){return this.json<SafeguardState>("PUT","/v1/safeguards/policy",policy,this.settings().deviceToken);}
   setWriteLock(locked:boolean){return this.json<SafeguardState>("POST","/v1/safeguards/lock",{locked},this.settings().deviceToken);}

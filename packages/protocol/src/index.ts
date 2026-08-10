@@ -310,3 +310,16 @@ export interface RestorePreview {
   confirmToken: string;
   expiresAt: string;
 }
+
+export interface SelectiveRestoreChange extends ChangeItem {
+  id: string;
+}
+
+export interface SelectiveRestorePlan {
+  snapshotId: string;
+  changes: SelectiveRestoreChange[];
+}
+
+export interface SelectiveRestorePreview extends RestorePreview {
+  selectedChanges: number;
+}

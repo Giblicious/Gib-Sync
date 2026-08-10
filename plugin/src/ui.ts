@@ -1,5 +1,5 @@
 import { App, Modal, Notice, Platform, PluginSettingTab, Setting, setIcon } from "obsidian";
-import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, QuarantineItem, SafeguardPolicy, SeafileLibrary, SetupResponse } from "@gib-sync/protocol";
+import type { ChangeAssessment, DeviceInfo, ExistingVaultLocation, HistoryItem, QuarantineItem, SafeguardPolicy, SeafileLibrary, SelectiveRestoreChange, SetupResponse } from "@gib-sync/protocol";
 import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
 import { isGibSyncConflictPath,shouldSyncChangedPath } from "./settings";
@@ -119,13 +119,32 @@ export class QuickCodeEntryModal extends Modal {
   onClose(){this.contentEl.empty();}
 }
 
+class SelectiveRestoreModal extends Modal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly snapshot:HistoryItem,private readonly restored:()=>void){super(app);}
+  async onOpen(){mobileContent(this.contentEl);this.setTitle("Restore selected files");this.contentEl.empty();const status=this.contentEl.createEl("p",{text:"Loading changed files…"});
+    try{const plan=await this.plugin.api.selectiveRestorePlan(this.snapshot.id);status.remove();if(!plan.changes.length){this.contentEl.createEl("p",{text:"This snapshot already matches the current vault."});return;}
+      const selected=new Set<string>(),controls=this.contentEl.createDiv({cls:"gib-sync-row-actions"}),search=this.contentEl.createEl("input",{cls:"gib-sync-selective-restore-search"}),list=this.contentEl.createDiv({cls:"gib-sync-selective-restore-list"});search.type="search";search.placeholder="Filter changed paths";
+      const rows=new Map<string,HTMLInputElement>(),render=()=>{const query=search.value.trim().toLowerCase(),matches=plan.changes.filter((change)=>!query||change.path.toLowerCase().includes(query)||(change.previousPath??"").toLowerCase().includes(query));list.empty();rows.clear();for(const change of matches.slice(0,400))this.changeRow(list,change,selected,rows);if(matches.length>400)list.createDiv({cls:"gib-sync-muted",text:`Showing 400 of ${matches.length} matches. Refine the filter to see a specific path.`});};
+      const setAll=(value:boolean)=>{selected.clear();if(value)for(const change of plan.changes.slice(0,5000))selected.add(change.id);render();};
+      controls.createEl("button",{text:plan.changes.length>5000?"Select first 5,000":"Select all"}).onclick=()=>setAll(true);controls.createEl("button",{text:"Clear"}).onclick=()=>setAll(false);search.oninput=render;render();
+      const review=controls.createEl("button",{text:"Review restore",cls:"mod-cta"});review.onclick=async()=>{if(!selected.size){new Notice("Select at least one file change to restore.");return;}review.disabled=true;try{const ids=[...selected],preview=await this.plugin.api.selectiveRestorePreview(this.snapshot.id,ids),reasons=preview.assessment.reasons.length?`\n\nWarnings:\n- ${preview.assessment.reasons.join("\n- ")}`:"";
+        if(!await confirmAction(this.app,"Restore selected files",`${assessmentText(preview.assessment)}${reasons}\n\nOnly the ${preview.selectedChanges} selected historical change${preview.selectedChanges===1?"":"s"} will be applied. Current history remains available.`,"Restore selected",preview.assessment.deleted>0)){review.disabled=false;return;}
+        await this.plugin.api.selectiveRestore(this.snapshot.id,ids,preview.confirmToken);this.close();this.restored();await this.plugin.runSync();new Notice(`${ids.length} selected historical change${ids.length===1?"":"s"} restored`);
+      }catch(error){new Notice(`Selective restore failed: ${error instanceof Error?error.message:String(error)}`,10000);review.disabled=false;}};
+    }catch(error){status.setText(error instanceof Error?error.message:String(error));}}
+  private changeRow(container:HTMLElement,change:SelectiveRestoreChange,selected:Set<string>,rows:Map<string,HTMLInputElement>){const label=container.createEl("label",{cls:"gib-sync-selective-restore-row"}),input=label.createEl("input");input.type="checkbox";input.checked=selected.has(change.id);rows.set(change.id,input);input.onchange=()=>{if(input.checked)selected.add(change.id);else selected.delete(change.id);};
+    label.createSpan({text:`${change.kind}: ${change.previousPath?`${change.previousPath} → `:""}${change.path}`});}
+  onClose(){this.contentEl.empty();}
+}
+
 export class HistoryModal extends Modal {
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Gib Sync history");this.contentEl.empty();const container=this.contentEl.createDiv({cls:"gib-sync-history"});container.setText("Loading…");try{const history=await this.plugin.api.history();container.empty();for(const item of history)this.row(container,item);if(!history.length)container.setText("No snapshots yet.");}catch(error){container.setText(error instanceof Error?error.message:String(error));}}
   private row(container:HTMLElement,item:HistoryItem){const row=container.createDiv({cls:"gib-sync-history-row"});const details=row.createDiv();details.createEl("strong",{text:`${item.bookmarked?"★ ":""}${item.message}`});details.createEl("div",{cls:"gib-sync-muted",text:`${new Date(item.createdAt).toLocaleString()} · ${item.deviceName} · ${item.fileCount} files`});
     const actions=row.createDiv({cls:"gib-sync-row-actions"}),bookmark=actions.createEl("button",{text:item.bookmarked?"Unbookmark":"Bookmark"});
     bookmark.onclick=async()=>{bookmark.disabled=true;try{if(item.bookmarked)await this.plugin.api.unbookmark(item.id);else{const label=await promptText(this.app,"Bookmark snapshot","Bookmark label","Known good");if(label===null){bookmark.disabled=false;return;}await this.plugin.api.bookmark(item.id,label||"Known good");}this.onOpen();}catch(error){new Notice(error instanceof Error?error.message:String(error));bookmark.disabled=false;}};
-    const button=actions.createEl("button",{text:"Preview restore"});button.onclick=async()=>{button.disabled=true;try{const preview=await this.plugin.api.restorePreview(item.id);
+    const selected=actions.createEl("button",{text:"Restore files"});selected.onclick=()=>new SelectiveRestoreModal(this.app,this.plugin,item,()=>this.close()).open();
+    const button=actions.createEl("button",{text:"Restore all"});button.onclick=async()=>{button.disabled=true;try{const preview=await this.plugin.api.restorePreview(item.id);
       const reasons=preview.assessment.reasons.length?`\n\nWarnings:\n- ${preview.assessment.reasons.join("\n- ")}`:"";
       if(!await confirmAction(this.app,"Restore snapshot",`${assessmentText(preview.assessment)}${reasons}\n\nThis creates a new snapshot and preserves current history.`,"Restore",true)){button.disabled=false;return;}
       await this.plugin.api.restore(item.id,preview.confirmToken);this.close();await this.plugin.runSync();new Notice("Snapshot restored");
@@ -140,14 +159,16 @@ export class SafeguardReviewModal extends Modal{
     const card=this.contentEl.createDiv({cls:"gib-sync-safeguard-card"});card.createEl("h3",{text:`${item.deviceName} · ${item.source==="seafile"?"Seafile/WebDAV":"Obsidian device"}`});
     card.createEl("p",{text:assessmentText(item.assessment)});const reasons=card.createEl("ul");for(const reason of item.assessment.reasons)reasons.createEl("li",{text:reason});
     const deleted=item.changes.filter((change)=>change.kind==="deleted"),verifiedCleanup=item.source==="device"&&deleted.length>0&&deleted.every((change)=>isGibSyncConflictPath(change.path));
+    if(item.source==="seafile"&&deleted.length){const folders=[...new Set(deleted.map((change)=>change.path.split("/")[0]||"Vault root"))],warning=card.createDiv({cls:"gib-sync-attention-card is-warning"});warning.createEl("strong",{text:"External deletion requires one-time approval"});warning.createEl("p",{text:`Seafile reports ${deleted.length} missing file${deleted.length===1?"":"s"} (${bytes(item.assessment.bytesRemoved)}) across ${folders.slice(0,4).join(", ")}${folders.length>4?` and ${folders.length-4} more`:""}. Maintenance and prior trust never approve this batch automatically.`});}
     if(verifiedCleanup){const explanation=card.createDiv({cls:"gib-sync-attention-card is-warning"});explanation.createEl("strong",{text:"Recognized Gib Sync conflict cleanup"});explanation.createEl("p",{text:`All ${deleted.length} deleted files are generated conflict copies. This batch also contains ${item.assessment.modified} edited note${item.assessment.modified===1?"":"s"}. Approving maintenance keeps exactly these local results and temporarily permits the rest of your cleanup.`});}
     const disclosure=card.createEl("details");disclosure.createEl("summary",{text:`Review ${item.changes.length} changed paths`});const list=disclosure.createEl("ul",{cls:"gib-sync-change-list"});
     for(const change of item.changes)list.createEl("li",{text:`${change.kind}: ${change.previousPath?`${change.previousPath} → `:""}${change.path}`});
     const actions=card.createDiv({cls:"gib-sync-row-actions"});
-    const approve=actions.createEl("button",{text:"Approve once"}),trustMinutes=verifiedCleanup?60:15,trust=actions.createEl("button",{text:verifiedCleanup?"Approve cleanup + maintain 60 min":"Approve + trust 15 min"}),reject=actions.createEl("button",{text:"Reject and restore"});
-    const disable=()=>{approve.disabled=true;trust.disabled=true;reject.disabled=true;};
+    const trustEligible=item.source==="device"&&!item.assessment.deleted&&!item.assessment.reasons.some((reason)=>/out-of-date device|completely empty|protected path|grew unexpectedly|mostly emptied|high-entropy/i.test(reason));
+    const approve=actions.createEl("button",{text:"Approve once"}),trustMinutes=verifiedCleanup?60:15,trust=trustEligible?actions.createEl("button",{text:verifiedCleanup?"Approve cleanup + maintain 60 min":"Approve + trust 15 min"}):null,reject=actions.createEl("button",{text:"Reject and restore"});
+    const disable=()=>{approve.disabled=true;if(trust)trust.disabled=true;reject.disabled=true;};
     approve.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id);this.close();await this.plugin.runSync();new Notice("Quarantined changes approved");}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
-    trust.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id,trustMinutes);this.close();await this.plugin.runSync();new Notice(`Changes approved; this device is in maintenance for ${trustMinutes} minutes`);}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
+    if(trust)trust.onclick=async()=>{disable();try{await this.plugin.api.approveQuarantine(item.id,trustMinutes);this.close();await this.plugin.runSync();new Notice(`Changes approved; this device is in maintenance for ${trustMinutes} minutes`);}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
     reject.onclick=async()=>{if(!await confirmAction(this.app,"Reject quarantined changes","Reject this entire change batch and restore this device to the last accepted snapshot?","Reject and restore",true))return;disable();try{await this.plugin.api.rejectQuarantine(item.id);const restored=await this.plugin.engine.restoreAcceptedSnapshot();this.close();new Notice(`Changes rejected · restored ${restored.downloaded} and removed ${restored.deleted} local files`,10000);void this.plugin.refreshServerStatus();}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);void this.onOpen();}};
   }
   onClose(){this.contentEl.empty();this.closed();}

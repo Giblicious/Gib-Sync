@@ -15,9 +15,9 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## Safety center
 
-Gib Sync evaluates every proposed snapshot before it becomes the shared vault head. Suspicious changes are held in quarantine without modifying the accepted snapshot or the readable recovery tree. Connected devices are notified immediately and can inspect every affected path before choosing **Approve once**, **Approve and trust for 15 minutes**, or **Reject and restore accepted snapshot**.
+Gib Sync evaluates every proposed snapshot before it becomes the shared vault head. Suspicious changes are held in quarantine without modifying the accepted snapshot or the readable recovery tree. Connected devices are notified immediately and can inspect every affected path before choosing **Approve once**, device-scoped maintenance for a non-external batch, or **Reject and restore accepted snapshot**. Seafile deletion batches always require one-time approval; neither prior approval nor a maintenance window can approve a later destructive batch.
 
-The built-in balanced and strict presets cover mass deletions, unusually broad changes, destructive folder operations, unexpected file growth, extension churn, high-entropy/ransomware-like content, protected-path deletion, and unexpectedly empty vaults. Every threshold and protected path can also be customized. Repeated copies of the same proposal reuse one quarantine item instead of creating alert spam.
+The built-in balanced and strict presets focus on data-loss signals: mass deletion, files being mostly emptied, destructive folder impact, unexpected file growth, extension churn, high-entropy/ransomware-like content, protected-path deletion, and unexpectedly empty vaults. Large additions, edits, and recognized moves proceed normally. Every threshold and protected path can also be customized. Repeated copies of the same proposal reuse one quarantine item instead of creating alert spam.
 
 Additional recovery controls include:
 
@@ -26,7 +26,7 @@ Additional recovery controls include:
 - Vault-location identity checks that pause sync if the configured vault name or filesystem location changes.
 - Safe previews before exclusion or `.obsidian` settings would remove files from the shared vault.
 - Device inventory, clock-skew and stale-device warnings, and immediate device revocation.
-- Preview-and-confirm restore with an expiring confirmation token.
+- Preview-and-confirm full or selected-file restore with an expiring confirmation token.
 - Named known-good snapshot bookmarks retained in immutable history.
 
 ## Storage layout
@@ -39,7 +39,8 @@ Selected Seafile library and folder
 │   └── image.png               # ordinary readable file
 └── .gib-sync/
     ├── blobs/                  # encrypted synchronization history
-    └── snapshots/              # immutable manifests
+    ├── snapshots/              # immutable manifests
+    └── readable-generation.gib # signed completed-mirror marker
 ```
 
 The readable tree is bidirectional. Downloading it produces an ordinary Obsidian vault without requiring Gib Sync, its database, or a vault encryption key. Direct changes from Seafile's web editor, WebDAV, desktop sync client, or another external source are detected, committed into Gib Sync history, and pushed to connected Obsidian devices.
@@ -56,7 +57,9 @@ Simultaneous edits use a lossless three-way policy:
 
 When a newly paired device already contains a vault, Gib Sync compares content hashes before writing anything. If at least 90% of the included files match the server exactly, it treats the vaults as copies: it downloads and verifies the current server head, keeps files unique to either side, and preserves both versions of every differing same-path file before publishing the union. Lower-overlap vaults remain blocked as likely mismatches.
 
-The mirror is crash-recoverable: the server records the hash of each successfully written readable file and the snapshot represented by the mirror. An interrupted operation is repaired on the next sync. A mirror is marked current only after every snapshot entry has been verified and obsolete files have been removed.
+The mirror is crash-recoverable: the server records each successfully written readable file and writes a signed completed-generation marker only after every expected path is visible and obsolete paths are gone. An interrupted operation resumes from the files that actually exist, even if the canonical vault advances again before completion. A missing readable file counts as a deletion only when it belonged to that committed generation and remains absent across repeated observations; partial-generation absence is never imported as deletion.
+
+This follows the same proven safety model used by database-backed two-way synchronizers: compare both sides to the last successfully synchronized state, recognize moves before delete/create pairs, and commit synchronization metadata only after the data operation succeeds. FreeFileSync documents these principles in its [two-way synchronization and move-detection model](https://freefilesync.org/manual.php?topic=synchronization-settings). Gib Sync implements the concepts independently for immutable snapshots, Seafile, and mobile Obsidian; it does not copy FreeFileSync source code.
 
 `.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes portable themes, snippets, hotkeys, and other settings, but workspace layout files always remain device-local. Concurrent JSON settings changes merge recursively by key; overlapping scalar or array values use the newer side, and non-JSON system files use the newer whole file. `.obsidian` system files never create user-facing conflict copies.
 

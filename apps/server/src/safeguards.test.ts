@@ -51,6 +51,19 @@ describe("safeguard assessment",()=>{
     const result=assessChanges(before,after,BALANCED_POLICY,{staleBaseline:true});
     expect(result.assessment).toMatchObject({created:0,deleted:0,modified:0,moved:30,totalChanged:30,reasons:[]});
   });
+  it("allows large legitimate additions and ordinary rewrite batches without approval noise",()=>{
+    const before=Array.from({length:200},(_,index)=>entry(`Existing/note-${index}.md`,`old-${index}`,2000));
+    const rewritten=before.map((item,index)=>({...item,hash:`new-${index}`.padEnd(64,"0"),size:2100}));
+    const created=Array.from({length:200},(_,index)=>entry(`Imported/note-${index}.md`,`added-${index}`,1800));
+    const result=assessChanges(before,[...rewritten,...created],BALANCED_POLICY);
+    expect(result.assessment).toMatchObject({created:200,modified:200,deleted:0,reasons:[]});
+  });
+  it("still guards mass rewrites that mostly empty files",()=>{
+    const before=Array.from({length:120},(_,index)=>entry(`Notes/note-${index}.md`,`old-${index}`,4000));
+    const emptied=before.map((item,index)=>({...item,hash:`empty-${index}`.padEnd(64,"0"),size:20}));
+    const result=assessChanges(before,emptied,BALANCED_POLICY);
+    expect(result.assessment.reasons).toContain("120 files would be deleted or mostly emptied");
+  });
   it("does not disguise unrelated mass deletion and replacement as a move",()=>{
     const before=Array.from({length:30},(_,index)=>entry(`Journal/entry-${index}.md`,`old-${index}`,1000));
     const after=Array.from({length:30},(_,index)=>entry(`Imports/unrelated-${index}.md`,`new-${index}`,1000));

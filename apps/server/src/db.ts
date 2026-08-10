@@ -12,13 +12,15 @@ export class Store {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS vaults(id TEXT PRIMARY KEY, name TEXT NOT NULL, wrapped_key TEXT NOT NULL, head_id TEXT, created_at TEXT NOT NULL,
         storage_url TEXT, storage_username TEXT, storage_repo_id TEXT, storage_repo_name TEXT, storage_base_path TEXT, storage_token TEXT, storage_layout TEXT,
-        mirror_base_path TEXT, mirror_head_id TEXT);
+        mirror_base_path TEXT, mirror_head_id TEXT, mirror_generation_id TEXT);
       CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, revoked_at TEXT);
       CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), parent_id TEXT, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created_at TEXT NOT NULL, message TEXT NOT NULL, manifest_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS snapshots_vault_created ON snapshots(vault_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS blobs(vault_id TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(vault_id, hash));
       CREATE TABLE IF NOT EXISTS pairings(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, secret_hash TEXT NOT NULL, created_by_device TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT);
       CREATE TABLE IF NOT EXISTS mirror_entries(vault_id TEXT NOT NULL REFERENCES vaults(id), path TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(vault_id,path));
+      CREATE TABLE IF NOT EXISTS external_absences(vault_id TEXT NOT NULL REFERENCES vaults(id), path TEXT NOT NULL, hash TEXT NOT NULL, mirror_head_id TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, observations INTEGER NOT NULL, PRIMARY KEY(vault_id,path));
       CREATE TABLE IF NOT EXISTS quarantines(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), proposal_hash TEXT NOT NULL, source TEXT NOT NULL,
         device_id TEXT NOT NULL, device_name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL,
         message TEXT NOT NULL, manifest_json TEXT NOT NULL, assessment_json TEXT NOT NULL, changes_json TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT);
@@ -29,7 +31,7 @@ export class Store {
         message TEXT NOT NULL, created_at TEXT NOT NULL, cleared_at TEXT);
     `);
     const columns = new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row) => row.name));
-    for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT"})) {
+    for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT",mirror_generation_id:"TEXT"})) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE vaults ADD COLUMN ${name} ${type}`);
     }
     const pairingColumns=new Set(this.all<{name:string}>("PRAGMA table_info(pairings)").map((row)=>row.name));
@@ -39,6 +41,9 @@ export class Store {
     const mirrorColumns=new Set(this.all<{name:string}>("PRAGMA table_info(mirror_entries)").map((row)=>row.name));
     if(!mirrorColumns.has("storage_id"))this.db.exec("ALTER TABLE mirror_entries ADD COLUMN storage_id TEXT");
     if(!mirrorColumns.has("storage_mtime"))this.db.exec("ALTER TABLE mirror_entries ADD COLUMN storage_mtime INTEGER");
+    const quarantineColumns=new Set(this.all<{name:string}>("PRAGMA table_info(quarantines)").map((row)=>row.name));
+    if(!quarantineColumns.has("resolution_kind"))this.db.exec("ALTER TABLE quarantines ADD COLUMN resolution_kind TEXT");
+    if(!quarantineColumns.has("resolution_context_json"))this.db.exec("ALTER TABLE quarantines ADD COLUMN resolution_context_json TEXT");
     const currentVaultColumns=new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row)=>row.name));
     if(!currentVaultColumns.has("external_scan_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_scan_at TEXT");
     if(!currentVaultColumns.has("external_import_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_import_at TEXT");
