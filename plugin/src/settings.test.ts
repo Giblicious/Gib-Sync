@@ -79,11 +79,11 @@ describe("file-change sync filtering",()=>{
     await expect(loadSettings(plugin)).resolves.toMatchObject({folderCreateTimes:{"Intentional empty folder":12345}});
   });
 
-  it("retries folder cleanup once when upgrading from the timestamp-based implementation",async()=>{
-    const oldPlugin={loadData:async()=>({folderCleanupVersion:2,lastFolderCleanupAt:12345})} as unknown as Plugin;
-    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:3,lastFolderCleanupAt:0});
-    const currentPlugin={loadData:async()=>({folderCleanupVersion:3,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied"})} as unknown as Plugin;
-    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:3,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied"});
+  it("retries folder cleanup once when upgrading to topology-aware health",async()=>{
+    const oldPlugin={loadData:async()=>({folderCleanupVersion:3,lastFolderCleanupAt:12345,retiredFolderCount:2})} as unknown as Plugin;
+    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:0,retiredFolderCount:0});
+    const currentPlugin={loadData:async()=>({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"})} as unknown as Plugin;
+    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"});
   });
 });
 

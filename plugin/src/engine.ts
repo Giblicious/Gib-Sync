@@ -22,7 +22,7 @@ function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   return bytes.slice().buffer;
 }
 
-export interface SyncResult { uploaded: number; downloaded: number; deleted: number; prunedFolders:number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
+export interface SyncResult { uploaded: number; downloaded: number; deleted: number; prunedFolders:number; pendingRetiredFolders:number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
@@ -140,9 +140,21 @@ export class SyncEngine {
     for (const part of parts) { current = current ? `${current}/${part}` : part; if (!await this.adapter.exists(current)) await this.adapter.mkdir(current); }
   }
 
-  private async pruneRetiredEmptyFolders():Promise<{removed:number;attempted:boolean}>{
+  private async folderHasCanonicalFile(path:string,retiredPaths:Set<string>):Promise<boolean>{
+    const listing=await this.adapter.list(path);
+    if(listing.files.some((file)=>this.include(file)&&!retiredPaths.has(normalizePath(file))))return true;
+    for(const folder of listing.folders){await this.cooperate();if(await this.folderHasCanonicalFile(folder,retiredPaths))return true;}
+    return false;
+  }
+
+  private async pruneRetiredEmptyFolders():Promise<{removed:number;remaining:number;attempted:boolean}>{
     const settings=this.getSettings(),retired=Object.entries(settings.retiredPaths),newest=Math.max(0,...retired.map(([,state])=>state.retiredAt));
-    if(!newest||newest<=settings.lastFolderCleanupAt)return {removed:0,attempted:false};
+    if(!newest){settings.retiredFolderCount=0;settings.retiredFolderNote="";return {removed:0,remaining:0,attempted:false};}
+    // A retired folder may contain a transient or excluded device-local item
+    // during the first pass and become empty later. Keep auditing while any
+    // candidate remains instead of permanently treating that first pass as
+    // proof that the device's folder topology is current.
+    if(newest<=settings.lastFolderCleanupAt&&!settings.retiredFolderCount)return {removed:0,remaining:0,attempted:false};
     const candidates=new Map<string,number>();
     for(const [path,state] of retired){
       const parts=normalizePath(path).split("/").slice(0,-1);let current="";
@@ -171,11 +183,23 @@ export class SyncEngine {
         this.expectLocalMutation(path,null);await this.adapter.rmdir(path,true);removed++;
       }catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
+    const remainingPaths:string[]=[],retiredPathSet=new Set(retired.map(([path])=>normalizePath(path)));
+    for(const path of eligible)try{
+      if((await this.adapter.stat(path))?.type!=="folder")continue;
+      // A parent may still legitimately contain accepted files after only one
+      // of its child branches moved. It is healthy, not a stale folder shell.
+      // Retry only branches made entirely of retired or device-local content.
+      if(!await this.folderHasCanonicalFile(path,retiredPathSet))remainingPaths.push(path);
+    }catch(error){if(!failureDetails.some((item)=>item.startsWith(`${path}:`))){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}}
+    const remaining=remainingPaths.length;
+    settings.retiredFolderCount=remaining;
+    settings.retiredFolderNote=remaining?`${remaining} retired folder${remaining===1?"":"s"} still contain device-local or excluded items, or could not be removed`:"";
     if(!failures){settings.lastFolderCleanupAt=newest;settings.lastFolderCleanupError="";}
     else settings.lastFolderCleanupError=failureDetails.slice(0,8).join(" · ").slice(0,2000);
     if(removed)this.status({phase:"applying",message:`Removed ${removed} empty retired folder${removed===1?"":"s"} left by accepted moves or deletions`,level:"success"});
     if(failures)this.status({phase:"applying",message:`Empty-folder cleanup deferred for ${failures} path${failures===1?"":"s"}; ${failureDetails.slice(0,3).join(" · ")}; file reconciliation can continue and cleanup will retry`,level:"warning"});
-    return {removed,attempted:true};
+    else if(remaining)this.status({phase:"applying",message:`Folder topology differs locally · ${settings.retiredFolderNote} · cleanup will retry safely`,level:"warning"});
+    return {removed,remaining,attempted:true};
   }
 
   private text(path: string): boolean { return TEXT_EXTENSIONS.has(path.split(".").pop()?.toLowerCase() ?? ""); }
@@ -382,7 +406,7 @@ export class SyncEngine {
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
     if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       this.status({phase:"up-to-date",message:"Up to date · no local or server changes"});
-      return {uploaded:0,downloaded:0,deleted:0,prunedFolders,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
+      return {uploaded:0,downloaded:0,deleted:0,prunedFolders,pendingRetiredFolders:settings.retiredFolderCount,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
     const remoteSnapshot=(await this.api.state()).head;
     if(settings.pendingApplyPaths.length){prunedFolders+=await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;}
@@ -577,7 +601,7 @@ export class SyncEngine {
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
       if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
-      return { uploaded: 0, downloaded, deleted, prunedFolders, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
+      return { uploaded: 0, downloaded, deleted, prunedFolders,pendingRetiredFolders:settings.retiredFolderCount, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
     }
 
     if(!settings.initialized&&remoteSnapshot){
@@ -610,6 +634,6 @@ export class SyncEngine {
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});
     if(fullScan){settings.fullScanRequired=false;settings.lastFullScanAt=new Date().toISOString();await this.saveSettings();}
-    return { uploaded, downloaded, deleted, prunedFolders, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
+    return { uploaded, downloaded, deleted, prunedFolders,pendingRetiredFolders:settings.retiredFolderCount, conflicts, resolved, mirrored, snapshotId: settings.lastSnapshotId,processedPaths:pendingPaths,fullScan };
   }
 }

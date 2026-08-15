@@ -103,7 +103,9 @@ export default class GibSyncPlugin extends Plugin {
   private indicatorHealth(){const alerts=this.serverStatus?.healthAlerts??[],error=alerts.find((item)=>item.level==="error"),warning=alerts.find((item)=>item.level==="warning");return {errors:alerts.filter((item)=>item.level==="error").length,warnings:alerts.filter((item)=>item.level==="warning").length,description:error?.message??warning?.message};}
   indicatorState(){
     if(this.compatibilityBlocked)return {key:"blocked" as const,label:"Update required",icon:"download",tone:"warning" as const,animated:false,attentionCount:0,description:this.compatibility?.reason??"This Gib Sync version is not compatible with the server"};
-    return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),this.indicatorHealth());
+    const health=this.indicatorHealth();
+    if(this.settings.retiredFolderCount){health.warnings++;health.description=this.settings.retiredFolderNote||`${this.settings.retiredFolderCount} retired folders remain on this device`;}
+    return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),health);
   }
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
   private appendIndicatorVisual(host:HTMLElement,state= this.indicatorState(),dotOnly=false){
@@ -263,7 +265,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     assertSetupServerCompatible(setup);
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:3,lastFolderCleanupAt:0,lastFolderCleanupError:"",fullScanRequired:true,lastFullScanAt:null });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:4,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
@@ -341,7 +343,7 @@ export default class GibSyncPlugin extends Plugin {
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     const startingVersions=new Map(this.pathVersions),startingPathTimes={...this.settings.pendingPathTimes};
     try {
-      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.prunedFolders} empty folders removed · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.prunedFolders} empty folders removed · ${result.pendingRetiredFolders} retired folders pending · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
       for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
       for(const [path,time] of Object.entries(startingPathTimes))if(this.settings.pendingPathTimes[path]===time&&(result.fullScan||result.processedPaths.includes(path)))delete this.settings.pendingPathTimes[path];
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
@@ -349,7 +351,8 @@ export default class GibSyncPlugin extends Plugin {
       this.changedDuringReadFailures.clear();
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
-      this.report(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders?"complete":"up-to-date",`${result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders?"Sync complete":"Up to date"} · ${summary}`,result.conflicts?"warning":"success");
+      const changed=Boolean(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders),folderWarning=result.pendingRetiredFolders>0;
+      this.report(changed?"complete":"up-to-date",`${changed?"Sync complete":folderWarning?"Files are in sync; folder cleanup pending":"Up to date"} · ${summary}`,result.conflicts||folderWarning?"warning":"success");
       await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
       runSucceeded=true;

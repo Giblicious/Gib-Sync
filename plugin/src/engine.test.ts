@@ -105,6 +105,16 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result.prunedFolders).toBe(0);expect(config.lastFolderCleanupAt).toBe(0);expect(config.lastFolderCleanupError).toContain("Blocked: Access denied by test adapter");
   });
+  it("keeps retrying a retired folder that becomes empty after its first cleanup pass",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),ignored=new TextEncoder().encode("temporary\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000019",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"stable.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Legacy/old.md":{hash,snapshotId:head.id,retiredAt}};config.exclusions=[...config.exclusions,"Legacy/device-local.tmp"];
+    adapter.files.set("stable.md",clear);adapter.files.set("Legacy/device-local.tmp",ignored);adapter.dirs.add("Legacy");
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    const first=await engine.sync();expect(first.pendingRetiredFolders).toBe(1);expect(config.retiredFolderCount).toBe(1);expect(config.retiredFolderNote).toContain("1 retired folder");expect(adapter.dirs.has("Legacy")).toBe(true);
+    adapter.files.delete("Legacy/device-local.tmp");const second=await engine.sync();
+    expect(second.prunedFolders).toBe(1);expect(second.pendingRetiredFolders).toBe(0);expect(config.retiredFolderCount).toBe(0);expect(config.retiredFolderNote).toBe("");expect(adapter.dirs.has("Legacy")).toBe(false);
+  });
   it("removes only the empty source branch after an accepted folder move",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("moved\n"),keep=new TextEncoder().encode("keep\n"),noteHash=await hashBytes(note),keepHash=await hashBytes(keep),createdAt=new Date().toISOString();
     const base:Snapshot={id:"00000000-0000-4000-8000-000000000014",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt,message:"Base",entries:[{path:"Legacy/Nested/note.md",hash:noteHash,size:note.length,mtime:1},{path:"Legacy/keep.md",hash:keepHash,size:keep.length,mtime:1}]};
@@ -112,7 +122,7 @@ describe("SyncEngine", () => {
     api.head=remote;api.snapshots.set(base.id,base);api.blobs.set(noteHash,await encryptBlob(note,config.vaultKey,noteHash));api.blobs.set(keepHash,await encryptBlob(keep,config.vaultKey,keepHash));config.initialized=true;config.lastSnapshotId=base.id;
     adapter.files.set("Legacy/Nested/note.md",note);adapter.files.set("Legacy/keep.md",keep);for(const path of ["Legacy","Legacy/Nested"]){adapter.dirs.add(path);adapter.dirMtimes.set(path,1);}
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
-    expect(result.prunedFolders).toBe(1);expect(adapter.files.get("Current/note.md")).toEqual(note);expect(adapter.files.has("Legacy/Nested/note.md")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(adapter.dirs.has("Legacy")).toBe(true);expect(adapter.files.get("Legacy/keep.md")).toEqual(keep);
+    expect(result.prunedFolders).toBe(1);expect(result.pendingRetiredFolders).toBe(0);expect(adapter.files.get("Current/note.md")).toEqual(note);expect(adapter.files.has("Legacy/Nested/note.md")).toBe(false);expect(adapter.dirs.has("Legacy/Nested")).toBe(false);expect(adapter.dirs.has("Legacy")).toBe(true);expect(adapter.files.get("Legacy/keep.md")).toEqual(keep);
   });
   it("hashes only journaled paths and preserves the rest of the baseline",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),oldChanged=new TextEncoder().encode("old\n"),changed=new TextEncoder().encode("new\n"),stable=new TextEncoder().encode("stable\n");
