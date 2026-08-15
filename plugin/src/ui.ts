@@ -4,6 +4,7 @@ import type GibSyncPlugin from "./main";
 import { normalizeQuickCode,openPairingEnvelope } from "./crypto";
 import { isGibSyncConflictPath,shouldSyncChangedPath } from "./settings";
 import { detailedDiagnostics,privacySafeDiagnostics } from "./diagnostics";
+import { buildQuickStatusModel, type QuickStatusAction } from "./status-overview";
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -229,23 +230,23 @@ export class StatusOverviewModal extends Modal{
     this.render();this.unsubscribe=this.plugin.subscribeStatus(()=>this.render());
     if(this.plugin.settings.deviceToken)void this.plugin.refreshServerStatus();
   }
+  private openSettings(){this.close();const control=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;control?.open?.();window.setTimeout(()=>control?.openTabById?.("gib-sync"),50);}
+  private runPrimary(action:QuickStatusAction){
+    if(action==="setup"){this.close();new SetupModal(this.app,this.plugin).open();return;}
+    if(action==="resolve"){new NativeSyncConflictModal(this.app,this.plugin).open();return;}
+    if(action==="review"){this.close();this.plugin.openSafeguards();return;}
+    if(action==="resume"){void this.plugin.setPaused(false);return;}
+    this.close();void this.plugin.runSync();
+  }
   private render(){
-    const root=this.contentEl;root.empty();const live=this.plugin.liveStatus,state=this.plugin.indicatorState(),server=this.plugin.serverStatus;
+    const root=this.contentEl;root.empty();const live=this.plugin.liveStatus,state=this.plugin.indicatorState();
+    const model=buildQuickStatusModel({state,live,configured:Boolean(this.plugin.settings.deviceToken),nativeSyncBlocked:this.plugin.isNativeSyncBlocking(),paused:this.plugin.settings.paused});
     const hero=root.createDiv({cls:`gib-sync-status-overview is-${state.tone}`});const icon=hero.createSpan({cls:"gib-sync-status-overview-icon"});setIcon(icon,state.icon);
-    const copy=hero.createDiv();copy.createEl("strong",{text:state.label});copy.createEl("div",{text:state.description,cls:"gib-sync-muted"});
-    if(live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
-    const facts=root.createDiv({cls:"gib-sync-status-overview-grid"});const fact=(label:string,value:string)=>{const item=facts.createDiv();item.createEl("span",{text:label});item.createEl("strong",{text:value});};
-    fact("Current operation",live.message);fact("Last successful sync",when(live.lastSuccessAt));fact("Last result",live.lastResult||"No completed sync yet");fact("Next check",when(live.nextSyncAt));
-    if(server){fact("Remote inventory",`${server.snapshotCount} snapshots · ${server.mirrorFileCount} readable files`);fact("Held changes",String(server.safeguards.pendingQuarantines));}
+    const copy=hero.createDiv({cls:"gib-sync-status-overview-copy"});copy.createEl("strong",{text:state.label});copy.createEl("div",{text:model.description,cls:"gib-sync-status-overview-description"});copy.createEl("small",{text:model.meta,cls:"gib-sync-status-overview-meta"});
+    if(live.running&&live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
     const actions=root.createDiv({cls:"gib-sync-status-overview-actions"});
-    const sync=actions.createEl("button",{text:"Sync now",cls:"mod-cta"});sync.disabled=live.running||this.plugin.settings.paused||this.plugin.isNativeSyncBlocking();sync.onclick=()=>{this.close();void this.plugin.runSync();};
-    const pause=actions.createEl("button",{text:this.plugin.settings.paused?"Resume":"Pause"});pause.onclick=async()=>{pause.disabled=true;await this.plugin.setPaused(!this.plugin.settings.paused);this.render();};
-    if(state.attentionCount>0){const review=actions.createEl("button",{text:"Review held changes"});review.onclick=()=>{this.close();this.plugin.openSafeguards();};}
-    const settings=actions.createEl("button",{text:"Settings"});settings.onclick=()=>{this.close();const control=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;control?.open?.();window.setTimeout(()=>control?.openTabById?.("gib-sync"),50);};
-    if(this.plugin.isNativeSyncBlocking()){const warning=root.createDiv({cls:"gib-sync-native-sync-warning"});warning.createEl("strong",{text:"Obsidian Sync is enabled"});warning.createEl("p",{text:"Gib Sync is safely paused until the core Sync plugin is disabled."});const button=warning.createEl("button",{text:"Resolve"});button.onclick=()=>new NativeSyncConflictModal(this.app,this.plugin).open();}
-    const activity=root.createDiv({cls:"gib-sync-status-overview-activity"});activity.createEl("strong",{text:"Recent activity"});
-    for(const entry of [...live.activities].reverse().slice(0,8)){const row=activity.createDiv({cls:`gib-sync-activity-row is-${entry.level}`});row.createEl("time",{text:new Date(entry.at).toLocaleTimeString()});row.createSpan({cls:"gib-sync-activity-marker"});row.createEl("span",{text:`${entry.message}${(entry.repeats??1)>1?` · repeated ${entry.repeats} times`:""}`});}
-    if(!live.activities.length)activity.createDiv({cls:"gib-sync-muted",text:"No activity yet."});
+    const primary=actions.createEl("button",{text:model.primaryLabel,cls:"mod-cta"});primary.disabled=model.primaryDisabled;primary.onclick=()=>this.runPrimary(model.primaryAction);
+    const details=actions.createEl("button",{text:"Details"});details.onclick=()=>this.openSettings();
   }
   onClose(){this.unsubscribe?.();this.unsubscribe=null;this.contentEl.empty();}
 }
