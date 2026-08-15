@@ -3,7 +3,7 @@ import { detectMoves, type ManifestEntry, type Snapshot } from "@gib-sync/protoc
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import { isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type RetiredFolderBlocker, type SyncPhase } from "./settings";
+import { isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type GibSyncSettings, type SyncPhase } from "./settings";
 import { mergeCommunityPluginEnablement, mergeSystemJson } from "./system-merge";
 
 type FileState = ManifestEntry & { bytes?: Uint8Array; sourcePath?:string };
@@ -143,66 +143,62 @@ export class SyncEngine {
 
   private disposableMetadata(path:string):boolean{const name=normalizePath(path).split("/").at(-1)?.toLowerCase()??"";return DISPOSABLE_FOLDER_METADATA.has(name)||name.startsWith("._");}
 
-  private async pruneRetiredTree(path:string,retiredAt:number,removeMetadata:boolean):Promise<{folders:number;metadata:number}>{
-    const settings=this.getSettings();if((settings.folderCreateTimes[path]??0)>retiredAt)return {folders:0,metadata:0};
-    const stat=await this.adapter.stat(path);if(stat?.type!=="folder")return {folders:0,metadata:0};
-    let folders=0,metadata=0;const listing=await this.adapter.list(path);
+  private async localRecoveryPath(batch:string,path:string):Promise<string>{
+    const base=normalizePath(`.gib-sync/local-recovery/${batch}/${path}`);let candidate=base,index=2;
+    while(await this.adapter.exists(candidate)){const dot=base.lastIndexOf("."),slash=base.lastIndexOf("/"),stem=dot>slash?base.slice(0,dot):base,extension=dot>slash?base.slice(dot):"";candidate=`${stem} - ${index++}${extension}`;}
+    return candidate;
+  }
+
+  private async currentFolderFile(path:string):Promise<boolean>{
+    if(!this.include(path))return false;const retired=this.getSettings().retiredPaths[path];if(!retired)return true;
+    try{return await hashBytes(new Uint8Array(await this.adapter.readBinary(path)))!==retired.hash;}catch{return true;}
+  }
+
+  private async retireFolderFile(path:string,batch:string):Promise<"kept"|"metadata"|"recovered">{
+    if(await this.currentFolderFile(path))return "kept";
+    await this.cooperate();this.expectLocalMutation(path,null);
+    if(this.disposableMetadata(path)){await this.adapter.remove(path);return "metadata";}
+    const trashLocal=(this.adapter as DataAdapter&{trashLocal?:DataAdapter["trashLocal"]}).trashLocal;
+    if(typeof trashLocal==="function")try{await trashLocal.call(this.adapter,path);return "recovered";}catch{if(!await this.adapter.exists(path))return "recovered";}
+    const recovery=await this.localRecoveryPath(batch,path);await this.ensureParent(recovery);await this.adapter.rename(path,recovery);
+    return "recovered";
+  }
+
+  private async pruneRetiredTree(path:string,batch:string):Promise<{folders:number;metadata:number;recovered:number}>{
+    const stat=await this.adapter.stat(path);if(stat?.type!=="folder")return {folders:0,metadata:0,recovered:0};
+    let folders=0,metadata=0,recovered=0;const listing=await this.adapter.list(path);
     for(const folder of listing.folders){
       const normalized=normalizePath(folder),lower=normalized.toLowerCase();if(PROTECTED_FOLDER_ROOTS.has(lower))continue;
-      await this.cooperate();const child=await this.pruneRetiredTree(normalized,retiredAt,removeMetadata);folders+=child.folders;metadata+=child.metadata;
+      await this.cooperate();const child=await this.pruneRetiredTree(normalized,batch);folders+=child.folders;metadata+=child.metadata;recovered+=child.recovered;
     }
-    if(removeMetadata)for(const file of listing.files){const normalized=normalizePath(file);if(!this.disposableMetadata(normalized)||(this.include(normalized)&&!settings.retiredPaths[normalized]))continue;await this.cooperate();this.expectLocalMutation(normalized,null);await this.adapter.remove(normalized);metadata++;}
-    const first=await this.adapter.list(path);if(first.files.length||first.folders.length)return {folders,metadata};
-    await this.cooperate(true);const second=await this.adapter.list(path);if(second.files.length||second.folders.length)return {folders,metadata};
-    if((await this.adapter.stat(path))?.type!=="folder")return {folders,metadata};
-    this.expectLocalMutation(path,null);await this.adapter.rmdir(path,true);return {folders:folders+1,metadata};
+    for(const file of listing.files){const result=await this.retireFolderFile(normalizePath(file),batch);if(result==="metadata")metadata++;else if(result==="recovered")recovered++;}
+    const first=await this.adapter.list(path);if(first.files.length||first.folders.length)return {folders,metadata,recovered};
+    await this.cooperate(true);const second=await this.adapter.list(path);if(second.files.length||second.folders.length)return {folders,metadata,recovered};
+    if((await this.adapter.stat(path))?.type!=="folder")return {folders,metadata,recovered};
+    this.expectLocalMutation(path,null);await this.adapter.rmdir(path,true);return {folders:folders+1,metadata,recovered};
   }
 
-  private async inspectRetiredFolder(path:string,retiredPaths:Set<string>):Promise<{canonical:boolean;blockers:string[];truncated:boolean}>{
+  private async inspectRetiredFolder(path:string):Promise<{canonical:boolean;blockers:string[]}>{
     const listing=await this.adapter.list(path);
-    let canonical=false,truncated=false;const blockers:string[]=[];
+    let canonical=false;const blockers:string[]=[];
     for(const file of listing.files){
       const normalized=normalizePath(file);
-      if(this.include(normalized)&&!retiredPaths.has(normalized))canonical=true;
-      else if(blockers.length<200)blockers.push(normalized);else truncated=true;
+      if(await this.currentFolderFile(normalized))canonical=true;
+      else if(blockers.length<4)blockers.push(normalized);
     }
     for(const folder of listing.folders){
-      await this.cooperate();const child=await this.inspectRetiredFolder(folder,retiredPaths);canonical ||= child.canonical;truncated ||= child.truncated;
-      for(const blocker of child.blockers)if(blockers.length<200)blockers.push(blocker);else truncated=true;
+      await this.cooperate();const child=await this.inspectRetiredFolder(folder);canonical ||= child.canonical;
+      for(const blocker of child.blockers)if(blockers.length<4)blockers.push(blocker);
     }
-    return {canonical,blockers,truncated};
-  }
-
-  async resolveRetiredFolderBlockers(action:"remove"|"keep"):Promise<{files:number;folders:number}>{
-    const settings=this.getSettings(),records=settings.retiredFolderBlockers;if(!records.length)return {files:0,folders:0};
-    if(action==="keep"){
-      const at=Date.now();for(const record of records)settings.folderCreateTimes[record.folder]=at;
-      settings.retiredFolderCount=0;settings.retiredFolderNote="";settings.retiredFolderBlockers=[];await this.saveSettings();return {files:0,folders:0};
-    }
-    if(records.some((record)=>record.truncated))throw new SyncSafetyError("A retired folder contains too many local items for one safe review. Keep it on this device or narrow its contents first.");
-    const roots=records.map((record)=>record.folder).sort((a,b)=>a.split("/").length-b.split("/").length).filter((path,index,all)=>!all.slice(0,index).some((root)=>path===root||path.startsWith(`${root}/`)));
-    const retiredSet=new Set(Object.keys(settings.retiredPaths).map((path)=>normalizePath(path))),plans:{root:string;items:string[];retiredAt:number}[]=[];
-    for(const root of roots){
-      const record=records.find((item)=>item.folder===root)!;const current=await this.inspectRetiredFolder(root,retiredSet);
-      if(current.canonical)throw new SyncSafetyError(`${root} now contains a synced file. Nothing was removed; sync again before reviewing leftovers.`);
-      const expected=[...record.items].sort(),actual=[...current.blockers].sort();if(current.truncated||expected.length!==actual.length||expected.some((path,index)=>path!==actual[index]))throw new SyncSafetyError(`${root} changed after review. Nothing was removed; sync again to refresh the list.`);
-      const retiredAt=Math.max(0,...Object.entries(settings.retiredPaths).filter(([path])=>path===root||path.startsWith(`${root}/`)).map(([,state])=>state.retiredAt));plans.push({root,items:actual,retiredAt:retiredAt||Date.now()});
-    }
-    // Complete every read-only check before the first deletion. A stale modal
-    // can therefore never partially clean one tree and then fail on another.
-    for(const plan of plans)for(const path of plan.items)if((await this.adapter.stat(path))?.type!=="file")throw new SyncSafetyError(`${path} changed after review. Nothing was removed.`);
-    let files=0,folders=0;
-    for(const plan of plans){for(const path of plan.items){this.expectLocalMutation(path,null);await this.adapter.remove(path);files++;}const cleaned=await this.pruneRetiredTree(plan.root,plan.retiredAt,false);folders+=cleaned.folders;}
-    settings.retiredFolderCount=0;settings.retiredFolderNote="";settings.retiredFolderBlockers=[];settings.lastFolderCleanupError="";await this.saveSettings();return {files,folders};
+    return {canonical,blockers};
   }
 
   private async pruneRetiredEmptyFolders():Promise<{removed:number;remaining:number;attempted:boolean}>{
     const settings=this.getSettings(),retired=Object.entries(settings.retiredPaths),newest=Math.max(0,...retired.map(([,state])=>state.retiredAt));
-    if(!newest){settings.retiredFolderCount=0;settings.retiredFolderNote="";settings.retiredFolderBlockers=[];return {removed:0,remaining:0,attempted:false};}
-    // A retired folder may contain a transient or excluded device-local item
-    // during the first pass and become empty later. Keep auditing while any
-    // candidate remains instead of permanently treating that first pass as
-    // proof that the device's folder topology is current.
+    if(!newest){settings.retiredFolderCount=0;settings.retiredFolderNote="";return {removed:0,remaining:0,attempted:false};}
+    // Older clients could leave a retired branch in place when it contained an
+    // ignored file. Retry those records after upgrades until accepted folder
+    // topology has actually been applied on this device.
     if(newest<=settings.lastFolderCleanupAt&&!settings.retiredFolderCount)return {removed:0,remaining:0,attempted:false};
     const candidates=new Map<string,number>();
     for(const [path,state] of retired){
@@ -215,34 +211,33 @@ export class SyncEngine {
     }
     const eligible=new Set<string>();let failures=0,removed=0;const failureDetails:string[]=[];
     for(const [path,retiredAt] of candidates){
-      if((settings.folderCreateTimes[path]??0)>retiredAt)continue;
       try{const stat=await this.adapter.stat(path);if(stat?.type==="folder")eligible.add(path);}catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    const ordered=[...eligible].sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left));let metadataRemoved=0;
+    const ordered=[...eligible].sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left));let metadataRemoved=0,recovered=0;const batch=new Date().toISOString().replace(/[:.]/g,"-");
     for(const path of ordered){
       await this.cooperate();
       try{
-        const cleaned=await this.pruneRetiredTree(path,candidates.get(path)??0,true);removed+=cleaned.folders;metadataRemoved+=cleaned.metadata;
+        if((await this.inspectRetiredFolder(path)).canonical)continue;
+        const cleaned=await this.pruneRetiredTree(path,batch);removed+=cleaned.folders;metadataRemoved+=cleaned.metadata;recovered+=cleaned.recovered;
       }catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    const blockerRecords:RetiredFolderBlocker[]=[],retiredPathSet=new Set(retired.map(([path])=>normalizePath(path)));
+    const remainingPaths:string[]=[],remainingDetails:string[]=[];
     for(const path of eligible)try{
       if((await this.adapter.stat(path))?.type!=="folder")continue;
       // A parent may still legitimately contain accepted files after only one
       // of its child branches moved. It is healthy, not a stale folder shell.
       // Retry only branches made entirely of retired or device-local content.
-      const inspection=await this.inspectRetiredFolder(path,retiredPathSet);
-      if(!inspection.canonical)blockerRecords.push({folder:path,items:inspection.blockers,truncated:inspection.truncated});
+      const inspection=await this.inspectRetiredFolder(path);
+      if(!inspection.canonical){remainingPaths.push(path);remainingDetails.push(`${path} ← ${inspection.blockers.length?inspection.blockers.join(", "):"contents changed during cleanup"}`);}
     }catch(error){if(!failureDetails.some((item)=>item.startsWith(`${path}:`))){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}}
-    const actionableBlockers=blockerRecords.sort((a,b)=>a.folder.split("/").length-b.folder.split("/").length).filter((record,index,all)=>!all.slice(0,index).some((parent)=>record.folder===parent.folder||record.folder.startsWith(`${parent.folder}/`)));
-    const remainingDetails=actionableBlockers.map((record)=>`${record.folder} ← ${record.items.length?record.items.slice(0,4).join(", "):"contents changed during cleanup"}${record.truncated?", …":""}`),remaining=actionableBlockers.length;
+    const remaining=remainingPaths.length;
     settings.retiredFolderCount=remaining;
-    settings.retiredFolderBlockers=actionableBlockers;
     settings.retiredFolderNote=remaining?`${remaining} retired folder${remaining===1?" is":"s are"} blocked: ${remainingDetails.slice(0,4).join(" · ")}${remainingDetails.length>4?` · and ${remainingDetails.length-4} more`:""}`.slice(0,2000):"";
     if(!failures){settings.lastFolderCleanupAt=newest;settings.lastFolderCleanupError="";}
     else settings.lastFolderCleanupError=failureDetails.slice(0,8).join(" · ").slice(0,2000);
     if(removed)this.status({phase:"applying",message:`Removed ${removed} empty retired folder${removed===1?"":"s"} left by accepted moves or deletions`,level:"success"});
     if(metadataRemoved)this.status({phase:"applying",message:`Removed ${metadataRemoved} harmless platform metadata file${metadataRemoved===1?"":"s"} from retired folders`,level:"success"});
+    if(recovered)this.status({phase:"applying",message:`Applied accepted folder deletions · moved ${recovered} device-only file${recovered===1?"":"s"} to local recovery`,level:"success"});
     if(failures)this.status({phase:"applying",message:`Empty-folder cleanup deferred for ${failures} path${failures===1?"":"s"}; ${failureDetails.slice(0,3).join(" · ")}; file reconciliation can continue and cleanup will retry`,level:"warning"});
     else if(remaining)this.status({phase:"applying",message:`Folder topology differs locally · ${settings.retiredFolderNote} · cleanup will retry safely`,level:"warning"});
     return {removed,remaining,attempted:true};

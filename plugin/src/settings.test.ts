@@ -31,6 +31,7 @@ describe("file-change sync filtering",()=>{
     expect(shouldSyncChangedPath(".obsidian/plugins/calendar/main.js",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".obsidian/community-plugins.json",DEFAULT_SETTINGS)).toBe(false);
     expect(shouldSyncChangedPath(".trash/deleted.md",DEFAULT_SETTINGS)).toBe(false);
+    expect(shouldSyncChangedPath(".trash/recovered.md",{...DEFAULT_SETTINGS,exclusions:[]})).toBe(false);
     expect(shouldSyncChangedPath(".githubish/note.md",DEFAULT_SETTINGS)).toBe(true);
   });
 
@@ -80,10 +81,10 @@ describe("file-change sync filtering",()=>{
   });
 
   it("retries folder cleanup once when upgrading to topology-aware health",async()=>{
-    const oldPlugin={loadData:async()=>({folderCleanupVersion:3,lastFolderCleanupAt:12345,retiredFolderCount:2})} as unknown as Plugin;
-    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:0,retiredFolderCount:0});
-    const currentPlugin={loadData:async()=>({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain",retiredFolderBlockers:[{folder:"Old",items:["Old/local.tmp"],truncated:false}]})} as unknown as Plugin;
-    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain",retiredFolderBlockers:[{folder:"Old",items:["Old/local.tmp"],truncated:false}]});
+    const oldPlugin={loadData:async()=>({folderCleanupVersion:4,lastFolderCleanupAt:12345,retiredFolderCount:2})} as unknown as Plugin;
+    await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:5,lastFolderCleanupAt:0,retiredFolderCount:0});
+    const currentPlugin={loadData:async()=>({folderCleanupVersion:5,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"})} as unknown as Plugin;
+    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:5,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"});
   });
 });
 

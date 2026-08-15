@@ -241,7 +241,6 @@ export class StatusOverviewModal extends Modal{
     const sync=actions.createEl("button",{text:"Sync now",cls:"mod-cta"});sync.disabled=live.running||this.plugin.settings.paused||this.plugin.isNativeSyncBlocking();sync.onclick=()=>{this.close();void this.plugin.runSync();};
     const pause=actions.createEl("button",{text:this.plugin.settings.paused?"Resume":"Pause"});pause.onclick=async()=>{pause.disabled=true;await this.plugin.setPaused(!this.plugin.settings.paused);this.render();};
     if(state.attentionCount>0){const review=actions.createEl("button",{text:"Review held changes"});review.onclick=()=>{this.close();this.plugin.openSafeguards();};}
-    if(this.plugin.settings.retiredFolderBlockers.length){const review=actions.createEl("button",{text:"Review folder leftovers"});review.onclick=()=>{this.close();new RetiredFolderCleanupModal(this.app,this.plugin).open();};}
     const settings=actions.createEl("button",{text:"Settings"});settings.onclick=()=>{this.close();const control=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;control?.open?.();window.setTimeout(()=>control?.openTabById?.("gib-sync"),50);};
     if(this.plugin.isNativeSyncBlocking()){const warning=root.createDiv({cls:"gib-sync-native-sync-warning"});warning.createEl("strong",{text:"Obsidian Sync is enabled"});warning.createEl("p",{text:"Gib Sync is safely paused until the core Sync plugin is disabled."});const button=warning.createEl("button",{text:"Resolve"});button.onclick=()=>new NativeSyncConflictModal(this.app,this.plugin).open();}
     const activity=root.createDiv({cls:"gib-sync-status-overview-activity"});activity.createEl("strong",{text:"Recent activity"});
@@ -249,22 +248,6 @@ export class StatusOverviewModal extends Modal{
     if(!live.activities.length)activity.createDiv({cls:"gib-sync-muted",text:"No activity yet."});
   }
   onClose(){this.unsubscribe?.();this.unsubscribe=null;this.contentEl.empty();}
-}
-
-export class RetiredFolderCleanupModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
-  onOpen(){
-    mobileContent(this.contentEl);this.setTitle("Retired folder leftovers");
-    this.contentEl.createEl("p",{text:"These local-only items are the only things preventing obsolete folders from disappearing. They are not part of the accepted server vault."});
-    const list=this.contentEl.createEl("ul");for(const record of this.plugin.settings.retiredFolderBlockers){const item=list.createEl("li");item.createEl("strong",{text:record.folder});for(const path of record.items.slice(0,20))item.createEl("div",{cls:"gib-sync-muted",text:path});if(record.truncated)item.createEl("div",{cls:"gib-sync-muted",text:"Additional items omitted; automatic removal is disabled for this folder."});}
-    new Setting(this.contentEl).setName("Keep on this device").setDesc("Stops cleanup attempts and keeps these folders and their local contents.").addButton((button)=>button.setButtonText("Keep folders").onClick(async()=>{button.setDisabled(true);try{await this.plugin.engine.resolveRetiredFolderBlockers("keep");this.close();new Notice("Local folders kept; synced vault files were unchanged");void this.plugin.runSync();}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);button.setDisabled(false);}}));
-    new Setting(this.contentEl).setName("Remove local leftovers").setDesc("Deletes only the listed device-local items, then removes the now-empty obsolete folder tree. Synced notes and server history are untouched.").addButton((button)=>button.setWarning().setButtonText("Remove leftovers").onClick(async()=>{
-      const examples=this.plugin.settings.retiredFolderBlockers.flatMap((record)=>record.items).slice(0,12).map((path)=>`- ${path}`).join("\n");
-      if(!await confirmAction(this.app,"Remove local folder leftovers",`Delete the listed local-only items and their obsolete empty folders?\n\n${examples}\n\nGib Sync will abort if anything changed after this review. Synced files and server history are not affected.`,"Remove local leftovers",true))return;
-      button.setDisabled(true);try{const result=await this.plugin.engine.resolveRetiredFolderBlockers("remove");this.close();new Notice(`Removed ${result.files} local leftover file${result.files===1?"":"s"} and ${result.folders} obsolete folder${result.folders===1?"":"s"}`,10000);void this.plugin.runSync();}catch(error){new Notice(error instanceof Error?error.message:String(error),10000);button.setDisabled(false);}
-    }));
-  }
-  onClose(){this.contentEl.empty();}
 }
 
 export class GibSyncSettingTab extends PluginSettingTab {
@@ -369,7 +352,6 @@ export class GibSyncSettingTab extends PluginSettingTab {
     const issues=server?.healthAlerts.filter((alert)=>alert.level==="warning"||alert.level==="error")??[];
     if(this.plugin.compatibility&&!this.plugin.compatibility.compatible){const update=root.createDiv({cls:"gib-sync-attention-card is-warning"});update.createEl("strong",{text:"Gib Sync compatibility update required"});update.createEl("p",{text:`${this.plugin.compatibility.reason} Synchronization is disabled until compatibility is restored.`});}
     if(live.phase==="error"||issues.length){const attention=root.createDiv({cls:`gib-sync-attention-card is-${live.phase==="error"||issues.some((notice)=>notice.level==="error")?"error":"warning"}`});attention.createEl("strong",{text:live.phase==="error"?"Sync needs help":issues.length===1?"One item needs attention":`${issues.length} items need attention`});attention.createEl("p",{text:live.phase==="error"?(live.lastError||live.message):issues[0].message});if(issues.length>1)attention.createEl("div",{cls:"gib-sync-muted",text:`${issues.length-1} more ${issues.length-1===1?"item":"items"} in technical details`});}
-    if(this.plugin.settings.retiredFolderBlockers.length){const attention=root.createDiv({cls:"gib-sync-attention-card is-warning"});attention.createEl("strong",{text:"Local folder leftovers"});attention.createEl("p",{text:this.plugin.settings.retiredFolderNote});const review=attention.createEl("button",{text:"Review and resolve"});review.onclick=()=>new RetiredFolderCleanupModal(this.app,this.plugin).open();}
     const grid=root.createDiv({cls:"gib-sync-status-grid gib-sync-status-summary"});const item=(host:HTMLElement,label:string,value:string,tone?:string)=>{const el=host.createDiv({cls:tone?`is-${tone}`:""});el.createEl("span",{text:label});el.createEl("strong",{text:value,attr:{title:value}});};
     const compatibility=server?.compatibility??this.plugin.compatibility,serverVersion=compatibility?.serverVersion??null;
     item(grid,"Current operation",live.running?live.message:"Idle");item(grid,"Last successful sync",when(live.lastSuccessAt));item(grid,"Next automatic check",when(live.nextSyncAt));item(grid,"Gib Sync versions",`Plugin ${this.plugin.manifest.version} · Server ${serverVersion??"checking…"}`);item(grid,"Server copy",server?server.mirrorCurrent?`${server.mirrorFileCount} files · current`:`${server.mirrorFileCount} files · catching up`:"Checking…",server&&!server.mirrorCurrent?"warning":undefined);item(grid,"Held changes",server?server.safeguards.pendingQuarantines?`${server.safeguards.pendingQuarantines} need review`:"None":"Checking…",server?.safeguards.pendingQuarantines?"warning":undefined);item(grid,"Connected devices",server?String(server.deviceCount):"Checking…");
