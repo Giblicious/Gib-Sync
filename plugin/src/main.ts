@@ -104,7 +104,7 @@ export default class GibSyncPlugin extends Plugin {
   indicatorState(){
     if(this.compatibilityBlocked)return {key:"blocked" as const,label:"Update required",icon:"download",tone:"warning" as const,animated:false,attentionCount:0,description:this.compatibility?.reason??"This Gib Sync version is not compatible with the server"};
     const health=this.indicatorHealth();
-    if(this.settings.retiredFolderCount){health.warnings++;health.description=this.settings.retiredFolderNote||`${this.settings.retiredFolderCount} retired folders remain on this device`;}
+    if(this.settings.retiredFolderCount){health.warnings++;health.description=this.settings.retiredFolderNote||`${this.settings.retiredFolderCount} local folder mismatch${this.settings.retiredFolderCount===1?"":"es"} remain`;}
     return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),health);
   }
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
@@ -343,7 +343,7 @@ export default class GibSyncPlugin extends Plugin {
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false;
     const startingVersions=new Map(this.pathVersions),startingPathTimes={...this.settings.pendingPathTimes};
     try {
-      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.prunedFolders} empty folders removed · ${result.pendingRetiredFolders} retired folders pending · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
+      const result = await this.engine.sync(); const now=new Date().toISOString(); const summary=`${result.uploaded} encrypted uploads · ${result.mirrored} readable files written · ${result.downloaded} downloaded · ${result.deleted} deleted · ${result.prunedFolders} folders reconciled · ${result.pendingRetiredFolders} folder mismatches · ${result.resolved} system changes auto-resolved · ${result.conflicts} note conflicts`;
       for(const path of result.processedPaths)if(this.pathVersions.get(path)===startingVersions.get(path))this.pathVersions.delete(path);
       for(const [path,time] of Object.entries(startingPathTimes))if(this.settings.pendingPathTimes[path]===time&&(result.fullScan||result.processedPaths.includes(path)))delete this.settings.pendingPathTimes[path];
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
@@ -352,8 +352,8 @@ export default class GibSyncPlugin extends Plugin {
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
       const changed=Boolean(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders),folderWarning=result.pendingRetiredFolders>0;
-      this.report(changed?"complete":"up-to-date",`${changed?"Sync complete":folderWarning?"Files are in sync; folder cleanup pending":"Up to date"} · ${summary}`,result.conflicts||folderWarning?"warning":"success");
-      await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
+      this.report(folderWarning?"blocked":changed?"complete":"up-to-date",`${folderWarning?"Files synchronized, but folder topology does not match":changed?"Sync complete":"Up to date"} · ${summary}`,result.conflicts||folderWarning?"warning":"success");
+      if(!folderWarning)await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
       runSucceeded=true;
     } catch (error) {
