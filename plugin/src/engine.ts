@@ -66,7 +66,7 @@ export class SyncEngine {
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
     for(const [path,entry] of remote){await this.cooperate();if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
     for(const [path,entry] of local)if(!remote.has(path)&&this.include(path)){await this.cooperate();if(head)settings.retiredPaths[path]={hash:entry.hash,snapshotId:head.id,retiredAt:Date.now()};this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology((head?.entries??[]).map((entry)=>entry.path));settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology((head?.entries??[]).map((entry)=>entry.path));settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
   private async entropy(bytes:Uint8Array):Promise<number>{
@@ -78,6 +78,11 @@ export class SyncEngine {
 
   private include(path: string): boolean {
     return shouldSyncChangedPath(normalizePath(path),this.getSettings());
+  }
+
+  private pluginSyncPath(path:string):boolean{
+    const normalized=normalizePath(path);if(normalized===".obsidian/community-plugins.json")return true;
+    const plugin=obsidianPluginPath(normalized);return Boolean(plugin&&plugin.id.toLowerCase()!=="gib-sync");
   }
 
   private async listFiles(path = ""): Promise<string[]> {
@@ -474,7 +479,7 @@ export class SyncEngine {
       }
       completed++;if(this.progress(completed,pending.length))this.status({phase:"applying",message:"Resuming accepted device state",current:completed,total:pending.length});
     }
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(target.entries.map((entry)=>entry.path));settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();await this.saveSettings();
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(target.entries.map((entry)=>entry.path));settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();
     if(preserved)this.status({phase:"applying",message:`Preserved ${preserved} genuine local change${preserved===1?"":"s"} made during the interrupted download; they will reconcile normally`,level:"success"});
     return retiredCleanup.removed+topology.removed;
   }
@@ -486,7 +491,7 @@ export class SyncEngine {
     for(const path of removed){const previous=physicalLocal.get(path);if(previous)settings.retiredPaths[path]={hash:previous.hash,snapshotId,retiredAt:Date.now()};}
     settings.pendingPaths=[];settings.pendingPathTimes={};this.trimRetiredPaths();await this.saveSettings();
     const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache),retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(topologyPaths);
-    settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};await this.saveSettings();return {...result,prunedFolders:retiredCleanup.removed+topology.removed};
+    settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();return {...result,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
   private async run(attempt: number): Promise<SyncResult> {
@@ -498,7 +503,7 @@ export class SyncEngine {
     this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
     let remoteHeadId:string|null;
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
-    if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
+    if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!settings.pluginSyncBootstrapPending&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       const accepted=requestedBaseId?await this.api.snapshot(requestedBaseId):null,topology=await this.reconcileFolderTopology((accepted?.entries??[]).map((entry)=>entry.path));prunedFolders+=topology.removed;await this.saveSettings();
       this.status({phase:topology.remaining?"applying":"up-to-date",message:topology.remaining?settings.retiredFolderNote:"Up to date · accepted file manifest and observed folders agree",level:topology.remaining?"warning":"success"});
       return {uploaded:0,downloaded:0,deleted:0,prunedFolders,pendingRetiredFolders:settings.retiredFolderCount,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
@@ -507,7 +512,7 @@ export class SyncEngine {
     if(settings.pendingApplyPaths.length){prunedFolders+=await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;}
     const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
     const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
-    const fullScan=settings.fullScanRequired||!settings.initialized||!baseSnapshot||auditDue;
+    const fullScan=settings.fullScanRequired||settings.pluginSyncBootstrapPending||!settings.initialized||!baseSnapshot||auditDue;
     this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
     const scanBaseline=ownDescendants&&remoteSnapshot?remoteSnapshot:baseSnapshot;
     const scanned=fullScan?await this.scan():await this.scanIncremental(scanBaseline!,pendingPaths),local=scanned.files;
@@ -540,7 +545,10 @@ export class SyncEngine {
       }
     }
     const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);}
-    const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path)),physicalLocal=new Map(local);let suppressedRetired=0,retiredStateChanged=false;
+    const physicalLocal=new Map(local),bootstrapPluginSync=settings.syncPlugins&&settings.pluginSyncBootstrapPending,acceptedPluginState=Boolean(bootstrapPluginSync&&remoteSnapshot&&[...remote.keys()].some((path)=>this.pluginSyncPath(path)));
+    if(acceptedPluginState){for(const path of new Set([...local.keys(),...remote.keys()].filter((candidate)=>this.pluginSyncPath(candidate)))){const accepted=remote.get(path);if(accepted)local.set(path,accepted);else local.delete(path);}this.status({phase:"merging",message:"Plugin sync first activation · adopting the accepted server plugin inventory and settings before publishing device changes",level:"success"});}
+    else if(bootstrapPluginSync)this.status({phase:"merging",message:"Plugin sync first activation · no accepted plugin inventory exists, so this device will establish it",level:"info"});
+    const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path));let suppressedRetired=0,retiredStateChanged=false;
     for(const [path,retired] of Object.entries(settings.retiredPaths)){
       const current=local.get(path);
       if(remote.has(path)){delete settings.retiredPaths[path];retiredStateChanged=true;continue;}
@@ -561,7 +569,7 @@ export class SyncEngine {
       const localPackageIsNewer=(entries:Map<string,FileState>)=>Math.max(0,...[...entries].map(([path,entry])=>this.localChangeTime(path,entry,effectiveBaseSnapshot)))>(remoteSnapshot?Date.parse(remoteSnapshot.createdAt):0);
       const versionFor=async(source:"local"|"remote",entries:Map<string,FileState>,id:string):Promise<string|null>=>{
         const entry=entries.get(`.obsidian/plugins/${id}/manifest.json`);if(!entry)return null;
-        try{const clear=source==="local"?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);return (JSON.parse(decoder.decode(clear)) as {version?:unknown}).version as string??null;}catch{return null;}
+        try{const clear=source==="local"&&!acceptedPluginState?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);return (JSON.parse(decoder.decode(clear)) as {version?:unknown}).version as string??null;}catch{return null;}
       };
       for(const id of [...pluginIds].sort()){
         await this.cooperate();
@@ -691,7 +699,7 @@ export class SyncEngine {
     const remoteHashes=new Set(remoteEntries.map((entry)=>entry.hash)),remotePathHashes=new Map(remoteEntries.map((entry)=>[entry.path,entry.hash])),entryPaths=new Set(entries.map((entry)=>entry.path));
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash);
     if (unchanged) {
-      let downloaded=0,deleted=0;if(remoteSnapshot){const applied=await this.stageAndApply(remoteSnapshot.id,final,entries.map((entry)=>entry.path),physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);downloaded=applied.downloaded;deleted=applied.deleted;prunedFolders+=applied.prunedFolders;}else{const topology=await this.reconcileFolderTopology([]);prunedFolders+=topology.removed;settings.lastSnapshotId=null;settings.initialized=true;await this.saveSettings();}let mirrored=0;
+      let downloaded=0,deleted=0;if(remoteSnapshot){const applied=await this.stageAndApply(remoteSnapshot.id,final,entries.map((entry)=>entry.path),physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);downloaded=applied.downloaded;deleted=applied.deleted;prunedFolders+=applied.prunedFolders;}else{const topology=await this.reconcileFolderTopology([]);prunedFolders+=topology.removed;settings.lastSnapshotId=null;settings.initialized=true;if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();}let mirrored=0;
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});

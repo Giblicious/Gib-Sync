@@ -64,7 +64,14 @@ describe("file-change sync filtering",()=>{
 
   it("preserves legacy plugin inclusion when upgrading an existing config-sync user",async()=>{
     const plugin={loadData:async()=>({syncObsidianConfig:true})} as unknown as Plugin;
-    await expect(loadSettings(plugin)).resolves.toMatchObject({syncObsidianConfig:true,syncPlugins:true});
+    await expect(loadSettings(plugin)).resolves.toMatchObject({syncObsidianConfig:true,syncPlugins:true,pluginSyncBootstrapPending:true});
+  });
+
+  it("pulls accepted plugin state once when upgrading an existing plugin-sync device",async()=>{
+    const legacy={loadData:async()=>({syncPlugins:true})} as unknown as Plugin;
+    await expect(loadSettings(legacy)).resolves.toMatchObject({syncPlugins:true,pluginSyncBootstrapPending:true});
+    const completed={loadData:async()=>({syncPlugins:true,pluginSyncBootstrapPending:false})} as unknown as Plugin;
+    await expect(loadSettings(completed)).resolves.toMatchObject({syncPlugins:true,pluginSyncBootstrapPending:false});
   });
 
   it("adds non-destructive indicator defaults to existing settings",async()=>{

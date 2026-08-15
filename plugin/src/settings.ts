@@ -19,7 +19,7 @@ export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
   lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean; paused:boolean;
-  syncIntervalSeconds: number; syncBookmarks: boolean; syncObsidianConfig: boolean; syncPlugins: boolean; exclusions: string[];
+  syncIntervalSeconds: number; syncBookmarks: boolean; syncObsidianConfig: boolean; syncPlugins: boolean; pluginSyncBootstrapPending:boolean; exclusions: string[];
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
@@ -31,7 +31,7 @@ export interface GibSyncSettings {
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,pluginSyncBootstrapPending:false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null,
   storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
@@ -61,6 +61,10 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   // plugins. Preserve that behavior for existing users so an upgrade cannot
   // silently remove their remotely synchronized plugin directories.
   if(stored?.syncPlugins===undefined&&stored?.syncObsidianConfig===true)settings.syncPlugins=true;
+  // Enabling plugin sync on an established device must first adopt the
+  // accepted server inventory. Older clients treated a phone's missing
+  // packages and freshly created default data.json files as intentional edits.
+  settings.pluginSyncBootstrapPending=settings.syncPlugins&&(stored?.pluginSyncBootstrapPending===true||stored?.pluginSyncBootstrapPending===undefined);
   settings.pendingPaths=Array.isArray(stored?.pendingPaths)?[...new Set(stored.pendingPaths.filter((path):path is string=>typeof path==="string"))]:[];
   settings.pendingPathTimes=stored?.pendingPathTimes&&typeof stored.pendingPathTimes==="object"&&!Array.isArray(stored.pendingPathTimes)
     ?Object.fromEntries(Object.entries(stored.pendingPathTimes).filter(([path,time])=>Boolean(path)&&typeof time==="number"&&Number.isFinite(time)&&time>0)):{};

@@ -299,8 +299,10 @@ export class GibSyncSettingTab extends PluginSettingTab {
       if(!value&&this.plugin.settings.syncObsidianConfig&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncBookmarks,value,this.plugin.settings.syncPlugins)){toggle.setValue(true);return;}
       this.plugin.settings.syncObsidianConfig=value;this.plugin.requireFullScan();await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
-    new Setting(this.pageEl).setName("Sync installed plugins").setDesc("Synchronizes each community plugin as one version-aware package, repairs incomplete enablement, and leaves generated caches, indexes, embeddings, logs, and temporary data on their device. Plugin data.json settings merge by key and may contain API keys visible in readable Seafile. Reload Obsidian after plugin updates.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncPlugins).onChange(async(value)=>{
+    new Setting(this.pageEl).setName("Sync installed plugins").setDesc("Synchronizes each community plugin as one version-aware package, repairs incomplete enablement, and leaves generated caches, indexes, embeddings, logs, and temporary data on their device. First activation pulls the accepted plugin inventory and settings before this device may publish plugin changes. Plugin data.json may contain API keys visible in readable Seafile. Reload Obsidian after plugin updates.").addToggle((toggle)=>toggle.setValue(this.plugin.settings.syncPlugins).onChange(async(value)=>{
       if(!value&&this.plugin.settings.syncPlugins&&!await this.confirmFilterChange(this.plugin.settings.exclusions,this.plugin.settings.syncBookmarks,this.plugin.settings.syncObsidianConfig,value)){toggle.setValue(true);return;}
+      if(value&&!this.plugin.settings.syncPlugins)this.plugin.settings.pluginSyncBootstrapPending=true;
+      if(!value)this.plugin.settings.pluginSyncBootstrapPending=false;
       this.plugin.settings.syncPlugins=value;this.plugin.requireFullScan();await this.plugin.saveSettings();if(configured)void this.plugin.runSync();
     }));
     new Setting(this.pageEl).setName("Filters").setHeading();
