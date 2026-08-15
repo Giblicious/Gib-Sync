@@ -140,11 +140,19 @@ export class SyncEngine {
     for (const part of parts) { current = current ? `${current}/${part}` : part; if (!await this.adapter.exists(current)) await this.adapter.mkdir(current); }
   }
 
-  private async folderHasCanonicalFile(path:string,retiredPaths:Set<string>):Promise<boolean>{
+  private async inspectRetiredFolder(path:string,retiredPaths:Set<string>):Promise<{canonical:boolean;blockers:string[]}>{
     const listing=await this.adapter.list(path);
-    if(listing.files.some((file)=>this.include(file)&&!retiredPaths.has(normalizePath(file))))return true;
-    for(const folder of listing.folders){await this.cooperate();if(await this.folderHasCanonicalFile(folder,retiredPaths))return true;}
-    return false;
+    let canonical=false;const blockers:string[]=[];
+    for(const file of listing.files){
+      const normalized=normalizePath(file);
+      if(this.include(normalized)&&!retiredPaths.has(normalized))canonical=true;
+      else if(blockers.length<4)blockers.push(normalized);
+    }
+    for(const folder of listing.folders){
+      await this.cooperate();const child=await this.inspectRetiredFolder(folder,retiredPaths);canonical ||= child.canonical;
+      for(const blocker of child.blockers)if(blockers.length<4)blockers.push(blocker);
+    }
+    return {canonical,blockers};
   }
 
   private async pruneRetiredEmptyFolders():Promise<{removed:number;remaining:number;attempted:boolean}>{
@@ -183,17 +191,18 @@ export class SyncEngine {
         this.expectLocalMutation(path,null);await this.adapter.rmdir(path,true);removed++;
       }catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    const remainingPaths:string[]=[],retiredPathSet=new Set(retired.map(([path])=>normalizePath(path)));
+    const remainingPaths:string[]=[],remainingDetails:string[]=[],retiredPathSet=new Set(retired.map(([path])=>normalizePath(path)));
     for(const path of eligible)try{
       if((await this.adapter.stat(path))?.type!=="folder")continue;
       // A parent may still legitimately contain accepted files after only one
       // of its child branches moved. It is healthy, not a stale folder shell.
       // Retry only branches made entirely of retired or device-local content.
-      if(!await this.folderHasCanonicalFile(path,retiredPathSet))remainingPaths.push(path);
+      const inspection=await this.inspectRetiredFolder(path,retiredPathSet);
+      if(!inspection.canonical){remainingPaths.push(path);remainingDetails.push(`${path} ← ${inspection.blockers.length?inspection.blockers.join(", "):"contents changed during cleanup"}`);}
     }catch(error){if(!failureDetails.some((item)=>item.startsWith(`${path}:`))){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}}
     const remaining=remainingPaths.length;
     settings.retiredFolderCount=remaining;
-    settings.retiredFolderNote=remaining?`${remaining} retired folder${remaining===1?"":"s"} still contain device-local or excluded items, or could not be removed`:"";
+    settings.retiredFolderNote=remaining?`${remaining} retired folder${remaining===1?" is":"s are"} blocked: ${remainingDetails.slice(0,4).join(" · ")}${remainingDetails.length>4?` · and ${remainingDetails.length-4} more`:""}`.slice(0,2000):"";
     if(!failures){settings.lastFolderCleanupAt=newest;settings.lastFolderCleanupError="";}
     else settings.lastFolderCleanupError=failureDetails.slice(0,8).join(" · ").slice(0,2000);
     if(removed)this.status({phase:"applying",message:`Removed ${removed} empty retired folder${removed===1?"":"s"} left by accepted moves or deletions`,level:"success"});

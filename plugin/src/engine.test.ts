@@ -111,7 +111,7 @@ describe("SyncEngine", () => {
     api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.retiredPaths={"Legacy/old.md":{hash,snapshotId:head.id,retiredAt}};config.exclusions=[...config.exclusions,"Legacy/device-local.tmp"];
     adapter.files.set("stable.md",clear);adapter.files.set("Legacy/device-local.tmp",ignored);adapter.dirs.add("Legacy");
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
-    const first=await engine.sync();expect(first.pendingRetiredFolders).toBe(1);expect(config.retiredFolderCount).toBe(1);expect(config.retiredFolderNote).toContain("1 retired folder");expect(adapter.dirs.has("Legacy")).toBe(true);
+    const first=await engine.sync();expect(first.pendingRetiredFolders).toBe(1);expect(config.retiredFolderCount).toBe(1);expect(config.retiredFolderNote).toContain("Legacy ← Legacy/device-local.tmp");expect(adapter.dirs.has("Legacy")).toBe(true);
     adapter.files.delete("Legacy/device-local.tmp");const second=await engine.sync();
     expect(second.prunedFolders).toBe(1);expect(second.pendingRetiredFolders).toBe(0);expect(config.retiredFolderCount).toBe(0);expect(config.retiredFolderNote).toBe("");expect(adapter.dirs.has("Legacy")).toBe(false);
   });
