@@ -82,8 +82,8 @@ describe("file-change sync filtering",()=>{
   it("retries folder cleanup once when upgrading to topology-aware health",async()=>{
     const oldPlugin={loadData:async()=>({folderCleanupVersion:3,lastFolderCleanupAt:12345,retiredFolderCount:2})} as unknown as Plugin;
     await expect(loadSettings(oldPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:0,retiredFolderCount:0});
-    const currentPlugin={loadData:async()=>({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"})} as unknown as Plugin;
-    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain"});
+    const currentPlugin={loadData:async()=>({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain",retiredFolderBlockers:[{folder:"Old",items:["Old/local.tmp"],truncated:false}]})} as unknown as Plugin;
+    await expect(loadSettings(currentPlugin)).resolves.toMatchObject({folderCleanupVersion:4,lastFolderCleanupAt:12345,lastFolderCleanupError:"Blocked: access denied",retiredFolderCount:2,retiredFolderNote:"2 remain",retiredFolderBlockers:[{folder:"Old",items:["Old/local.tmp"],truncated:false}]});
   });
 });
 

@@ -15,6 +15,7 @@ export interface RetiredPathState {
   snapshotId:string;
   retiredAt:number;
 }
+export interface RetiredFolderBlocker { folder:string; items:string[]; truncated:boolean; }
 
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
@@ -26,7 +27,7 @@ export interface GibSyncSettings {
   vaultIdentity: string;
   pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[];
   pendingApplySnapshotId:string|null; pendingApplyBaseSnapshotId:string|null; pendingApplyPriorHashes:Record<string,string|null>; retiredPaths:Record<string,RetiredPathState>;
-  folderCreateTimes:Record<string,number>; folderCleanupVersion:number; lastFolderCleanupAt:number; lastFolderCleanupError:string; retiredFolderCount:number; retiredFolderNote:string; fullScanRequired: boolean; lastFullScanAt: string | null;
+  folderCreateTimes:Record<string,number>; folderCleanupVersion:number; lastFolderCleanupAt:number; lastFolderCleanupError:string; retiredFolderCount:number; retiredFolderNote:string; retiredFolderBlockers:RetiredFolderBlocker[]; fullScanRequired: boolean; lastFullScanAt: string | null;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
 
@@ -34,7 +35,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
   lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
-  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:4,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null,
+  exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:4,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",retiredFolderBlockers:[],fullScanRequired:true,lastFullScanAt:null,
   storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -79,6 +80,7 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   settings.lastFolderCleanupError=typeof stored?.lastFolderCleanupError==="string"?stored.lastFolderCleanupError.slice(0,2000):"";
   settings.retiredFolderCount=currentFolderCleanup&&typeof stored?.retiredFolderCount==="number"&&Number.isInteger(stored.retiredFolderCount)&&stored.retiredFolderCount>0?stored.retiredFolderCount:0;
   settings.retiredFolderNote=currentFolderCleanup&&typeof stored?.retiredFolderNote==="string"?stored.retiredFolderNote.slice(0,2000):"";
+  settings.retiredFolderBlockers=currentFolderCleanup&&Array.isArray(stored?.retiredFolderBlockers)?stored.retiredFolderBlockers.filter((item):item is RetiredFolderBlocker=>Boolean(item)&&typeof item.folder==="string"&&Boolean(item.folder)&&Array.isArray(item.items)&&item.items.every((path)=>typeof path==="string")&&typeof item.truncated==="boolean").slice(0,100).map((item)=>({folder:item.folder,items:[...new Set(item.items)].slice(0,200),truncated:item.truncated})):[];
   return settings;
 }
 
