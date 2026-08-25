@@ -13,6 +13,7 @@ FROM node:24-bookworm-slim
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/packages/protocol ./packages/protocol
 COPY --from=build /app/apps/server ./apps/server
 USER node
