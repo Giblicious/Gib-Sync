@@ -41,6 +41,7 @@ export function buildQuickStatusModel(input:{
   if(!configured)description="Connect this vault to start syncing.";
   else if(nativeSyncBlocked)description="Turn off Obsidian Sync to continue safely.";
   else if(paused)description="Automatic syncing is paused.";
+  else if(state.key==="blocked")description=state.description||"Synchronization is safely paused.";
   else if(state.key==="attention"&&state.attentionCount>0)description=`${state.attentionCount} held change${state.attentionCount===1?"":"s"} need review.`;
   else if(state.key==="syncing")description=live.message||"Syncing your vault…";
   else if(state.key==="queued")description="Changes are waiting to sync.";
@@ -59,5 +60,6 @@ export function buildQuickStatusModel(input:{
   if(nativeSyncBlocked)return {description,meta,primaryAction:"resolve",primaryLabel:"Resolve",primaryDisabled:false};
   if(state.attentionCount>0)return {description,meta,primaryAction:"review",primaryLabel:"Review",primaryDisabled:false};
   if(paused)return {description,meta,primaryAction:"resume",primaryLabel:"Resume",primaryDisabled:false};
+  if(state.key==="blocked")return {description,meta,primaryAction:"sync",primaryLabel:"Server paused",primaryDisabled:true};
   return {description,meta,primaryAction:"sync",primaryLabel:live.running?"Syncing…":state.key==="error"?"Try again":"Sync now",primaryDisabled:live.running};
 }

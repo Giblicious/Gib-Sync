@@ -29,6 +29,10 @@ export class Store {
         label TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY(vault_id,snapshot_id));
       CREATE TABLE IF NOT EXISTS health_events(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), code TEXT NOT NULL, level TEXT NOT NULL,
         message TEXT NOT NULL, created_at TEXT NOT NULL, cleared_at TEXT);
+      CREATE TABLE IF NOT EXISTS server_containment(singleton INTEGER PRIMARY KEY CHECK(singleton=1), allowed_vault_id TEXT NOT NULL REFERENCES vaults(id),
+        reason TEXT NOT NULL, enabled_at TEXT NOT NULL, disabled_at TEXT);
+      CREATE TABLE IF NOT EXISTS server_containment_events(id TEXT PRIMARY KEY, action TEXT NOT NULL, allowed_vault_id TEXT,
+        reason TEXT NOT NULL, created_at TEXT NOT NULL);
     `);
     const columns = new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row) => row.name));
     for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT",mirror_generation_id:"TEXT"})) {

@@ -9,7 +9,7 @@ import { SeafileStorage,type ReadableStorageEntry,type VaultStorageRow } from ".
 import { SafeguardService } from "./safeguards.js";
 
 type MirrorEntry={path:string;hash:string;size:number;updated_at:string;storage_id:string|null;storage_mtime:number|null};
-export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;changedFolders?:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;}
+export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;changedFolders?:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;contained?:boolean;}
 
 const textExtensions=new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder=new TextDecoder(),encoder=new TextEncoder();
@@ -21,7 +21,7 @@ function folderSet(snapshot:Snapshot|null):Set<string>{
 
 export class ExternalImporter{
   private readonly jobs=new Map<string,Promise<ExternalImportResult>>();
-  constructor(private readonly config:Config,private readonly store:Store,private readonly storage:SeafileStorage,private readonly safeguards?:SafeguardService){}
+  constructor(private readonly config:Config,private readonly store:Store,private readonly storage:SeafileStorage,private readonly safeguards?:SafeguardService,private readonly canOperate:(vaultId:string)=>boolean=()=>true){}
   async settle():Promise<void>{await Promise.allSettled([...this.jobs.values()]);}
 
   scan(vaultId:string,fresh=false):Promise<ExternalImportResult>{
@@ -89,15 +89,16 @@ export class ExternalImporter{
   private systemJson(path:string):boolean{return path.replace(/\\/g,"/").toLowerCase().startsWith(".obsidian/")&&path.toLowerCase().endsWith(".json");}
 
   private async run(vaultId:string):Promise<ExternalImportResult>{
+    if(!this.canOperate(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
     const row=this.storageRow(vaultId),vault=this.store.one<{head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,mirror_generation_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;
     // This signed marker is Gib Sync's committed last-sync database. Safe
     // creations and edits can still be imported while a newer generation is
     // being written, but absence is deletion evidence only for a path that
     // existed in a successfully completed generation.
-    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id),mirrorCurrent=Boolean(generationCurrent&&vault.head_id===vault.mirror_head_id),head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
+    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id),mirrorCurrent=Boolean(generationCurrent&&vault.head_id===vault.mirror_head_id),head=vault.head_id?this.store.getSnapshot(vault.head_id):null,folderImportAllowed=Boolean(mirrorCurrent&&Array.isArray(head?.folders));
     const completedEntries=new Map((generationSnapshot?.entries??[]).map((entry)=>[entry.path,entry]));
     this.store.run("UPDATE vaults SET trusted_until=NULL,trusted_device_id=NULL WHERE id=? AND trusted_device_id=?",vaultId,`seafile:${vaultId}`);
-    const readableTree=await this.storage.listReadableTree(row),remote=readableTree.files,remoteFolders=new Set(readableTree.folders),headFolders=folderSet(head),completedFolders=folderSet(generationSnapshot);
+    const readableTree=await this.storage.listReadableTree(row),remote=readableTree.files,remoteFolders=new Set(readableTree.folders),headFolders=folderSet(head);
     if(remote.length>200_000)throw new Error("Readable Seafile vault exceeds 200,000 files");
     const remoteByPath=new Map(remote.map((entry)=>[entry.path,entry]));
     const mirrored=new Map(this.store.all<MirrorEntry>("SELECT path,hash,size,updated_at,storage_id,storage_mtime FROM mirror_entries WHERE vault_id=?",vaultId).map((entry)=>[entry.path,entry]));
@@ -105,7 +106,7 @@ export class ExternalImporter{
     const missingAll=[...mirrored.values()].filter((entry)=>!remoteByPath.has(entry.path));
     const scannedAt=new Date().toISOString();
     for(const absence of this.store.all<{path:string}>("SELECT path FROM external_absences WHERE vault_id=?",vaultId))if(remoteByPath.has(absence.path))this.store.run("DELETE FROM external_absences WHERE vault_id=? AND path=?",vaultId,absence.path);
-    const observedFolderChange=[...remoteFolders].some((folder)=>!(mirrorCurrent?headFolders:completedFolders).has(folder))||(mirrorCurrent&&[...headFolders].some((folder)=>!remoteFolders.has(folder)));
+    const observedFolderChange=folderImportAllowed&&([...remoteFolders].some((folder)=>!headFolders.has(folder))||[...headFolders].some((folder)=>!remoteFolders.has(folder)));
     if(!candidates.length&&!missingAll.length&&!observedFolderChange){
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
       return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,mirrorGenerationMismatch:!generationCurrent||vault.head_id!==vault.mirror_head_id};
@@ -203,9 +204,9 @@ export class ExternalImporter{
       }
     }
 
-    const finalFolders=mirrorCurrent?new Set(remoteFolders):new Set(headFolders);if(!mirrorCurrent)for(const folder of remoteFolders)if(!completedFolders.has(folder))finalFolders.add(folder);for(const folder of folderSet({entries:[...final.values()]} as Snapshot))finalFolders.add(folder);
-    const changedFolders=[...new Set([...headFolders,...finalFolders])].filter((folder)=>headFolders.has(folder)!==finalFolders.has(folder)).length;
-    const fileFolders=folderSet({entries:[...final.values()]} as Snapshot),explicitFolders=[...finalFolders].filter((folder)=>!fileFolders.has(folder)).sort();
+    const finalFolders=folderImportAllowed?new Set(remoteFolders):new Set(headFolders);for(const folder of folderSet({entries:[...final.values()]} as Snapshot))finalFolders.add(folder);
+    const changedFolders=folderImportAllowed?[...new Set([...headFolders,...finalFolders])].filter((folder)=>headFolders.has(folder)!==finalFolders.has(folder)).length:0;
+    const fileFolders=folderSet({entries:[...final.values()]} as Snapshot),explicitFolders=Array.isArray(head?.folders)?[...finalFolders].filter((folder)=>!fileFolders.has(folder)).sort():undefined;
     if(!changedFiles&&!deletedFiles&&!changedFolders){
       for(const item of downloaded.values())this.store.run("UPDATE mirror_entries SET storage_id=?,storage_mtime=?,size=? WHERE vault_id=? AND path=?",item.metadata.id,item.metadata.mtime,item.metadata.size,vaultId,item.metadata.path);
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
@@ -213,22 +214,26 @@ export class ExternalImporter{
     }
 
     for(const [hash,bytes] of newBytes){
+      if(!this.canOperate(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
       if(this.store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?",vaultId,hash))continue;
       await this.storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,encryptVaultBlob(bytes,key,hash));
       this.store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",vaultId,hash,bytes.length,scannedAt);
     }
     const entries=[...final.values()].sort((left,right)=>left.path.localeCompare(right.path));
-    const decision=this.safeguards?.propose({vaultId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",parentId:head?.id??null,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted, ${changedFolders} folders)`,entries,folders:explicitFolders,source:"seafile"});
+    if(!this.canOperate(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
+    const decision=this.safeguards?.propose({vaultId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",parentId:head?.id??null,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted, ${changedFolders} folders)`,entries,folders:explicitFolders??[],source:"seafile"});
     if(decision&&!decision.allowed){
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
       if(decision.quarantine&&decision.created)this.safeguards?.event(vaultId,"external_quarantine","warning",`Seafile changes were quarantined: ${decision.assessment.reasons.join("; ")}`);
       return {snapshotId:null,changedFiles,deletedFiles,conflicts,changedFolders,quarantineId:decision.quarantine?.id,locked:decision.locked,deferredDeletions};
     }
+    if(!this.canOperate(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
     const snapshot:Snapshot={
       id:randomUUID(),vaultId,parentId:head?.id??null,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",
       createdAt:scannedAt,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted, ${changedFolders} folders${conflicts?`, ${conflicts} conflicts`:""})`,
-      entries,folders:explicitFolders
+      entries
     };
+    if(explicitFolders)snapshot.folders=explicitFolders;
     await this.storage.put(row,`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
     this.store.db.exec("BEGIN IMMEDIATE");
     try{

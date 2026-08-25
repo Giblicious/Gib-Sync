@@ -63,6 +63,8 @@ This follows the same proven safety model used by database-backed two-way synchr
 
 Folder structure, including intentionally empty folders, synchronizes independently from file contents. After an accepted move or deletion, Gib Sync removes the retired source branch only when it is empty and has not been recreated since that change. Non-empty, excluded, newly recreated, and Obsidian framework folders are preserved.
 
+Legacy vaults initialize empty-folder topology from the first trusted upgraded Obsidian device, never from pre-existing empty shells in the readable Seafile tree. This prevents an upgrade from resurrecting directories left behind by historical moves or cleanups. Once initialized, direct Seafile folder creation and deletion remains bidirectional.
+
 `.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes portable themes, snippets, hotkeys, and other settings, but workspace layout files always remain device-local. Concurrent JSON settings changes merge recursively by key; overlapping scalar or array values use the newer side, and non-JSON system files use the newer whole file. `.obsidian` system files never create user-facing conflict copies.
 
 **Sync installed plugins** treats each plugin's code and assets as an atomic package. On first activation or after upgrading from an older client, the device pulls the accepted server plugin inventory and settings before it may publish plugin changes; when the server has no plugin state yet, the first device establishes it. This prevents a phone's incomplete plugin set or freshly created default `data.json` files from resetting an established desktop. After bootstrap, a complete package beats an incomplete copy, a higher manifest version wins, and equal versions use the later package modification. `data.json` remains independently mergeable settings. Generated cache folders—including caches, indexes, embeddings, logs, and temporary data—remain device-local and are removed from future server snapshots. The enabled-plugin list is applied after package files and entries lacking a complete `manifest.json` plus `main.js` are disabled automatically, while Gib Sync always preserves its own enablement. Plugin `data.json` files can contain API keys and are copied to readable Seafile when plugin sync is enabled.
@@ -90,6 +92,14 @@ Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. I
 5. Set `GIBSYNC_MIN_CLIENT_VERSION` to the oldest plugin release allowed to sync and `GIBSYNC_RECOMMENDED_CLIENT_VERSION` to the current release. Incompatible clients are blocked before vault access and remain able to read compatibility status.
 6. Run `docker compose up -d --build`.
 7. Verify `/healthz` reports the expected `serverVersion`, protocol, safety capabilities, `readableMirrors: true`, and client-version policy. The plugin refuses setup or synchronization when the server is too old or omits required safety capabilities.
+
+For incident containment, the server has a durable, audited global pause that allows one vault to keep operating while every other vault, external Seafile scanner, and readable-mirror worker is held. Device tokens are not revoked, so clients resume automatically when containment is cleared:
+
+```bash
+docker exec gib-sync npm run control -w @gib-sync/server -- containment enable --allow-vault-name "Vault name" --reason "Incident description"
+docker exec gib-sync npm run control -w @gib-sync/server -- containment status
+docker exec gib-sync npm run control -w @gib-sync/server -- containment disable --reason "Incident resolved"
+```
 
 Persist and back up `/data`. Existing encrypted vaults migrate without moving their sidecar objects. Their readable recovery path is created automatically under `Obsidian/<vault name>` and materialized by the first v0.3 sync.
 

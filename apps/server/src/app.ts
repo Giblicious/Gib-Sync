@@ -14,6 +14,8 @@ import { assessChanges,policyFor,SafeguardService } from "./safeguards.js";
 import { clientCompatibility } from "./compatibility.js";
 import { readGeneration,validGeneration,writeGeneration } from "./mirror-generation.js";
 import { SERVER_CAPABILITIES,SERVER_VERSION } from "./version.js";
+import { ContainmentService } from "./containment.js";
+import { repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -23,6 +25,7 @@ function snapshotFolders(snapshot:Snapshot|null):Set<string>{
   for(const entry of snapshot?.entries??[]){const parent=entry.path.split("/").slice(0,-1).join("/");if(parent)add(parent);}
   return folders;
 }
+const folderManifestInitialized=(snapshot:Snapshot|null):boolean=>Array.isArray(snapshot?.folders);
 
 export async function buildApp(config: Config, store = new Store(config.DATA_DIR), storage = new SeafileStorage(config)) {
   const unmigrated = store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NULL OR storage_token IS NULL");
@@ -39,8 +42,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const path=vault.storage_layout==="legacy"?`/Obsidian/${safeName}`:vault.storage_base_path;
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
+  repairUnsafeLegacyFolderHeads(store);
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
-  const safeguards=new SafeguardService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards);let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null,closing=false;
+  const safeguards=new SafeguardService(store),containment=new ContainmentService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards,(vaultId)=>containment.allows(vaultId));let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null,closing=false;
   const skipExternalOnce=new Set<string>(),healthRepairLocks=new Set<string>(),mirrorWriteSettles=new Map<string,{snapshotId:string;until:number}>();
   const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
   function notifyVault(vaultId:string,headId:string|null,attention=false){
@@ -57,8 +61,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
   await app.register(sensible);
   app.setErrorHandler((error,_request,reply)=>{
-    const typed=error as Error & {statusCode?:number;compatibility?:unknown},compatibility=typed.compatibility;
+    const typed=error as Error & {statusCode?:number;compatibility?:unknown;containment?:unknown},compatibility=typed.compatibility;
     if(typed.statusCode===426&&compatibility)return reply.code(426).send({error:typed.message,message:typed.message,compatibility});
+    if(typed.statusCode===423&&typed.containment)return reply.code(423).send({error:typed.message,message:typed.message,containment:typed.containment});
     return reply.send(error);
   });
   app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: config.MAX_BLOB_BYTES }, (_request, body, done) => done(null, body));
@@ -69,14 +74,16 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return clientCompatibility({clientVersion:header(request,"x-gib-sync-client-version"),clientProtocol:Number.isInteger(parsedProtocol)?parsedProtocol:null,
       minimumVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION,serverProtocol:PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES]});
   };
-  async function authenticate(request: FastifyRequest,allowIncompatible=false): Promise<AuthDevice> {
+  async function authenticate(request: FastifyRequest,options:{allowIncompatible?:boolean;allowContainment?:boolean}={}): Promise<AuthDevice> {
     const raw = request.headers.authorization?.replace(/^Bearer\s+/i, "") ?? "";
     if (!raw) throw app.httpErrors.unauthorized();
     const device = store.one<AuthDevice & { revoked_at: string | null }>("SELECT id,vault_id,name,revoked_at FROM devices WHERE token_hash=?", sha256(raw));
     if (!device || device.revoked_at) throw app.httpErrors.unauthorized();
     const compatibility=compatibilityFor(request);
     store.run("UPDATE devices SET last_seen_at=?,client_version=?,client_protocol=? WHERE id=?", new Date().toISOString(),compatibility.clientVersion,compatibility.clientProtocol,device.id);
-    if(config.GIBSYNC_MIN_CLIENT_VERSION!=="0.0.0"&&!allowIncompatible&&!compatibility.compatible)throw Object.assign(new Error(`${compatibility.reason} Update Gib Sync through BRAT before syncing.`),{statusCode:426,compatibility});
+    if(config.GIBSYNC_MIN_CLIENT_VERSION!=="0.0.0"&&!options.allowIncompatible&&!compatibility.compatible)throw Object.assign(new Error(`${compatibility.reason} Update Gib Sync through BRAT before syncing.`),{statusCode:426,compatibility});
+    const control=containment.state();
+    if(control.active&&!options.allowContainment&&control.allowedVaultId!==device.vault_id)throw Object.assign(new Error("This server is in emergency containment. Sync is safely paused for this vault; no files are being changed."),{statusCode:423,containment:{active:true,thisVaultAllowed:false,enabledAt:control.enabledAt,reason:control.reason}});
     return device;
   }
 
@@ -89,18 +96,19 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   async function reconcileReadableFolders(vaultId:string,snapshot:Snapshot):Promise<{created:number;deleted:number;remaining:string[]}>{
     const row=storageRow(vaultId),tree=await storage.listReadableTree(row),visible=new Set(tree.folders),desired=snapshotFolders(snapshot);let created=0,deleted=0;
     for(const path of [...desired].sort((left,right)=>left.split("/").length-right.split("/").length||left.localeCompare(right))){if(visible.has(path))continue;await storage.ensureReadableFolder(row,path);visible.add(path);created++;}
-    for(const path of [...visible].filter((folder)=>!desired.has(folder)).sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left))){if(await storage.deleteReadableFolder(row,path)){visible.delete(path);deleted++;}}
-    return {created,deleted,remaining:[...visible].filter((folder)=>!desired.has(folder)).sort()};
+    if(folderManifestInitialized(snapshot))for(const path of [...visible].filter((folder)=>!desired.has(folder)).sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left))){if(await storage.deleteReadableFolder(row,path)){visible.delete(path);deleted++;}}
+    return {created,deleted,remaining:folderManifestInitialized(snapshot)?[...visible].filter((folder)=>!desired.has(folder)).sort():[]};
   }
 
   async function verifyReadableGeneration(vaultId:string,snapshot:Snapshot,removedPaths:string[]):Promise<{missing:string[];lingering:string[];missingFolders:string[];lingeringFolders:string[]}>{
     const tree=await storage.listReadableTree(storageRow(vaultId)),visible=new Map(tree.files.map((entry)=>[entry.path,entry])),visibleFolders=new Set(tree.folders),desiredFolders=snapshotFolders(snapshot);
     const missing=snapshot.entries.filter((entry)=>visible.get(entry.path)?.size!==entry.size).map((entry)=>entry.path),lingering=removedPaths.filter((path)=>visible.has(path));
-    return {missing,lingering,missingFolders:[...desiredFolders].filter((path)=>!visibleFolders.has(path)),lingeringFolders:[...visibleFolders].filter((path)=>!desiredFolders.has(path))};
+    return {missing,lingering,missingFolders:[...desiredFolders].filter((path)=>!visibleFolders.has(path)),lingeringFolders:folderManifestInitialized(snapshot)?[...visibleFolders].filter((path)=>!desiredFolders.has(path)):[]};
   }
 
   const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Map<string,{timer:NodeJS.Timeout;due:number}>(),mirrorFailureCounts=new Map<string,number>(),mirrorRetryNotBefore=new Map<string,number>();
   async function ingestExternalChanges(vaultId:string,fresh=false):Promise<ExternalImportResult>{
+    if(!containment.allows(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
     const activeMirror=fresh?mirrorJobs.get(vaultId):undefined;
     if(activeMirror){
@@ -135,6 +143,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return result;
   }
   function reconcileReadableMirror(vaultId:string):Promise<void>{
+    if(!containment.allows(vaultId))return Promise.resolve();
     const active=mirrorJobs.get(vaultId);if(active)return active;
     const job=(async()=>{for(let attempt=0;attempt<3;attempt++){
       let external:ExternalImportResult|null=null;
@@ -153,16 +162,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       if(vault.mirror_head_id===vault.head_id&&vault.mirror_generation_id===vault.head_id&&validGeneration(generation,snapshot))return;
       const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId),target=new Set(snapshot.entries.map((entry)=>entry.path));
       const visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
-      const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>headStillCurrent()&&!externalScanRequests.has(vaultId);let superseded=false;
+      const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>headStillCurrent()&&!externalScanRequests.has(vaultId)&&containment.allows(vaultId);let superseded=false;
       for(const entry of snapshot.entries){if(!mayContinue()){superseded=true;break;}const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash&&visible.get(entry.path)?.size===entry.size)continue;
         const encrypted=await loadEncryptedBlob(vaultId,entry.hash);if(!encrypted)throw new Error(`Encrypted blob is unavailable for ${entry.path}`);const clear=decryptVaultBlob(encrypted,key,entry.hash);mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.putReadable(row,entry.path,clear);
         if(!mayContinue()){superseded=true;break;}
         store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at",vaultId,entry.path,entry.hash,clear.length,new Date().toISOString());}
-      if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
+      if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!containment.allows(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
       const removedPaths:string[]=[];for(const {path} of store.all<{path:string}>("SELECT path FROM mirror_entries WHERE vault_id=?",vaultId)){if(target.has(path))continue;if(!mayContinue()){superseded=true;break;}mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.deleteReadable(row,path);if(!mayContinue()){superseded=true;break;}store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,path);removedPaths.push(path);}
-      if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
+      if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!containment.allows(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
+      if(!mayContinue()){mirrorWriteSettles.delete(vaultId);return;}
       const folderResult=await reconcileReadableFolders(vaultId,snapshot),verified=await verifyReadableGeneration(vaultId,snapshot,removedPaths);if(verified.missing.length||verified.lingering.length||verified.missingFolders.length||verified.lingeringFolders.length)throw new Error(`Readable mirror generation is not yet visible (${verified.missing.length} files missing, ${verified.lingering.length} files lingering, ${verified.missingFolders.length} folders missing, ${verified.lingeringFolders.length} folders lingering${folderResult.remaining.length?`, ${folderResult.remaining.length} non-empty folder removals deferred`:""})`);
-      if(!mayContinue()){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
+      if(!mayContinue()){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!containment.allows(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
       await writeGeneration(config,storage,row,snapshot);const completed=store.run("UPDATE vaults SET mirror_head_id=?,mirror_generation_id=? WHERE id=? AND head_id=?",snapshot.id,snapshot.id,vaultId,snapshot.id);
       if(completed.changes){store.run("DELETE FROM external_absences WHERE vault_id=?",vaultId);mirrorWriteSettles.delete(vaultId);return;}
       skipExternalOnce.add(vaultId);mirrorWriteSettles.delete(vaultId);
@@ -173,7 +183,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     mirrorJobs.set(vaultId,job);return job;
   }
   function scheduleMirror(vaultId:string,delay=2000){
-    if(closing)return;const effectiveDelay=Math.max(delay,(mirrorRetryNotBefore.get(vaultId)??0)-Date.now(),0),due=Date.now()+effectiveDelay,scheduled=mirrorTimers.get(vaultId);if(scheduled&&scheduled.due<=due)return;if(scheduled)clearTimeout(scheduled.timer);
+    if(closing||!containment.allows(vaultId))return;const effectiveDelay=Math.max(delay,(mirrorRetryNotBefore.get(vaultId)??0)-Date.now(),0),due=Date.now()+effectiveDelay,scheduled=mirrorTimers.get(vaultId);if(scheduled&&scheduled.due<=due)return;if(scheduled)clearTimeout(scheduled.timer);
     const timer=setTimeout(()=>{mirrorTimers.delete(vaultId);if(!closing)void reconcileReadableMirror(vaultId);},effectiveDelay);timer.unref();mirrorTimers.set(vaultId,{timer,due});
   }
 
@@ -186,7 +196,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     };
   }
 
-  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],minimumClientVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedClientVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION, storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
+  app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],minimumClientVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedClientVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION, containmentActive:containment.state().active,storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0 }));
 
   app.post("/v1/health/repair",async(request,reply)=>{
     const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
@@ -323,7 +333,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.get("/v1/status", async (request) => {
-    const device = await authenticate(request,true); const compatibility=compatibilityFor(request),vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,mirror_generation_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
+    const device = await authenticate(request,{allowIncompatible:true,allowContainment:true}); const compatibility=compatibilityFor(request),vault = store.one<{name:string;head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;external_scan_at:string|null;external_import_at:string|null;external_error:string|null}>("SELECT name,head_id,mirror_head_id,mirror_generation_id,external_scan_at,external_import_at,external_error FROM vaults WHERE id=?",device.vault_id)!;
     const mirrorCurrent=Boolean(vault.head_id&&vault.mirror_head_id===vault.head_id&&vault.mirror_generation_id===vault.head_id);
     safeguards.clearResolvedQuarantineAlerts(device.vault_id);
     const aggregate = store.one<{snapshot_count:number;blob_count:number;blob_bytes:number}>("SELECT (SELECT COUNT(*) FROM snapshots WHERE vault_id=?) snapshot_count,(SELECT COUNT(*) FROM blobs WHERE vault_id=?) blob_count,(SELECT COALESCE(SUM(size),0) FROM blobs WHERE vault_id=?) blob_bytes",device.vault_id,device.vault_id,device.vault_id)!;
@@ -335,16 +345,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(vault.head_id&&!mirrorCurrent)healthAlerts.unshift({code:"mirror_diverged",level:"warning",message:"Readable Seafile mirror is catching up or verifying its completed generation",at:new Date().toISOString()});
     for(const item of devices)if(!item.revokedAt&&Math.abs(item.clockSkewMs)>safeguards.policy(device.vault_id).clockSkewMinutes*60_000)healthAlerts.unshift({code:`clock_skew:${item.id}`,level:"warning",message:`${item.name}'s clock differs from the server by ${Math.round(Math.abs(item.clockSkewMs)/60_000)} minutes`,at:item.lastSeenAt});
     for(const item of devices)if(!item.revokedAt&&Date.now()-Date.parse(item.lastSeenAt)>30*24*60*60*1000)healthAlerts.push({code:`stale_device:${item.id}`,level:"info",message:`${item.name} has not synced in over 30 days`,at:item.lastSeenAt});
+    const control=containment.state();
     return { protocolVersion:PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],vaultId:device.vault_id,vaultName:vault.name,deviceId:device.id,deviceName:device.name,
       deviceCount:store.one<{count:number}>("SELECT COUNT(*) count FROM devices WHERE vault_id=? AND revoked_at IS NULL",device.vault_id)?.count ?? 0,
       snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?store.getSnapshot(vault.head_id):null,
       storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
       mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
       mirrorCurrent,externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error,
-      safeguards:safeguards.state(device.vault_id,device.id),healthAlerts,devices,compatibility };
+      containment:{active:control.active,thisVaultAllowed:!control.active||control.allowedVaultId===device.vault_id,enabledAt:control.enabledAt,reason:control.reason},safeguards:safeguards.state(device.vault_id,device.id),healthAlerts,devices,compatibility };
   });
 
-  app.get("/v1/compatibility",async(request)=>{await authenticate(request,true);return compatibilityFor(request);});
+  app.get("/v1/compatibility",async(request)=>{await authenticate(request,{allowIncompatible:true,allowContainment:true});return compatibilityFor(request);});
 
   app.post("/v1/external/scan",async(request)=>{
     const device=await authenticate(request);return ingestExternalChanges(device.vault_id,true);
@@ -357,9 +368,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     folderImpactCount:z.number().int().min(1).max(200000),fileGrowthBytes:z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER),
     fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
 
-  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders:string[]=[]):Promise<Snapshot|null>{
+  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[]):Promise<Snapshot|null>{
     const current=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(current!==parentId)return null;
-    const snapshot:Snapshot={id:randomUUID(),vaultId,parentId,deviceId,deviceName,createdAt:new Date().toISOString(),message,entries:[...entries].sort((a,b)=>a.path.localeCompare(b.path)),folders:[...new Set(folders.map((folder)=>safeRelativePath(folder)))].sort()};
+    const snapshot:Snapshot={id:randomUUID(),vaultId,parentId,deviceId,deviceName,createdAt:new Date().toISOString(),message,entries:[...entries].sort((a,b)=>a.path.localeCompare(b.path))};
+    if(folders)snapshot.folders=[...new Set(folders.map((folder)=>safeRelativePath(folder)))].sort();
     await storage.put(storageRow(vaultId),`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
     store.db.exec("BEGIN IMMEDIATE");
     try{
@@ -611,7 +623,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.addHook("onReady",async()=>{
     for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL"))scheduleMirror(id,50);
-    const scanAll=()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NOT NULL"))void ingestExternalChanges(id).catch((error)=>app.log.error({err:error,vaultId:id},"External Seafile scan failed"));};
+    const scanAll=()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NOT NULL"))if(containment.allows(id))void ingestExternalChanges(id).catch((error)=>app.log.error({err:error,vaultId:id},"External Seafile scan failed"));};
     externalTimer=setInterval(scanAll,3000);externalTimer.unref();externalStartupTimer=setTimeout(scanAll,250);externalStartupTimer.unref();
   });
 

@@ -15,7 +15,7 @@ const schema = z.object({
   SEAFILE_ALLOWED_HOSTS: z.string().optional(),
   MAX_BLOB_BYTES: z.coerce.number().int().positive().default(1073741824),
   GIBSYNC_MIN_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.48"),
-  GIBSYNC_RECOMMENDED_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.48")
+  GIBSYNC_RECOMMENDED_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.49")
 });
 
 export type Config = z.infer<typeof schema>;

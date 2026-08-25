@@ -1,6 +1,6 @@
 export const PROTOCOL_VERSION = 7;
-export const MINIMUM_SAFE_SERVER_VERSION = "0.8.48";
-export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"] as const;
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.49";
+export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","server-containment-v1"] as const;
 
 export interface ClientCompatibility {
   clientVersion: string | null;
@@ -110,10 +110,18 @@ export interface ServerStatus {
   externalScanAt: string | null;
   externalImportAt: string | null;
   externalError: string | null;
+  containment?: ServerContainmentStatus;
   safeguards: SafeguardState;
   healthAlerts: HealthAlert[];
   devices: DeviceInfo[];
   compatibility: ClientCompatibility;
+}
+
+export interface ServerContainmentStatus {
+  active:boolean;
+  thisVaultAllowed:boolean;
+  enabledAt:string|null;
+  reason:string|null;
 }
 
 export interface MirrorPlanRequest {

@@ -27,6 +27,7 @@ describe("quick status popup model",()=>{
     expect(buildQuickStatusModel({state:state({key:"attention",attentionCount:2}),live,configured:true,nativeSyncBlocked:false,paused:false})).toMatchObject({description:"2 held changes need review.",primaryAction:"review",primaryLabel:"Review"});
     expect(buildQuickStatusModel({state:state({key:"blocked"}),live,configured:true,nativeSyncBlocked:false,paused:true})).toMatchObject({description:"Automatic syncing is paused.",primaryAction:"resume",primaryLabel:"Resume"});
     expect(buildQuickStatusModel({state:state({key:"blocked"}),live,configured:true,nativeSyncBlocked:true,paused:false})).toMatchObject({description:"Turn off Obsidian Sync to continue safely.",primaryAction:"resolve",primaryLabel:"Resolve"});
+    expect(buildQuickStatusModel({state:state({key:"blocked",description:"Emergency containment is protecting this vault"}),live,configured:true,nativeSyncBlocked:false,paused:false})).toMatchObject({description:"Emergency containment is protecting this vault",primaryLabel:"Server paused",primaryDisabled:true});
   });
 
   it("offers setup before a vault is connected",()=>{

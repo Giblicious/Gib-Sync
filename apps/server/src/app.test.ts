@@ -8,6 +8,7 @@ import { Store } from "./db.js";
 import { buildApp } from "./app.js";
 import type { SeafileStorage } from "./seafile.js";
 import { decryptVaultBlob,encryptVaultBlob,normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
+import { ContainmentService } from "./containment.js";
 
 class MemoryStorage {
   files = new Map<string, Uint8Array>();
@@ -54,12 +55,28 @@ describe("Gib Sync API", () => {
   it("blocks incompatible clients while preserving update guidance and status access",async()=>{
     const {config,store,storage}=fixture();config.GIBSYNC_MIN_CLIENT_VERSION="0.8.19";config.GIBSYNC_RECOMMENDED_CLIENT_VERSION="0.8.20";const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"7"};
-    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.48",protocolVersion:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"])});
+    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.49",protocolVersion:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","server-containment-v1"])});
     const blocked=await app.inject({method:"GET",url:"/v1/head",headers:legacy});expect(blocked.statusCode).toBe(426);expect(blocked.json().message).toContain("Update Gib Sync through BRAT");
     const visible=await app.inject({method:"GET",url:"/v1/status",headers:legacy});expect(visible.statusCode).toBe(200);expect(visible.json().compatibility).toMatchObject({compatible:false,minimumVersion:"0.8.19"});
-    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.48",serverProtocol:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"])});
+    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.49",serverProtocol:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","server-containment-v1"])});
     expect((await app.inject({method:"GET",url:"/v1/head",headers:current})).statusCode).toBe(200);
     const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:7,compatibility:"update-available"});await app.close();
+  });
+  it("pauses every non-allowed vault without revoking devices and resumes cleanly",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const allowed=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Allowed desktop","/Obsidian/Allowed")})).json();
+    const blocked=(await app.inject({method:"POST",url:"/v1/setup",payload:{...setupPayload("Blocked phone","/Obsidian/Blocked"),vaultName:"Blocked"}})).json();
+    const allowedAuth={authorization:`Bearer ${allowed.deviceToken}`},blockedAuth={authorization:`Bearer ${blocked.deviceToken}`};
+    const controls=new ContainmentService(store);controls.enable(allowed.vaultId,"Incident containment test");
+    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({containmentActive:true});
+    expect((await app.inject({method:"GET",url:"/v1/head",headers:allowedAuth})).statusCode).toBe(200);
+    const status=await app.inject({method:"GET",url:"/v1/status",headers:blockedAuth});expect(status.statusCode).toBe(200);expect(status.json().containment).toMatchObject({active:true,thisVaultAllowed:false,reason:"Incident containment test"});
+    const paused=await app.inject({method:"GET",url:"/v1/head",headers:blockedAuth});expect(paused.statusCode).toBe(423);expect(paused.json()).toMatchObject({containment:{active:true,thisVaultAllowed:false}});
+    expect((await app.inject({method:"GET",url:"/v1/watch?head=",headers:blockedAuth})).statusCode).toBe(423);
+    expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:blockedAuth,payload:{}})).statusCode).toBe(423);
+    storage.files.set(`read:${blocked.vaultId}:must-not-import.md`,Buffer.from("paused\n"));await new Promise((resolve)=>setTimeout(resolve,350));
+    expect(store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",blocked.vaultId)?.head_id).toBeNull();
+    controls.disable("Incident resolved");expect((await app.inject({method:"GET",url:"/v1/head",headers:blockedAuth})).statusCode).toBe(200);await app.close();
   });
   it("serves authenticated integrity-checked clear content for low-memory mobile downloads",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
@@ -182,6 +199,22 @@ describe("Gib Sync API", () => {
     storage.dirs.delete(`read:${credentials.vaultId}:New empty folder`);
     const removed=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(removed).toMatchObject({snapshotId:expect.any(String),changedFolders:1});
     state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.folders).toEqual([]);await app.close();
+  });
+  it("does not promote stale readable folders while a legacy vault awaits a trusted folder manifest",async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
+    const initial=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Legacy baseline",entries:[],folders:[]}})).json();
+    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:initial.id}})).statusCode).toBe(200);
+    const legacy={...initial};delete legacy.folders;store.run("UPDATE snapshots SET manifest_json=? WHERE id=?",JSON.stringify(legacy),initial.id);
+    storage.dirs.add(`read:${setup.vaultId}:Stale legacy shell`);
+    const folderOnly=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(folderOnly).toMatchObject({snapshotId:null,changedFiles:0});expect(folderOnly.changedFolders).toBeUndefined();
+    const external=Buffer.from("external edit\n");storage.files.set(`read:${setup.vaultId}:external.md`,external);
+    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),changedFiles:1,changedFolders:0});
+    const legacyDerived=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(legacyDerived.folders).toBeUndefined();
+    const trusted=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:legacyDerived.id,message:"Trusted folder baseline",entries:legacyDerived.entries,folders:["Trusted empty"]}})).json();
+    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:trusted.id}})).statusCode).toBe(200);expect(storage.dirs.has(`read:${setup.vaultId}:Stale legacy shell`)).toBe(false);expect(storage.dirs.has(`read:${setup.vaultId}:Trusted empty`)).toBe(true);
+    storage.dirs.add(`read:${setup.vaultId}:Remote empty`);let folderImport:any;for(let attempt=0;attempt<4;attempt++){folderImport=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();if(folderImport.snapshotId)break;await new Promise((resolve)=>setTimeout(resolve,100));}expect(folderImport).toMatchObject({snapshotId:expect.any(String),changedFolders:1});
+    expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.folders).toEqual(["Remote empty","Trusted empty"]);await app.close();
   });
   it("three-way merges simultaneous Obsidian and Seafile text edits",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
