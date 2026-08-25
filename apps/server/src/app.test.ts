@@ -11,6 +11,7 @@ import { decryptVaultBlob,encryptVaultBlob,normalizeQuickCode,openJson,sealJson,
 
 class MemoryStorage {
   files = new Map<string, Uint8Array>();
+  dirs = new Set<string>();
   blockReadableWrites = false;
   private readableWriteWaiters: Array<() => void> = [];
   async authenticate(url:string,username:string) { return {url:url.replace(/\/$/,""),username:username.toLowerCase(),token:`token:${username}`}; }
@@ -23,10 +24,13 @@ class MemoryStorage {
   async put(row:any,path:string,bytes:Uint8Array) { this.files.set(`${row.id}:${path}`, bytes.slice()); }
   async get(row:any,path:string) { const bytes = this.files.get(`${row.id}:${path}`); if (!bytes) throw new Error("missing"); return bytes.slice(); }
   async getReadable(row:any,path:string){const bytes=this.files.get(`read:${row.id}:${path}`);if(!bytes)throw new Error("missing readable");return bytes.slice();}
-  async putReadable(row:any,path:string,bytes:Uint8Array){if(this.blockReadableWrites)await new Promise<void>((resolve)=>this.readableWriteWaiters.push(resolve));this.files.set(`read:${row.id}:${path}`,bytes.slice());}
+  async putReadable(row:any,path:string,bytes:Uint8Array){if(this.blockReadableWrites)await new Promise<void>((resolve)=>this.readableWriteWaiters.push(resolve));const parts=path.split("/").slice(0,-1);let current="";for(const part of parts){current=current?`${current}/${part}`:part;this.dirs.add(`read:${row.id}:${current}`);}this.files.set(`read:${row.id}:${path}`,bytes.slice());}
+  async ensureReadableFolder(row:any,path:string){const parts=path.split("/");let current="";for(const part of parts){current=current?`${current}/${part}`:part;this.dirs.add(`read:${row.id}:${current}`);}}
   unblockReadableWrites(){this.blockReadableWrites=false;for(const resolve of this.readableWriteWaiters.splice(0))resolve();}
   async deleteReadable(row:any,path:string){this.files.delete(`read:${row.id}:${path}`);}
-  async listReadable(row:any){const prefix=`read:${row.id}:`;return [...this.files.entries()].filter(([key])=>key.startsWith(prefix)).map(([key,bytes])=>({path:key.slice(prefix.length),id:sha256(bytes),mtime:1,size:bytes.length}));}
+  async deleteReadableFolder(row:any,path:string){const key=`read:${row.id}:${path}`,prefix=`${key}/`;if([...this.files.keys()].some((item)=>item.startsWith(prefix))||[...this.dirs].some((item)=>item.startsWith(prefix)))return false;this.dirs.delete(key);return true;}
+  async listReadableTree(row:any){const prefix=`read:${row.id}:`;return {files:[...this.files.entries()].filter(([key])=>key.startsWith(prefix)).map(([key,bytes])=>({path:key.slice(prefix.length),id:sha256(bytes),mtime:1,size:bytes.length})),folders:[...this.dirs].filter((key)=>key.startsWith(prefix)).map((key)=>key.slice(prefix.length)).sort()};}
+  async listReadable(row:any){return (await this.listReadableTree(row)).files;}
 }
 
 const roots: string[] = [];
@@ -49,13 +53,13 @@ describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
   it("blocks incompatible clients while preserving update guidance and status access",async()=>{
     const {config,store,storage}=fixture();config.GIBSYNC_MIN_CLIENT_VERSION="0.8.19";config.GIBSYNC_RECOMMENDED_CLIENT_VERSION="0.8.20";const app=await buildApp(config,store,storage as unknown as SeafileStorage);
-    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"6"};
-    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.47",protocolVersion:6,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1"])});
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"7"};
+    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.48",protocolVersion:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"])});
     const blocked=await app.inject({method:"GET",url:"/v1/head",headers:legacy});expect(blocked.statusCode).toBe(426);expect(blocked.json().message).toContain("Update Gib Sync through BRAT");
     const visible=await app.inject({method:"GET",url:"/v1/status",headers:legacy});expect(visible.statusCode).toBe(200);expect(visible.json().compatibility).toMatchObject({compatible:false,minimumVersion:"0.8.19"});
-    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.47",serverProtocol:6,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1"])});
+    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.48",serverProtocol:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"])});
     expect((await app.inject({method:"GET",url:"/v1/head",headers:current})).statusCode).toBe(200);
-    const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:6,compatibility:"update-available"});await app.close();
+    const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:7,compatibility:"update-available"});await app.close();
   });
   it("serves authenticated integrity-checked clear content for low-memory mobile downloads",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`};
@@ -73,17 +77,17 @@ describe("Gib Sync API", () => {
     const manualDevice=await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Manual mobile")});expect(manualDevice.statusCode).toBe(200);expect(manualDevice.json().vaultId).toBe(credentials.vaultId);
     const readable=Buffer.from("readable note\n");const hash=sha256(readable);const blob = Buffer.from("encrypted-content");
     expect((await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:blob})).statusCode).toBe(201);
-    const commit = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"note.md",hash,size:readable.length,mtime:1}]}});
-    expect(commit.statusCode).toBe(201); expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.entries[0].path).toBe("note.md");
+    const commit = await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Initial",entries:[{path:"note.md",hash,size:readable.length,mtime:1}],folders:["Empty","Projects/Empty"]}});
+    expect(commit.statusCode).toBe(201); const committedState=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(committedState.entries[0].path).toBe("note.md");expect(committedState.folders).toEqual(["Empty","Projects/Empty"]);
     expect((await app.inject({method:"GET",url:"/v1/head",headers:auth})).json()).toEqual({headId:commit.json().id});
     const plan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:commit.json().id,entries:commit.json().entries}});expect(plan.json().uploadPaths).toEqual(["note.md"]);
     const mirrorPut=await app.inject({method:"PUT",url:"/v1/mirror/file?path=note.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":commit.json().id,"x-gib-sync-hash":hash},payload:readable});expect(mirrorPut.statusCode).toBe(204);
     const resumedPlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:commit.json().id,entries:commit.json().entries}});expect(resumedPlan.json()).toMatchObject({uploadPaths:[],alreadyCurrent:false});
-    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:commit.json().id}})).statusCode).toBe(200);
+    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:commit.json().id}})).statusCode).toBe(200);expect(storage.dirs.has(`read:${credentials.vaultId}:Empty`)).toBe(true);expect(storage.dirs.has(`read:${credentials.vaultId}:Projects/Empty`)).toBe(true);
     const emptyProposal=await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:commit.json().id,message:"Delete",entries:[]}});expect(emptyProposal.statusCode).toBe(423);
     const emptyCommit=await app.inject({method:"POST",url:`/v1/quarantines/${emptyProposal.json().quarantine.id}/approve`,headers:auth,payload:{}});expect(emptyCommit.statusCode).toBe(201);
     const deletePlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:emptyCommit.json().id,entries:[]}});expect([[],["note.md"]]).toContainEqual(deletePlan.json().deletePaths);
-    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:emptyCommit.json().id}})).statusCode).toBe(200);expect(storage.files.has(`read:${credentials.vaultId}:note.md`)).toBe(false);
+    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:emptyCommit.json().id}})).statusCode).toBe(200);expect(storage.files.has(`read:${credentials.vaultId}:note.md`)).toBe(false);expect(storage.dirs.has(`read:${credentials.vaultId}:Empty`)).toBe(false);expect(storage.dirs.has(`read:${credentials.vaultId}:Projects/Empty`)).toBe(false);
     const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json();expect(pairing.code).toMatch(/^\d{5}$/);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
     const wrongCode=((Number(pairing.code)+1)%100_000).toString().padStart(5,"0");expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:wrongCode,deviceName:"Intruder"}})).statusCode).toBe(410);
     const claim=await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pairing.code,deviceName:"Mobile"}});
@@ -167,6 +171,17 @@ describe("Gib Sync API", () => {
     expect((await app.inject({method:"POST",url:`/v1/quarantines/${deleted.json().quarantineId}/approve`,headers:auth,payload:{}})).statusCode).toBe(201);
     state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.entries).toEqual([]);
     await app.close();
+  });
+  it("imports empty folder additions and removals from the readable Seafile vault",async()=>{
+    const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${credentials.deviceToken}`};
+    const initial=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,message:"Empty baseline",entries:[],folders:[]}})).json();expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:initial.id}})).statusCode).toBe(200);
+    storage.dirs.add(`read:${credentials.vaultId}:New empty folder`);
+    const added=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(added).toMatchObject({snapshotId:expect.any(String),changedFolders:1});
+    let state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.folders).toEqual(["New empty folder"]);expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:state.head.id}})).statusCode).toBe(200);
+    storage.dirs.delete(`read:${credentials.vaultId}:New empty folder`);
+    const removed=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(removed).toMatchObject({snapshotId:expect.any(String),changedFolders:1});
+    state=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json();expect(state.head.folders).toEqual([]);await app.close();
   });
   it("three-way merges simultaneous Obsidian and Seafile text edits",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);

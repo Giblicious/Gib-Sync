@@ -75,7 +75,7 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
 }
 
 type VaultSafetyRow={safeguard_policy:string|null;write_locked_at:string|null;write_locked_by:string|null;trusted_until:string|null;trusted_device_id:string|null};
-type Proposal={vaultId:string;deviceId:string;deviceName:string;parentId:string|null;message:string;entries:ManifestEntry[];source:"device"|"seafile";signals?:ClientSafetySignals};
+type Proposal={vaultId:string;deviceId:string;deviceName:string;parentId:string|null;message:string;entries:ManifestEntry[];folders?:string[];source:"device"|"seafile";signals?:ClientSafetySignals};
 
 export class SafeguardService{
   constructor(private readonly store:Store){}
@@ -98,7 +98,7 @@ export class SafeguardService{
     const hardReason=assessment.reasons.some((reason)=>/out-of-date device|completely empty|Protected path|grew unexpectedly|mostly emptied|high-entropy/i.test(reason));
     const explicitReview=Boolean(assessment.reasons.length&&(proposal.source==="seafile"||assessment.deleted>0||hardReason));
     if(!assessment.reasons.length||!previous.length||(trusted&&!explicitReview))return {allowed:true,locked:false,assessment,quarantine:null,created:false,authorization:trusted?"trusted_window":"policy"};
-    const manifest=JSON.stringify([...proposal.entries].sort((a,b)=>a.path.localeCompare(b.path)));
+    const manifest=JSON.stringify({entries:[...proposal.entries].sort((a,b)=>a.path.localeCompare(b.path)),folders:[...new Set(proposal.folders??[])].sort()});
     const proposalHash=sha256(Buffer.from(JSON.stringify({parentId:proposal.parentId,message:proposal.message,manifest})));
     const existing=this.store.one<{id:string}>("SELECT id FROM quarantines WHERE vault_id=? AND proposal_hash=? AND status='pending'",proposal.vaultId,proposalHash);
     const id=existing?.id??randomUUID(),createdAt=new Date().toISOString(),expiresAt=new Date(Date.now()+7*24*60*60*1000).toISOString();

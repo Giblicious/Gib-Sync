@@ -19,7 +19,7 @@ class MemoryAdapter {
     for(const name of this.dirs)if(name.startsWith(prefix)&&name!==path){const rest=name.slice(prefix.length),slash=rest.indexOf("/");folders.add(slash<0?name:`${prefix}${rest.slice(0,slash)}`);}
     return { files, folders:[...folders] };
   }
-  async readBinary(path: string) { this.readCalls.push(path);return this.files.get(path)!.slice().buffer; }
+  async readBinary(path: string) { this.readCalls.push(path);const bytes=this.files.get(path);if(!bytes)throw Object.assign(new Error(`ENOENT: file not found, open '${path}'`),{code:"ENOENT"});return bytes.slice().buffer; }
   async writeBinary(path: string, data: ArrayBuffer) { this.writeCalls.push(path);this.files.set(path, new Uint8Array(data)); }
   async stat(path: string) { const bytes = this.files.get(path); if(bytes)return {type:"file" as const,ctime:1,mtime:1,size:bytes.length};return this.dirs.has(path)?{type:"folder" as const,ctime:1,mtime:this.dirMtimes.get(path)??1,size:0}:null; }
   async exists(path: string) { return this.files.has(path) || this.dirs.has(path); }
@@ -39,8 +39,8 @@ class MemoryApi {
   async getContent(hash:string){this.contentCalls.push(hash);return this.contents.get(hash)!;}
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
   async markDeviceReady(headId:string|null){this.readyHeads.push(headId??"");return {ok:true};}
-  async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"]}) {
-    this.commits++;this.lastCommitBody=body; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries};this.snapshots.set(this.head.id,this.head);return this.head;
+  async commit(body: {parentId:string|null;message:string;entries:Snapshot["entries"];folders?:string[]}) {
+    this.commits++;this.lastCommitBody=body; this.head = {id:`00000000-0000-4000-8000-${String(this.commits).padStart(12,"0")}`,vaultId:"vault",parentId:body.parentId,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:body.message,entries:body.entries,folders:body.folders};this.snapshots.set(this.head.id,this.head);return this.head;
   }
   async mirrorPlan(_snapshotId:string,entries:Snapshot["entries"]){return {uploadPaths:entries.filter((entry)=>!this.mirror.has(entry.path)).map((entry)=>entry.path),deletePaths:[],alreadyCurrent:false};}
   async putMirrorFile(_snapshotId:string,path:string,_hash:string,bytes:Uint8Array){this.mirror.set(path,bytes.slice());}
@@ -53,6 +53,26 @@ function settings(): GibSyncSettings {
 }
 
 describe("SyncEngine", () => {
+  it("ignores a newly created file that disappears from a full scan before it is read",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("quick draft.md",new TextEncoder().encode("temporary\n"));
+    const list=adapter.list.bind(adapter);adapter.list=async(path:string)=>{const result=await list(path);if(path==="")adapter.files.delete("quick draft.md");return result;};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,downloaded:0,deleted:0,conflicts:0});expect(api.commits).toBe(0);expect(api.head).toBeNull();
+  });
+  it("treats a pending file deleted between stat and read as a clean deletion",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),base:Snapshot={id:"00000000-0000-4000-8000-000000000005",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Empty",entries:[]};
+    api.head=base;api.snapshots.set(base.id,base);config.initialized=true;config.lastSnapshotId=base.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();config.pendingPaths=["quick draft.md"];adapter.files.set("quick draft.md",new TextEncoder().encode("temporary\n"));
+    const stat=adapter.stat.bind(adapter);let first=true;adapter.stat=async(path:string)=>{const result=await stat(path);if(path==="quick draft.md"&&first){first=false;adapter.files.delete(path);}return result;};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,downloaded:0,deleted:0,conflicts:0,fullScan:false});expect(api.commits).toBe(0);expect(api.head).toBe(base);
+  });
+  it("quietly retries when a new file disappears after scanning but before upload",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("quick draft.md",new TextEncoder().encode("temporary\n"));
+    const read=adapter.readBinary.bind(adapter);let reads=0;adapter.readBinary=async(path:string)=>{if(path==="quick draft.md"&&++reads===2)adapter.files.delete(path);return read(path);};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);expect(api.commits).toBe(0);
+    await expect(engine.sync()).resolves.toMatchObject({uploaded:0,downloaded:0,conflicts:0});expect(api.commits).toBe(0);
+  });
   it("cooperatively yields and throttles UI progress during large sync work",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),progress:string[]=[];let yields=0;
     for(let index=0;index<40;index++)adapter.files.set(`Journal/${index}.md`,new TextEncoder().encode(`entry ${index}\n`));
@@ -82,6 +102,19 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result).toMatchObject({prunedFolders:0,pendingRetiredFolders:0});expect(adapter.dirs.has("Projects/New section")).toBe(true);expect(config.folderCreateTimes["Projects/New section"]).toBeGreaterThan(0);expect(adapter.rmdirCalls).toEqual([]);
   });
+  it("publishes a new empty root folder and creates it on another device",async()=>{
+    const desktop=new MemoryAdapter(),api=new MemoryApi(),desktopConfig=settings();desktopConfig.fullScanRequired=true;desktop.dirs.add("Projects");desktopConfig.folderCreateTimes={Projects:Date.now()};
+    const desktopResult=await new SyncEngine(desktop as unknown as DataAdapter,api as unknown as GibSyncApi,()=>desktopConfig,async()=>{},()=>{}).sync();
+    expect(desktopResult).toMatchObject({uploaded:0,conflicts:0});expect(api.commits).toBe(1);expect(api.head?.folders).toEqual(["Projects"]);expect(desktop.dirs.has("Projects")).toBe(true);
+
+    const mobile=new MemoryAdapter(),mobileConfig={...settings(),deviceId:"mobile",deviceName:"Mobile"};
+    const mobileResult=await new SyncEngine(mobile as unknown as DataAdapter,api as unknown as GibSyncApi,()=>mobileConfig,async()=>{},()=>{}).sync();
+    expect(mobileResult).toMatchObject({uploaded:0,conflicts:0});expect(mobile.dirs.has("Projects")).toBe(true);expect(mobileConfig.lastSnapshotId).toBe(api.head?.id);expect(api.commits).toBe(1);
+
+    mobile.dirs.delete("Projects");mobileConfig.fullScanRequired=true;
+    await new SyncEngine(mobile as unknown as DataAdapter,api as unknown as GibSyncApi,()=>mobileConfig,async()=>{},()=>{}).sync();expect(api.head?.folders).toEqual([]);expect(api.commits).toBe(2);
+    await new SyncEngine(desktop as unknown as DataAdapter,api as unknown as GibSyncApi,()=>desktopConfig,async()=>{},()=>{}).sync();expect(desktop.dirs.has("Projects")).toBe(false);expect(api.commits).toBe(2);
+  });
   it("retires folder-create journal entries after the folder becomes accepted",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("accepted\n"),hash=await hashBytes(note);
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000029",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"Projects/note.md",hash,size:note.length,mtime:1}]};
@@ -105,12 +138,12 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result).toMatchObject({uploaded:0,downloaded:0,prunedFolders:0,pendingRetiredFolders:0,fullScan:false});expect(adapter.files.get("Local only/private.md")).toEqual(local);expect(adapter.dirs.has("Local only")).toBe(true);expect(adapter.trashed.size).toBe(0);
   });
-  it("withholds convergence when an accepted folder is missing locally",async()=>{
+  it("recreates an accepted folder that is missing locally",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),note=new TextEncoder().encode("accepted\n"),hash=await hashBytes(note);
     const head:Snapshot={id:"00000000-0000-4000-8000-000000000026",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Stable",entries:[{path:"Accepted/note.md",hash,size:note.length,mtime:1}]};
     api.head=head;config.initialized=true;config.lastSnapshotId=head.id;config.fullScanRequired=false;config.lastFullScanAt=new Date().toISOString();
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
-    expect(result).toMatchObject({uploaded:0,downloaded:0,pendingRetiredFolders:1,fullScan:false});expect(config.fullScanRequired).toBe(true);expect(config.retiredFolderNote).toContain("missing Accepted");
+    expect(result).toMatchObject({uploaded:0,downloaded:0,pendingRetiredFolders:0,fullScan:false});expect(adapter.dirs.has("Accepted")).toBe(true);expect(config.retiredFolderNote).toBe("");
   });
   it("prunes persisted empty retired folders during an otherwise lightweight sync",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("stable\n"),hash=await hashBytes(clear),retiredAt=Date.now()-120_000;

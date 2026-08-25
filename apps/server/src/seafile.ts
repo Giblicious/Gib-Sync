@@ -6,6 +6,7 @@ import { openJson, sealJson } from "./security.js";
 type Repo = { id?: string; repo_id?: string; name: string };
 type SeafileDirEntry={type:string;parent_dir:string;id:string;name:string;mtime:number;size?:number};
 export interface ReadableStorageEntry{path:string;id:string;mtime:number;size:number;}
+export interface ReadableStorageTree{files:ReadableStorageEntry[];folders:string[];}
 
 export interface VaultStorageRow {
   id: string;
@@ -149,10 +150,27 @@ export class SeafileStorage {
     const safe=safeRelativePath(relativePath);await this.putAt(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,bytes);
   }
 
+  async ensureReadableFolder(row:VaultStorageRow,relativePath:string):Promise<void>{
+    const safe=safeRelativePath(relativePath);await this.ensureDirectory(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`);
+  }
+
   async deleteReadable(row:VaultStorageRow,relativePath:string):Promise<void>{
     const safe=safeRelativePath(relativePath);const path=`${this.readableRoot(row)}/${safe}`||`/${safe}`;
     const response=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`,{method:"DELETE"});
     if(!response.ok&&response.status!==404)throw new Error(`Seafile delete ${path} failed (${response.status}: ${await response.text()})`);
+  }
+
+  async deleteReadableFolder(row:VaultStorageRow,relativePath:string):Promise<boolean>{
+    const safe=safeRelativePath(relativePath),path=`${this.readableRoot(row)}/${safe}`||`/${safe}`,credentials=this.credentials(row);
+    for(let check=0;check<2;check++){
+      const listing=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`);
+      if(listing.status===404)return true;if(!listing.ok)throw new Error(`Seafile directory check ${path} failed (${listing.status})`);
+      const body=await listing.json() as SeafileDirEntry[]|"uptodate";if(!Array.isArray(body)||body.length)return false;
+    }
+    const response=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`,{method:"DELETE"});
+    if(response.status===404)return true;
+    if(!response.ok){const stillThere=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`);if(stillThere.status===404)return true;if(response.status===400||response.status===409)return false;throw new Error(`Seafile delete folder ${path} failed (${response.status}: ${await response.text()})`);}
+    this.knownDirectories.delete(`${row.storage_url}|${row.storage_repo_id}|${path}`);return true;
   }
 
   async get(row: VaultStorageRow, relativePath: string): Promise<Uint8Array> {
@@ -173,22 +191,23 @@ export class SeafileStorage {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  async listReadable(row:VaultStorageRow):Promise<ReadableStorageEntry[]>{
+  async listReadableTree(row:VaultStorageRow):Promise<ReadableStorageTree>{
     const root=this.readableRoot(row)||"/",credentials=this.credentials(row);
     const response=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(root)}&recursive=1`);
-    if(response.status===404)return [];
+    if(response.status===404)return {files:[],folders:[]};
     if(!response.ok)throw new Error(`Seafile readable listing failed (${response.status})`);
     const body=await response.json() as SeafileDirEntry[]|"uptodate";
     if(!Array.isArray(body))throw new Error("Seafile returned an unexpected readable listing");
     const normalizedRoot=root==="/"?"/":`${root.replace(/\/+$/,"")}/`;
-    const output:ReadableStorageEntry[]=[];
+    const files:ReadableStorageEntry[]=[],folders:string[]=[];
     for(const entry of body){
-      if(entry.type!=="file")continue;
       const full=`${entry.parent_dir.replace(/\/+$/,"")}/${entry.name}`.replace(/\/+/g,"/");
       const path=normalizedRoot==="/"?full.replace(/^\/+/,""):full.startsWith(normalizedRoot)?full.slice(normalizedRoot.length):"";
       if(!path)continue;
-      try{output.push({path:safeRelativePath(path),id:entry.id,mtime:entry.mtime,size:entry.size??0});}catch{}
+      try{const safe=safeRelativePath(path);if(entry.type==="file")files.push({path:safe,id:entry.id,mtime:entry.mtime,size:entry.size??0});else if(entry.type==="dir")folders.push(safe);}catch{}
     }
-    return output.sort((left,right)=>left.path.localeCompare(right.path));
+    return {files:files.sort((left,right)=>left.path.localeCompare(right.path)),folders:[...new Set(folders)].sort()};
   }
+
+  async listReadable(row:VaultStorageRow):Promise<ReadableStorageEntry[]>{return (await this.listReadableTree(row)).files;}
 }

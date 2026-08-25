@@ -9,11 +9,15 @@ import { SeafileStorage,type ReadableStorageEntry,type VaultStorageRow } from ".
 import { SafeguardService } from "./safeguards.js";
 
 type MirrorEntry={path:string;hash:string;size:number;updated_at:string;storage_id:string|null;storage_mtime:number|null};
-export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;}
+export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;changedFolders?:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;}
 
 const textExtensions=new Set(["md","txt","canvas","json","jsonl","css","js","ts","yaml","yml","xml","csv","svg","html"]);
 const decoder=new TextDecoder(),encoder=new TextEncoder();
 const DELETION_CONFIRMATION_MS=15_000;
+
+function folderSet(snapshot:Snapshot|null):Set<string>{
+  const folders=new Set<string>(),add=(parts:string[])=>{let current="";for(const part of parts){current=current?`${current}/${part}`:part;folders.add(current);}};for(const folder of snapshot?.folders??[])add(folder.split("/").filter(Boolean));for(const entry of snapshot?.entries??[])add(entry.path.split("/").slice(0,-1));return folders;
+}
 
 export class ExternalImporter{
   private readonly jobs=new Map<string,Promise<ExternalImportResult>>();
@@ -90,10 +94,10 @@ export class ExternalImporter{
     // creations and edits can still be imported while a newer generation is
     // being written, but absence is deletion evidence only for a path that
     // existed in a successfully completed generation.
-    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id),mirrorCurrent=Boolean(generationCurrent&&vault.head_id===vault.mirror_head_id);
+    const generationSnapshot=vault.mirror_generation_id?this.store.getSnapshot(vault.mirror_generation_id):null,generationCurrent=Boolean(generationSnapshot&&vault.mirror_generation_id===vault.mirror_head_id),mirrorCurrent=Boolean(generationCurrent&&vault.head_id===vault.mirror_head_id),head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
     const completedEntries=new Map((generationSnapshot?.entries??[]).map((entry)=>[entry.path,entry]));
     this.store.run("UPDATE vaults SET trusted_until=NULL,trusted_device_id=NULL WHERE id=? AND trusted_device_id=?",vaultId,`seafile:${vaultId}`);
-    const remote=await this.storage.listReadable(row);
+    const readableTree=await this.storage.listReadableTree(row),remote=readableTree.files,remoteFolders=new Set(readableTree.folders),headFolders=folderSet(head),completedFolders=folderSet(generationSnapshot);
     if(remote.length>200_000)throw new Error("Readable Seafile vault exceeds 200,000 files");
     const remoteByPath=new Map(remote.map((entry)=>[entry.path,entry]));
     const mirrored=new Map(this.store.all<MirrorEntry>("SELECT path,hash,size,updated_at,storage_id,storage_mtime FROM mirror_entries WHERE vault_id=?",vaultId).map((entry)=>[entry.path,entry]));
@@ -101,12 +105,12 @@ export class ExternalImporter{
     const missingAll=[...mirrored.values()].filter((entry)=>!remoteByPath.has(entry.path));
     const scannedAt=new Date().toISOString();
     for(const absence of this.store.all<{path:string}>("SELECT path FROM external_absences WHERE vault_id=?",vaultId))if(remoteByPath.has(absence.path))this.store.run("DELETE FROM external_absences WHERE vault_id=? AND path=?",vaultId,absence.path);
-    if(!candidates.length&&!missingAll.length){
+    const observedFolderChange=[...remoteFolders].some((folder)=>!(mirrorCurrent?headFolders:completedFolders).has(folder))||(mirrorCurrent&&[...headFolders].some((folder)=>!remoteFolders.has(folder)));
+    if(!candidates.length&&!missingAll.length&&!observedFolderChange){
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
       return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,mirrorGenerationMismatch:!generationCurrent||vault.head_id!==vault.mirror_head_id};
     }
 
-    const head=vault.head_id?this.store.getSnapshot(vault.head_id):null;
     const mergeBase=(path:string):MirrorEntry|undefined=>{
       if(mirrorCurrent)return mirrored.get(path);
       const completed=completedEntries.get(path);
@@ -199,7 +203,10 @@ export class ExternalImporter{
       }
     }
 
-    if(!changedFiles&&!deletedFiles){
+    const finalFolders=mirrorCurrent?new Set(remoteFolders):new Set(headFolders);if(!mirrorCurrent)for(const folder of remoteFolders)if(!completedFolders.has(folder))finalFolders.add(folder);for(const folder of folderSet({entries:[...final.values()]} as Snapshot))finalFolders.add(folder);
+    const changedFolders=[...new Set([...headFolders,...finalFolders])].filter((folder)=>headFolders.has(folder)!==finalFolders.has(folder)).length;
+    const fileFolders=folderSet({entries:[...final.values()]} as Snapshot),explicitFolders=[...finalFolders].filter((folder)=>!fileFolders.has(folder)).sort();
+    if(!changedFiles&&!deletedFiles&&!changedFolders){
       for(const item of downloaded.values())this.store.run("UPDATE mirror_entries SET storage_id=?,storage_mtime=?,size=? WHERE vault_id=? AND path=?",item.metadata.id,item.metadata.mtime,item.metadata.size,vaultId,item.metadata.path);
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
       return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts,deferredDeletions,mirrorGenerationMismatch:!generationCurrent||vault.head_id!==vault.mirror_head_id};
@@ -211,16 +218,16 @@ export class ExternalImporter{
       this.store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",vaultId,hash,bytes.length,scannedAt);
     }
     const entries=[...final.values()].sort((left,right)=>left.path.localeCompare(right.path));
-    const decision=this.safeguards?.propose({vaultId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",parentId:head?.id??null,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted)`,entries,source:"seafile"});
+    const decision=this.safeguards?.propose({vaultId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",parentId:head?.id??null,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted, ${changedFolders} folders)`,entries,folders:explicitFolders,source:"seafile"});
     if(decision&&!decision.allowed){
       this.store.run("UPDATE vaults SET external_scan_at=?,external_error=NULL WHERE id=?",scannedAt,vaultId);
       if(decision.quarantine&&decision.created)this.safeguards?.event(vaultId,"external_quarantine","warning",`Seafile changes were quarantined: ${decision.assessment.reasons.join("; ")}`);
-      return {snapshotId:null,changedFiles,deletedFiles,conflicts,quarantineId:decision.quarantine?.id,locked:decision.locked,deferredDeletions};
+      return {snapshotId:null,changedFiles,deletedFiles,conflicts,changedFolders,quarantineId:decision.quarantine?.id,locked:decision.locked,deferredDeletions};
     }
     const snapshot:Snapshot={
       id:randomUUID(),vaultId,parentId:head?.id??null,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",
-      createdAt:scannedAt,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted${conflicts?`, ${conflicts} conflicts`:""})`,
-      entries
+      createdAt:scannedAt,message:`Seafile external change (${changedFiles} changed, ${deletedFiles} deleted, ${changedFolders} folders${conflicts?`, ${conflicts} conflicts`:""})`,
+      entries,folders:explicitFolders
     };
     await this.storage.put(row,`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
     this.store.db.exec("BEGIN IMMEDIATE");
@@ -233,6 +240,6 @@ export class ExternalImporter{
       for(const missing of deleted)if(!final.has(missing.path)){this.store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,missing.path);this.store.run("DELETE FROM external_absences WHERE vault_id=? AND path=?",vaultId,missing.path);}
       this.store.db.exec("COMMIT");
     }catch(error){try{this.store.db.exec("ROLLBACK");}catch{}throw error;}
-    return {snapshotId:snapshot.id,changedFiles,deletedFiles,conflicts,deferredDeletions};
+    return {snapshotId:snapshot.id,changedFiles,deletedFiles,conflicts,changedFolders,deferredDeletions};
   }
 }

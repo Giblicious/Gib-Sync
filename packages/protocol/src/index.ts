@@ -1,6 +1,6 @@
-export const PROTOCOL_VERSION = 6;
-export const MINIMUM_SAFE_SERVER_VERSION = "0.8.36";
-export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1"] as const;
+export const PROTOCOL_VERSION = 7;
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.48";
+export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1"] as const;
 
 export interface ClientCompatibility {
   clientVersion: string | null;
@@ -31,6 +31,8 @@ export interface Snapshot {
   createdAt: string;
   message: string;
   entries: ManifestEntry[];
+  /** Explicit accepted folder topology. Omitted by snapshots created before protocol 7. */
+  folders?: string[];
 }
 
 export interface SetupResponse {
@@ -148,6 +150,7 @@ export interface CommitRequest {
   parentId: string | null;
   message: string;
   entries: ManifestEntry[];
+  folders?: string[];
   clientTime?: string;
   signals?: ClientSafetySignals;
 }

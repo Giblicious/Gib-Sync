@@ -6,25 +6,32 @@ import type { SeafileStorage,VaultStorageRow } from "./seafile.js";
 const GENERATION_PATH="readable-generation.gib";
 
 export interface ReadableGeneration{
-  version:1;
+  version:2;
   vaultId:string;
   snapshotId:string;
   entryCount:number;
+  folderCount:number;
   manifestHash:string;
   completedAt:string;
 }
 
-export function manifestHash(entries:ManifestEntry[]):string{
+function foldersFor(snapshot:Snapshot):string[]{
+  const folders=new Set<string>(),add=(parts:string[])=>{let current="";for(const part of parts){current=current?`${current}/${part}`:part;folders.add(current);}};for(const folder of snapshot.folders??[])add(folder.split("/").filter(Boolean));for(const entry of snapshot.entries)add(entry.path.split("/").slice(0,-1));
+  return [...folders].sort();
+}
+
+export function manifestHash(entries:ManifestEntry[],folders:string[]=[]):string{
   const stable=[...entries].sort((left,right)=>left.path.localeCompare(right.path)).map(({path,hash,size})=>({path,hash,size}));
-  return sha256(Buffer.from(JSON.stringify(stable)));
+  return sha256(Buffer.from(JSON.stringify({entries:stable,folders:[...new Set(folders)].sort()})));
 }
 
 export function generationFor(snapshot:Snapshot):ReadableGeneration{
-  return {version:1,vaultId:snapshot.vaultId,snapshotId:snapshot.id,entryCount:snapshot.entries.length,manifestHash:manifestHash(snapshot.entries),completedAt:new Date().toISOString()};
+  const folders=foldersFor(snapshot);return {version:2,vaultId:snapshot.vaultId,snapshotId:snapshot.id,entryCount:snapshot.entries.length,folderCount:folders.length,manifestHash:manifestHash(snapshot.entries,folders),completedAt:new Date().toISOString()};
 }
 
 export function validGeneration(generation:ReadableGeneration|null,snapshot:Snapshot|null):generation is ReadableGeneration{
-  return Boolean(generation&&snapshot&&generation.version===1&&generation.vaultId===snapshot.vaultId&&generation.snapshotId===snapshot.id&&generation.entryCount===snapshot.entries.length&&generation.manifestHash===manifestHash(snapshot.entries));
+  if(!generation||!snapshot||generation.version!==2)return false;const folders=foldersFor(snapshot);
+  return generation.vaultId===snapshot.vaultId&&generation.snapshotId===snapshot.id&&generation.entryCount===snapshot.entries.length&&generation.folderCount===folders.length&&generation.manifestHash===manifestHash(snapshot.entries,folders);
 }
 
 export async function readGeneration(config:Config,storage:SeafileStorage,row:VaultStorageRow):Promise<ReadableGeneration|null>{

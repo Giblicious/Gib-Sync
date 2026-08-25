@@ -59,7 +59,7 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){this.settings.folderCreateTimes[normalizePath(file.path)]=Date.now();this.persistJournalSoon();}else this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path),expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.settings.folderCreateTimes[path]=Date.now();this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path),expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {this.lastVaultRenameAt=Date.now();if(file instanceof TFolder){this.settings.folderCreateTimes[normalizePath(file.path)]=Date.now();this.persistJournalSoon();this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
@@ -408,6 +408,7 @@ export default class GibSyncPlugin extends Plugin {
     try{
       const stat=await this.app.vault.adapter.stat(path);
       if(!stat&&expectedHash===null){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
+      if(stat?.type==="folder"&&expectedHash==="folder"){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
       if(stat?.type==="file"&&expectedHash&&await hashBytes(new Uint8Array(await this.app.vault.adapter.readBinary(path)))===expectedHash){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
     }catch{}
     if(this.expectedLocalMutations.get(path)!==expectedHash)return;this.expectedLocalMutations.delete(path);
