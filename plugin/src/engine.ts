@@ -159,6 +159,22 @@ export class SyncEngine {
     try{return await hashBytes(new Uint8Array(await this.adapter.readBinary(path)))!==retired.hash;}catch{return true;}
   }
 
+  private hasLocalFolderIntent(path:string,after=0):boolean{
+    const normalized=normalizePath(path);
+    return Object.entries(this.getSettings().folderCreateTimes).some(([createdAtPath,createdAt])=>{
+      if(createdAt<=after)return false;const created=normalizePath(createdAtPath);
+      return created===normalized||created.startsWith(`${normalized}/`)||normalized.startsWith(`${created}/`);
+    });
+  }
+
+  private trimFolderCreateTimes(existing:Set<string>,desired:Set<string>):void{
+    const times=this.getSettings().folderCreateTimes;
+    for(const recorded of Object.keys(times)){
+      const path=normalizePath(recorded);
+      if(!existing.has(path)||desired.has(path))delete times[recorded];
+    }
+  }
+
   private async retireFolderFile(path:string,batch:string):Promise<"kept"|"metadata"|"recovered">{
     if(await this.currentFolderFile(path))return "kept";
     await this.cooperate();this.expectLocalMutation(path,null);
@@ -216,7 +232,7 @@ export class SyncEngine {
     }
     const eligible=new Set<string>();let failures=0,removed=0;const failureDetails:string[]=[];
     for(const [path,retiredAt] of candidates){
-      try{const stat=await this.adapter.stat(path);if(stat?.type==="folder")eligible.add(path);}catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
+      try{const stat=await this.adapter.stat(path);if(stat?.type==="folder"&&!this.hasLocalFolderIntent(path,retiredAt))eligible.add(path);}catch(error){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}
     }
     const ordered=[...eligible].sort((left,right)=>right.split("/").length-left.split("/").length||right.localeCompare(left));let metadataRemoved=0,recovered=0;const batch=new Date().toISOString().replace(/[:.]/g,"-");
     for(const path of ordered){
@@ -278,7 +294,7 @@ export class SyncEngine {
   }
 
   private async reconcileFolderTopology(acceptedPaths:Iterable<string>):Promise<{removed:number;remaining:number}>{
-    const settings=this.getSettings(),desired=this.acceptedFolders(acceptedPaths),before=await this.localManagedFolders(),extraRoots=this.minimalFolderRoots([...before].filter((path)=>!desired.has(path)));
+    const settings=this.getSettings(),desired=this.acceptedFolders(acceptedPaths),before=await this.localManagedFolders(),extraRoots=this.minimalFolderRoots([...before].filter((path)=>!desired.has(path)&&!this.hasLocalFolderIntent(path)));
     let removed=0,recovered=0,metadata=0,failures=0;const failureDetails:string[]=[],batch=new Date().toISOString().replace(/[:.]/g,"-");
     for(const root of extraRoots){
       await this.cooperate();
@@ -289,7 +305,7 @@ export class SyncEngine {
         const cleaned=await this.pruneRetiredTree(root,batch);removed+=cleaned.folders;recovered+=cleaned.recovered;metadata+=cleaned.metadata;
       }catch(error){failures++;failureDetails.push(`${root}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    const after=extraRoots.length?await this.localManagedFolders():before,extra=this.minimalFolderRoots([...after].filter((path)=>!desired.has(path))),missing=this.minimalFolderRoots([...desired].filter((path)=>!after.has(path))),remaining=extra.length+missing.length;
+    const after=extraRoots.length?await this.localManagedFolders():before,extra=this.minimalFolderRoots([...after].filter((path)=>!desired.has(path)&&!this.hasLocalFolderIntent(path))),missing=this.minimalFolderRoots([...desired].filter((path)=>!after.has(path))),remaining=extra.length+missing.length;this.trimFolderCreateTimes(after,desired);
     settings.retiredFolderCount=remaining;
     settings.retiredFolderNote=remaining?`Folder topology differs from the accepted snapshot: ${[...extra.map((path)=>`extra ${path}`),...missing.map((path)=>`missing ${path}`)].slice(0,8).join(" · ")}${remaining>8?` · and ${remaining-8} more`:""}`.slice(0,2000):"";
     if(!failures)settings.lastFolderCleanupAt=Date.now();settings.lastFolderCleanupError=failures?failureDetails.slice(0,8).join(" · ").slice(0,2000):"";

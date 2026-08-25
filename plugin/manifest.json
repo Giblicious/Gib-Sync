@@ -1,7 +1,7 @@
 {
   "id": "gib-sync",
   "name": "Gib Sync",
-  "version": "0.8.46",
+  "version": "0.8.47",
   "minAppVersion": "1.5.0",
   "description": "Self-hosted, versioned Obsidian sync with bidirectional Seafile editing and live status.",
   "author": "Giblicious",
