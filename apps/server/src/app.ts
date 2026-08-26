@@ -15,7 +15,10 @@ import { clientCompatibility } from "./compatibility.js";
 import { readGeneration,validGeneration,writeGeneration } from "./mirror-generation.js";
 import { SERVER_CAPABILITIES,SERVER_VERSION } from "./version.js";
 import { ContainmentService } from "./containment.js";
-import { repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
+import { planLegacyFolderDescendantRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
+import { canonicalManifest } from "./manifest.js";
+import { auditHeadIntegrity } from "./integrity.js";
+import { SnapshotCommitter } from "./snapshot-commit.js";
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -43,6 +46,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
   repairUnsafeLegacyFolderHeads(store);
+  const integrityBlockedVaults=new Set<string>();
+  for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){
+    const audit=auditHeadIntegrity(store,vault.id,vault.head_id);if(audit.valid)continue;integrityBlockedVaults.add(vault.id);const now=new Date().toISOString();
+    store.run("UPDATE vaults SET write_locked_at=COALESCE(write_locked_at,?),write_locked_by=COALESCE(write_locked_by,'Server integrity audit') WHERE id=?",now,vault.id);
+    if(!store.one("SELECT 1 FROM health_events WHERE vault_id=? AND code='head_integrity_blocked' AND cleared_at IS NULL",vault.id))store.run("INSERT INTO health_events(id,vault_id,code,level,message,created_at) VALUES(?,?,?,?,?,?)",randomUUID(),vault.id,"head_integrity_blocked","error",`Sync was stopped before mirror mutation because the accepted snapshot failed integrity checks: ${audit.issues.join("; ")}`,now);
+  }
   const app = Fastify({ trustProxy:true,logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: config.MAX_BLOB_BYTES + 1024 });
   const safeguards=new SafeguardService(store),containment=new ContainmentService(store),externalImporter=new ExternalImporter(config,store,storage,safeguards,(vaultId)=>containment.allows(vaultId));let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null,closing=false;
   const skipExternalOnce=new Set<string>(),healthRepairLocks=new Set<string>(),mirrorWriteSettles=new Map<string,{snapshotId:string;until:number}>();
@@ -92,6 +101,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if (!row?.storage_url || !row.storage_token) throw new Error("Vault storage is not configured");
     return row;
   }
+  const snapshotCommitter=new SnapshotCommitter(store,storage,storageRow);
 
   async function reconcileReadableFolders(vaultId:string,snapshot:Snapshot):Promise<{created:number;deleted:number;remaining:string[]}>{
     const row=storageRow(vaultId),tree=await storage.listReadableTree(row),visible=new Set(tree.folders),desired=snapshotFolders(snapshot);let created=0,deleted=0;
@@ -109,6 +119,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   const mirrorJobs=new Map<string,Promise<void>>(),externalScanRequests=new Set<string>(),interruptedExternalResults=new Map<string,ExternalImportResult>();const mirrorTimers=new Map<string,{timer:NodeJS.Timeout;due:number}>(),mirrorFailureCounts=new Map<string,number>(),mirrorRetryNotBefore=new Map<string,number>();
   async function ingestExternalChanges(vaultId:string,fresh=false):Promise<ExternalImportResult>{
     if(!containment.allows(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
+    if(integrityBlockedVaults.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,locked:true};
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
     const activeMirror=fresh?mirrorJobs.get(vaultId):undefined;
     if(activeMirror){
@@ -143,7 +154,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return result;
   }
   function reconcileReadableMirror(vaultId:string):Promise<void>{
-    if(!containment.allows(vaultId))return Promise.resolve();
+    if(!containment.allows(vaultId)||integrityBlockedVaults.has(vaultId))return Promise.resolve();
     const active=mirrorJobs.get(vaultId);if(active)return active;
     const job=(async()=>{for(let attempt=0;attempt<3;attempt++){
       let external:ExternalImportResult|null=null;
@@ -200,15 +211,16 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.post("/v1/health/repair",async(request,reply)=>{
     const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
+    if(integrityBlockedVaults.has(device.vault_id))return reply.code(423).send({error:"The accepted snapshot failed structural integrity checks. Automated mirror repair is blocked to prevent propagation; restore the database from a verified backup or use an audited server repair."});
     if(healthRepairLocks.has(device.vault_id))return reply.conflict("A health repair is already running for this vault");healthRepairLocks.add(device.vault_id);
     try{
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;
     let snapshot=vault.head_id?store.getSnapshot(vault.head_id):null,removedConflictCopies=0;
     if(snapshot){
       const generatedSuffix=/ \(conflict - .+ - \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} UTC(?: - \d+)?\)(?=\.[^/]+$|$)/i;
-      const paths=new Set(snapshot.entries.map((entry)=>entry.path)),groups=new Map<string,ManifestEntry[]>();
+      const groups=new Map<string,ManifestEntry[]>();
       for(const entry of snapshot.entries){const original=entry.path.replace(generatedSuffix,"");if(original===entry.path)continue;const copies=groups.get(original)??[];copies.push(entry);groups.set(original,copies);}
-      const redundant=new Set<string>();for(const [original,copies] of groups)if(paths.has(original)&&copies.length>=3)for(const copy of copies)redundant.add(copy.path);
+      const byPath=new Map(snapshot.entries.map((entry)=>[entry.path,entry])),redundant=new Set<string>();for(const [original,copies] of groups){const intact=byPath.get(original);if(!intact)continue;for(const copy of copies)if(copy.hash===intact.hash)redundant.add(copy.path);}
       if(redundant.size){
         const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)),snapshot.folders);
         if(!cleaned)return reply.conflict("Vault changed while health repair was preparing the cleaned snapshot");
@@ -361,7 +373,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device=await authenticate(request);return ingestExternalChanges(device.vault_id,true);
   });
 
-  const entrySchema=z.object({path:z.string().min(1),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
+  const entrySchema=z.object({path:z.string().min(1).max(4000).refine((value)=>{try{return safeRelativePath(value)===value;}catch{return false;}},"Invalid vault-relative file path"),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().nonnegative()});
   const folderSchema=z.string().min(1).max(4000).refine((value)=>{try{return safeRelativePath(value)===value;}catch{return false;}},"Invalid vault-relative folder path");
   const policySchema=z.object({mode:z.enum(["strict","balanced","custom"]),deletionCount:z.number().int().min(1).max(100000),smallVaultDeletionCount:z.number().int().min(1).max(100000),
     smallVaultDeletionPercent:z.number().min(1).max(100),changedCount:z.number().int().min(1).max(200000),changedPercent:z.number().min(1).max(100),
@@ -369,18 +381,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
 
   async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[]):Promise<Snapshot|null>{
-    const current=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(current!==parentId)return null;
-    const snapshot:Snapshot={id:randomUUID(),vaultId,parentId,deviceId,deviceName,createdAt:new Date().toISOString(),message,entries:[...entries].sort((a,b)=>a.path.localeCompare(b.path))};
-    if(folders)snapshot.folders=[...new Set(folders.map((folder)=>safeRelativePath(folder)))].sort();
-    await storage.put(storageRow(vaultId),`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
-    store.db.exec("BEGIN IMMEDIATE");
-    try{
-      const latest=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id;if(latest!==parentId){store.db.exec("ROLLBACK");return null;}
-      store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,parentId,deviceId,deviceName,snapshot.createdAt,message,JSON.stringify(snapshot));
-      store.run("UPDATE vaults SET head_id=? WHERE id=?",snapshot.id,vaultId);
-      store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",snapshot.createdAt,vaultId,parentId);
-      store.db.exec("COMMIT");
-    }catch(error){try{store.db.exec("ROLLBACK");}catch{}throw error;}
+    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,afterInsert:(accepted)=>store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId)});if(!snapshot)return null;
     safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
 
@@ -391,6 +392,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
   app.post("/v1/safeguards/lock",async(request)=>{
     const device=await authenticate(request),locked=z.object({locked:z.boolean()}).parse(request.body).locked,now=new Date().toISOString();
+    if(!locked&&integrityBlockedVaults.has(device.vault_id))throw Object.assign(new Error("The server integrity lock cannot be cleared until the accepted snapshot is repaired and the server is restarted."),{statusCode:423});
     store.run("UPDATE vaults SET write_locked_at=?,write_locked_by=? WHERE id=?",locked?now:null,locked?device.name:null,device.vault_id);
     safeguards.event(device.vault_id,locked?"write_lock_enabled":"write_lock_disabled","info",locked?`Remote writes frozen by ${device.name}`:`Remote writes resumed by ${device.name}`);
     return safeguards.state(device.vault_id,device.id);
@@ -448,6 +450,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     await ingestExternalChanges(device.vault_id);
     const vault=store.one<{head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null}>("SELECT head_id,mirror_head_id,mirror_generation_id FROM vaults WHERE id=?",device.vault_id)!;
     if(vault.head_id!==body.snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
+    const snapshot=store.getSnapshot(body.snapshotId),requested=canonicalManifest(body.entries).entries,accepted=snapshot?canonicalManifest(snapshot.entries).entries:[];
+    if(!snapshot||JSON.stringify(requested.map(({path,hash,size})=>({path,hash,size})))!==JSON.stringify(accepted.map(({path,hash,size})=>({path,hash,size}))))return reply.code(422).send({error:"Mirror plan does not exactly match the accepted snapshot"});
     const row=storageRow(device.vault_id),current=new Map(store.all<{path:string;hash:string;size:number}>("SELECT path,hash,size FROM mirror_entries WHERE vault_id=?",device.vault_id).map((entry)=>[entry.path,entry])),visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
     const target=new Map(body.entries.map((entry)=>[entry.path,entry.hash]));
     const uploadPaths=body.entries.filter((entry)=>current.get(entry.path)?.hash!==entry.hash||visible.get(entry.path)?.size!==entry.size).map((entry)=>entry.path);
@@ -506,16 +510,15 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   async function loadEncryptedBlob(vaultId:string,hash:string):Promise<Uint8Array|null>{
     const exists=store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?",vaultId,hash);if(!exists)return null;
-    const row=storageRow(vaultId);let bytes:Uint8Array;
-    try{bytes=await storage.get(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`);}
+    const row=storageRow(vaultId),vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;
+    const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);let bytes:Uint8Array;
+    try{bytes=await storage.get(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`);decryptVaultBlob(bytes,key,hash);}
     catch(error){
-      const vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId);
-      const entry=vault?.head_id?store.getSnapshot(vault.head_id)?.entries.find((item)=>item.hash===hash):undefined;
+      const entry=vault.head_id?store.getSnapshot(vault.head_id)?.entries.find((item)=>item.hash===hash):undefined;
       if(!entry)throw error;
       const clear=await storage.getReadable(row,entry.path);if(sha256(clear)!==hash)throw error;
-      const key=openJson<string>(vault!.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);
       bytes=encryptVaultBlob(clear,key,hash);await storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,bytes);
-      app.log.warn({vaultId,hash,path:entry.path},"Recovered missing encrypted blob from readable mirror");
+      app.log.warn({vaultId,hash,path:entry.path},"Recovered missing or corrupt encrypted blob from readable mirror");
     }
     return bytes;
   }
@@ -537,20 +540,27 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.put("/v1/blobs/:hash", async (request, reply) => {
     const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
-    if (store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, hash)) return reply.code(204).send();
+    if (store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, hash)){
+      try{if(await loadEncryptedBlob(device.vault_id,hash))return reply.code(204).send();}catch{app.log.warn({vaultId:device.vault_id,hash},"Replacing a registered blob that failed storage integrity verification");}
+    }
     const bytes = new Uint8Array(request.body ? Buffer.from(request.body as Buffer) : Buffer.alloc(0));
     if (!bytes.length) return reply.badRequest("Empty blob");
+    const vault=store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",device.vault_id)!;
+    try{decryptVaultBlob(bytes,openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id),hash);}catch{return reply.code(422).send({error:"Encrypted blob authentication or content hash is invalid"});}
     await storage.put(storageRow(device.vault_id), `blobs/${hash.slice(0,2)}/${hash}.gbs`, bytes);
-    store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)", device.vault_id, hash, bytes.length, new Date().toISOString());
+    store.run("INSERT INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?) ON CONFLICT(vault_id,hash) DO UPDATE SET size=excluded.size,created_at=excluded.created_at", device.vault_id, hash, bytes.length, new Date().toISOString());
     return reply.code(201).send();
   });
 
   app.post("/v1/commit", async (request, reply) => {
     const device = await authenticate(request);
+    if(integrityBlockedVaults.has(device.vault_id))return reply.code(423).send({error:"Sync is blocked because the accepted snapshot failed server integrity checks"});
     await ingestExternalChanges(device.vault_id);
     const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),folders:z.array(folderSchema).max(200000).default([]),
       clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),deviceLocalCleanupPaths:z.array(z.string().max(1000)).max(5000).optional(),vaultIdentity:z.string().max(500).optional(),staleBaseline:z.boolean().optional()}).optional() }).parse(request.body) as CommitRequest;
     if(body.clientTime){const skew=Date.parse(body.clientTime)-Date.now();store.run("UPDATE devices SET clock_skew_ms=? WHERE id=?",Number.isFinite(skew)?Math.round(skew):0,device.id);}
+    let manifest;try{manifest=canonicalManifest(body.entries,body.folders);}catch(error){return reply.code(422).send({error:error instanceof Error?error.message:String(error)});}
+    body.entries=manifest.entries;body.folders=manifest.folders??[];
     const missing = body.entries.filter((entry) => !store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, entry.hash));
     if (missing.length) return reply.code(422).send({ error: "Missing blobs", hashes: missing.slice(0,100).map((e) => e.hash) });
     const current = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!.head_id;
@@ -583,7 +593,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const vault=store.one<{head_id:string|null;write_locked_at:string|null}>("SELECT head_id,write_locked_at FROM vaults WHERE id=?",device.vault_id)!;
     if(intent.vaultId!==device.vault_id||intent.deviceId!==device.id||intent.snapshotId!==id||intent.headId!==vault.head_id||Date.parse(intent.expiresAt)<Date.now())return reply.conflict("Vault changed after the restore preview; preview it again");
     if(vault.write_locked_at)return reply.code(423).send({error:"Remote writes are frozen for this vault"});
-    const restored=await acceptSnapshot(device.vault_id,vault.head_id,device.id,device.name,`Restore ${id}`,source.entries,source.folders);if(!restored)return reply.conflict("Vault changed during restore");
+    const currentSnapshot=vault.head_id?store.getSnapshot(vault.head_id):null;
+    // Restoring a protocol-6 snapshot is a file restore, not permission to
+    // erase a newer authoritative empty-folder baseline.
+    const restored=await acceptSnapshot(device.vault_id,vault.head_id,device.id,device.name,`Restore ${id}`,source.entries,source.folders??currentSnapshot?.folders??[]);if(!restored)return reply.conflict("Vault changed during restore");
     return reply.code(201).send(restored);
   });
 
@@ -622,7 +635,16 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   app.addHook("onReady",async()=>{
-    for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL"))scheduleMirror(id,50);
+    for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){
+      if(!containment.allows(vault.id)||integrityBlockedVaults.has(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id);if(!plan)continue;
+      const head=store.getSnapshot(vault.head_id);if(!head)continue;
+      const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders);
+      if(repaired){
+        safeguards.event(vault.id,"legacy_folder_descendants_repaired","info",`Repaired ${plan.contaminatedFolders.length} inherited empty folder records while preserving file content and later device folder intent.`);
+        store.run("UPDATE health_events SET cleared_at=? WHERE vault_id=? AND cleared_at IS NULL AND code='legacy_folder_migration_reverted'",new Date().toISOString(),vault.id);
+      }
+    }
+    for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL"))if(!integrityBlockedVaults.has(id))scheduleMirror(id,50);
     const scanAll=()=>{for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NOT NULL"))if(containment.allows(id))void ingestExternalChanges(id).catch((error)=>app.log.error({err:error,vaultId:id},"External Seafile scan failed"));};
     externalTimer=setInterval(scanAll,3000);externalTimer.unref();externalStartupTimer=setTimeout(scanAll,250);externalStartupTimer.unref();
   });

@@ -1,6 +1,6 @@
 export const PROTOCOL_VERSION = 7;
-export const MINIMUM_SAFE_SERVER_VERSION = "0.8.49";
-export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","server-containment-v1"] as const;
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.51";
+export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1"] as const;
 
 export interface ClientCompatibility {
   clientVersion: string | null;

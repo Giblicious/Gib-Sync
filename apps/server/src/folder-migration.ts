@@ -2,25 +2,77 @@ import { randomUUID } from "node:crypto";
 import type { Snapshot } from "@gib-sync/protocol";
 import type { Store } from "./db.js";
 
-function sameFiles(left:Snapshot,right:Snapshot):boolean{
-  if(left.entries.length!==right.entries.length)return false;
-  const stable=(snapshot:Snapshot)=>snapshot.entries.map(({path,hash,size,mtime})=>({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
-  return JSON.stringify(stable(left))===JSON.stringify(stable(right));
+const stableFiles=(snapshot:Snapshot)=>snapshot.entries.map(({path,hash,size})=>({path,hash,size})).sort((a,b)=>a.path.localeCompare(b.path));
+const sameFiles=(left:Snapshot,right:Snapshot):boolean=>JSON.stringify(stableFiles(left))===JSON.stringify(stableFiles(right));
+const folders=(snapshot:Snapshot):Set<string>=>new Set(snapshot.folders??[]);
+const externalDevice=(snapshot:Snapshot):boolean=>snapshot.deviceId===`seafile:${snapshot.vaultId}`&&snapshot.deviceName==="Seafile";
+const trustedDevice=(snapshot:Snapshot):boolean=>!externalDevice(snapshot)&&!snapshot.deviceId.startsWith("server:");
+
+/**
+ * Protocol 7 briefly allowed a legacy readable mirror to seed its empty-folder
+ * baseline. That source had no deletion history, so stale empty directories
+ * could become authoritative. The signature deliberately requires an exact
+ * file manifest and a legacy parent with no folder manifest.
+ */
+export function unsafeLegacyFolderSeed(snapshot:Snapshot,parent:Snapshot|null):boolean{
+  return Boolean(parent&&snapshot.parentId===parent.id&&externalDevice(snapshot)&&Array.isArray(snapshot.folders)&&snapshot.folders.length&&!Array.isArray(parent.folders)&&sameFiles(snapshot,parent));
+}
+
+export interface LegacyFolderRepairPlan{
+  vaultId:string;
+  headId:string;
+  originIds:string[];
+  contaminatedFolders:string[];
+  desiredFolders:string[];
+  currentFolders:string[];
+}
+
+function currentChain(store:Store,vaultId:string,headId:string):Snapshot[]{
+  const reverse:Snapshot[]=[],seen=new Set<string>();let id:string|null=headId;
+  while(id){
+    if(seen.has(id))throw new Error(`Snapshot ancestry cycle detected for vault ${vaultId}`);seen.add(id);
+    const snapshot=store.getSnapshot(id);if(!snapshot||snapshot.vaultId!==vaultId)throw new Error(`Snapshot ancestry is incomplete for vault ${vaultId}`);
+    reverse.push(snapshot);id=snapshot.parentId;
+  }
+  return reverse.reverse();
+}
+
+/**
+ * Replays folder provenance along the accepted head ancestry. Folders first
+ * introduced by the unsafe legacy Seafile seed remain contaminated until a
+ * real device explicitly removes and later recreates them. This preserves all
+ * post-migration device intent while removing inherited stale shells.
+ */
+export function planLegacyFolderDescendantRepair(store:Store,vaultId:string,headId:string):LegacyFolderRepairPlan|null{
+  const chain=currentChain(store,vaultId,headId),tainted=new Set<string>(),trustedRecreations=new Set<string>(),origins:string[]=[];let previous:Snapshot|null=null;
+  for(const snapshot of chain){
+    if(unsafeLegacyFolderSeed(snapshot,previous)){
+      origins.push(snapshot.id);for(const folder of snapshot.folders??[])tainted.add(folder);previous=snapshot;continue;
+    }
+    if(tainted.size&&previous&&Array.isArray(previous.folders)&&Array.isArray(snapshot.folders)){
+      const before=folders(previous),after=folders(snapshot);
+      // Only a real device can establish new folder intent. An external scan
+      // may merely be observing a stale directory that the mirror has not yet
+      // removed, so its additions never cleanse inherited contamination.
+      if(trustedDevice(snapshot))for(const path of after)if(!before.has(path)&&tainted.has(path))trustedRecreations.add(path);
+    }
+    previous=snapshot;
+  }
+  const head=chain.at(-1);if(!head||!origins.length||!Array.isArray(head.folders))return null;
+  const contaminated=[...tainted].filter((path)=>head.folders!.includes(path)&&!trustedRecreations.has(path)).sort();if(!contaminated.length)return null;
+  const contaminatedSet=new Set(contaminated);
+  return {vaultId,headId,originIds:origins,contaminatedFolders:contaminated,currentFolders:[...head.folders].sort(),desiredFolders:head.folders.filter((path)=>!contaminatedSet.has(path)).sort()};
 }
 
 export function repairUnsafeLegacyFolderHeads(store:Store):number{
   let repaired=0;
   for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){
-    const head=store.getSnapshot(vault.head_id);if(!head?.parentId||head.deviceId!==`seafile:${vault.id}`||head.deviceName!=="Seafile"||!Array.isArray(head.folders)||!head.folders.length)continue;
-    if(!/^Seafile external change \(0 changed, 0 deleted, \d+ folders(?:, 0 conflicts)?\)$/.test(head.message))continue;
-    const parent=store.getSnapshot(head.parentId);if(!parent||Array.isArray(parent.folders)||!sameFiles(head,parent))continue;
-    const now=new Date().toISOString();
-    store.db.exec("BEGIN IMMEDIATE");
+    const head=store.getSnapshot(vault.head_id),parent=head?.parentId?store.getSnapshot(head.parentId):null;if(!head||!unsafeLegacyFolderSeed(head,parent))continue;
+    const now=new Date().toISOString();store.db.exec("BEGIN IMMEDIATE");
     try{
-      const updated=store.run("UPDATE vaults SET head_id=? WHERE id=? AND head_id=?",parent.id,vault.id,head.id);
+      const updated=store.run("UPDATE vaults SET head_id=? WHERE id=? AND head_id=?",parent!.id,vault.id,head.id);
       if(updated.changes){
-        store.run("INSERT INTO health_events(id,vault_id,code,level,message,created_at) VALUES(?,?,?,?,?,?)",randomUUID(),vault.id,"legacy_folder_migration_reverted","warning","An unsafe legacy folder-only migration was retired. The next trusted device sync will establish the folder baseline.",now);
-        repaired++;
+        store.run("INSERT INTO health_events(id,vault_id,code,level,message,created_at) VALUES(?,?,?,?,?,?)",randomUUID(),vault.id,"legacy_folder_migration_reverted","warning","An unsafe legacy folder-only migration was retired. The next trusted device sync will establish the folder baseline.",now);repaired++;
       }
       store.db.exec("COMMIT");
     }catch(error){try{store.db.exec("ROLLBACK");}catch{}throw error;}
