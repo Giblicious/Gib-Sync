@@ -15,7 +15,7 @@ import { clientCompatibility } from "./compatibility.js";
 import { readGeneration,validGeneration,writeGeneration } from "./mirror-generation.js";
 import { SERVER_CAPABILITIES,SERVER_VERSION } from "./version.js";
 import { ContainmentService } from "./containment.js";
-import { planLegacyFolderDescendantRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
+import { planLegacyFolderDescendantRepair,planRetiredLegacyFolderRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
 import { canonicalManifest } from "./manifest.js";
 import { auditHeadIntegrity } from "./integrity.js";
 import { SnapshotCommitter } from "./snapshot-commit.js";
@@ -380,8 +380,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     folderImpactCount:z.number().int().min(1).max(200000),fileGrowthBytes:z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER),
     fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
 
-  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[]):Promise<Snapshot|null>{
-    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,afterInsert:(accepted)=>store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId)});if(!snapshot)return null;
+  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[],folderRepair?:Snapshot["folderRepair"]):Promise<Snapshot|null>{
+    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,folderRepair,afterInsert:(accepted)=>store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId)});if(!snapshot)return null;
     safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
 
@@ -636,9 +636,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.addHook("onReady",async()=>{
     for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){
-      if(!containment.allows(vault.id)||integrityBlockedVaults.has(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id);if(!plan)continue;
+      if(!containment.allows(vault.id)||integrityBlockedVaults.has(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id)??planRetiredLegacyFolderRepair(store,vault.id,vault.head_id);if(!plan)continue;
       const head=store.getSnapshot(vault.head_id);if(!head)continue;
-      const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders);
+      const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders,{retiredFolders:plan.contaminatedFolders,observedAt:plan.observedAt,originSnapshotIds:plan.originIds});
       if(repaired){
         safeguards.event(vault.id,"legacy_folder_descendants_repaired","info",`Repaired ${plan.contaminatedFolders.length} inherited empty folder records while preserving file content and later device folder intent.`);
         store.run("UPDATE health_events SET cleared_at=? WHERE vault_id=? AND cleared_at IS NULL AND code='legacy_folder_migration_reverted'",new Date().toISOString(),vault.id);

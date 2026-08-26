@@ -102,6 +102,22 @@ describe("SyncEngine", () => {
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
     expect(result).toMatchObject({prunedFolders:0,pendingRetiredFolders:0});expect(adapter.dirs.has("Projects/New section")).toBe(true);expect(config.folderCreateTimes["Projects/New section"]).toBeGreaterThan(0);expect(adapter.rmdirCalls).toEqual([]);
   });
+  it("retires only folders named by a server provenance repair when the legacy base had no folder manifest",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),observedAt="2026-08-25T04:59:42.000Z";
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000060",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:"2026-08-24T00:00:00.000Z",message:"Legacy",entries:[]};
+    const repair:Snapshot={...base,id:"00000000-0000-4000-8000-000000000061",parentId:base.id,deviceId:"server:folder-provenance-repair",deviceName:"Gib Sync server",createdAt:"2026-08-26T00:00:00.000Z",message:"Repair unsafe legacy folder provenance",folders:[],folderRepair:{retiredFolders:["Stale","Device local"],observedAt,originSnapshotIds:["00000000-0000-4000-8000-000000000062"]}};
+    api.head=repair;api.snapshots.set(base.id,base);api.snapshots.set(repair.id,repair);config.initialized=true;config.lastSnapshotId=base.id;config.fullScanRequired=true;adapter.dirs.add("Stale");adapter.dirs.add("Device local");
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result).toMatchObject({uploaded:0,prunedFolders:2});expect(api.commits).toBe(0);expect(adapter.dirs.size).toBe(0);
+  });
+  it("preserves a retired folder explicitly recreated after the unsafe observation",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),observedAt="2026-08-25T04:59:42.000Z";
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000063",vaultId:"vault",parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:"2026-08-24T00:00:00.000Z",message:"Legacy",entries:[]};
+    const repair:Snapshot={...base,id:"00000000-0000-4000-8000-000000000064",parentId:base.id,deviceId:"server:folder-provenance-repair",deviceName:"Gib Sync server",createdAt:"2026-08-26T00:00:00.000Z",message:"Repair unsafe legacy folder provenance",folders:[],folderRepair:{retiredFolders:["Recreated"],observedAt,originSnapshotIds:["00000000-0000-4000-8000-000000000065"]}};
+    api.head=repair;api.snapshots.set(base.id,base);api.snapshots.set(repair.id,repair);config.initialized=true;config.lastSnapshotId=base.id;config.fullScanRequired=true;config.folderCreateTimes={Recreated:Date.parse(observedAt)+1000};adapter.dirs.add("Recreated");
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(result.prunedFolders).toBe(0);expect(api.commits).toBe(1);expect(api.head?.folders).toEqual(["Recreated"]);expect(adapter.dirs.has("Recreated")).toBe(true);
+  });
   it("publishes a new empty root folder and creates it on another device",async()=>{
     const desktop=new MemoryAdapter(),api=new MemoryApi(),desktopConfig=settings();desktopConfig.fullScanRequired=true;desktop.dirs.add("Projects");desktopConfig.folderCreateTimes={Projects:Date.now()};
     const desktopResult=await new SyncEngine(desktop as unknown as DataAdapter,api as unknown as GibSyncApi,()=>desktopConfig,async()=>{},()=>{}).sync();

@@ -25,6 +25,7 @@ export interface LegacyFolderRepairPlan{
   contaminatedFolders:string[];
   desiredFolders:string[];
   currentFolders:string[];
+  observedAt:string;
 }
 
 function currentChain(store:Store,vaultId:string,headId:string):Snapshot[]{
@@ -61,7 +62,25 @@ export function planLegacyFolderDescendantRepair(store:Store,vaultId:string,head
   const head=chain.at(-1);if(!head||!origins.length||!Array.isArray(head.folders))return null;
   const contaminated=[...tainted].filter((path)=>head.folders!.includes(path)&&!trustedRecreations.has(path)).sort();if(!contaminated.length)return null;
   const contaminatedSet=new Set(contaminated);
-  return {vaultId,headId,originIds:origins,contaminatedFolders:contaminated,currentFolders:[...head.folders].sort(),desiredFolders:head.folders.filter((path)=>!contaminatedSet.has(path)).sort()};
+  const originSet=new Set(origins),observedAt=chain.filter((snapshot)=>originSet.has(snapshot.id)).map((snapshot)=>snapshot.createdAt).sort().at(-1)!;
+  return {vaultId,headId,originIds:origins,contaminatedFolders:contaminated,currentFolders:[...head.folders].sort(),desiredFolders:head.folders.filter((path)=>!contaminatedSet.has(path)).sort(),observedAt};
+}
+
+/**
+ * A direct unsafe seed may already have been rewound while its readable mirror
+ * still contains the observed empty folders. Establish an explicit baseline
+ * and carry the exact retired paths to updated clients.
+ */
+export function planRetiredLegacyFolderRepair(store:Store,vaultId:string,headId:string):LegacyFolderRepairPlan|null{
+  const chain=currentChain(store,vaultId,headId),head=chain.at(-1);if(!head||Array.isArray(head.folders))return null;
+  const accepted=new Set(chain.map((snapshot)=>snapshot.id)),origins:Snapshot[]=[];
+  for(const row of store.all<{id:string}>("SELECT id FROM snapshots WHERE vault_id=?",vaultId)){
+    const snapshot=store.getSnapshot(row.id);if(!snapshot||accepted.has(snapshot.id)||!snapshot.parentId||!accepted.has(snapshot.parentId))continue;
+    const parent=store.getSnapshot(snapshot.parentId);if(unsafeLegacyFolderSeed(snapshot,parent))origins.push(snapshot);
+  }
+  if(!origins.length)return null;
+  const contaminated=[...new Set(origins.flatMap((snapshot)=>snapshot.folders??[]))].sort();if(!contaminated.length)return null;
+  return {vaultId,headId,originIds:origins.map((snapshot)=>snapshot.id).sort(),contaminatedFolders:contaminated,currentFolders:[],desiredFolders:[],observedAt:origins.map((snapshot)=>snapshot.createdAt).sort().at(-1)!};
 }
 
 export function repairUnsafeLegacyFolderHeads(store:Store):number{

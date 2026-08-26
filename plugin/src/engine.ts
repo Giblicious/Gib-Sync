@@ -757,6 +757,9 @@ export class SyncEngine {
     const entries = [...final.values(),...preservedIgnored].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const baseFolders=this.manifestFolders(effectiveBaseSnapshot),remoteFolders=this.manifestFolders(remoteSnapshot),mergedFolders=this.mergeFolders(baseFolders,scanned.folders,remoteFolders);
+    if(remoteSnapshot?.folderRepair){
+      for(const raw of remoteSnapshot.folderRepair.retiredFolders){const path=normalizePath(raw);if(!settings.folderCreateTimes[path])mergedFolders.delete(path);}
+    }
     for(const folder of remoteSnapshot?.folders??[])if(!this.include(folder)&&!isDeviceLocalObsidianPath(folder))mergedFolders.add(normalizePath(folder));
     const folders=[...mergedFolders].sort(),acceptedRemoteFolders=this.manifestFolders(remoteSnapshot);
     for(const folder of remoteSnapshot?.folders??[])if(!this.include(folder)&&!isDeviceLocalObsidianPath(folder))acceptedRemoteFolders.add(normalizePath(folder));
