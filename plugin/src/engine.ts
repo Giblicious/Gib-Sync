@@ -66,7 +66,7 @@ export class SyncEngine {
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
     for(const [path,entry] of remote){await this.cooperate();if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
     for(const [path,entry] of local)if(!remote.has(path)&&this.include(path)){await this.cooperate();if(head)settings.retiredPaths[path]={hash:entry.hash,snapshotId:head.id,retiredAt:Date.now()};this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(head));settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(head),head?.folderRepair,head?.createdAt);settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
   private async entropy(bytes:Uint8Array):Promise<number>{
@@ -301,6 +301,21 @@ export class SyncEngine {
     return folders;
   }
 
+  private async hasProtectedFolderIntent(path:string,repair?:Snapshot["folderRepair"],fallbackIssuedAt?:string):Promise<boolean>{
+    if(!repair)return this.hasLocalFolderIntent(path);
+    const normalized=normalizePath(path),retired=repair.retiredFolders.some((raw)=>{const candidate=normalizePath(raw);return candidate===normalized||candidate.startsWith(`${normalized}/`)||normalized.startsWith(`${candidate}/`);});
+    const observedAt=retired?Date.parse(repair.issuedAt??fallbackIssuedAt??repair.observedAt):0;if(!Number.isFinite(observedAt)||!this.hasLocalFolderIntent(path,observedAt))return !retired&&this.hasLocalFolderIntent(path);
+    // Obsidian can emit a burst of create events while re-indexing folders
+    // that already existed. Require filesystem evidence newer than the unsafe
+    // observation before allowing such an event to override an exact server
+    // retirement directive.
+    for(const [createdPath,createdAt] of Object.entries(this.getSettings().folderCreateTimes)){
+      const created=normalizePath(createdPath);if(createdAt<=observedAt||!(created===normalized||created.startsWith(`${normalized}/`)||normalized.startsWith(`${created}/`)))continue;
+      try{const stat=await this.adapter.stat(created);if(stat?.type==="folder"&&Math.max(stat.ctime,stat.mtime)>observedAt)return true;}catch{}
+    }
+    return false;
+  }
+
   private snapshotFolders(snapshot:Snapshot|null):Set<string>{
     const folders=this.acceptedFolders((snapshot?.entries??[]).map((entry)=>entry.path));
     for(const raw of this.manifestFolders(snapshot)){
@@ -331,7 +346,7 @@ export class SyncEngine {
     return false;
   }
 
-  private async reconcileFolderTopology(acceptedFolders:Iterable<string>):Promise<{removed:number;remaining:number}>{
+  private async reconcileFolderTopology(acceptedFolders:Iterable<string>,repair?:Snapshot["folderRepair"],repairSnapshotCreatedAt?:string):Promise<{removed:number;remaining:number}>{
     const settings=this.getSettings(),desired=new Set([...acceptedFolders].map((path)=>normalizePath(path)).filter((path)=>this.managedTopLevelFolder(path))),before=await this.localManagedFolders();
     let created=0,removed=0,recovered=0,metadata=0,failures=0;const failureDetails:string[]=[],batch=new Date().toISOString().replace(/[:.]/g,"-");
     for(const path of [...desired].sort((left,right)=>left.split("/").length-right.split("/").length||left.localeCompare(right))){
@@ -339,7 +354,8 @@ export class SyncEngine {
       try{if(!await this.adapter.exists(path)){this.expectLocalMutation(path,"folder");await this.adapter.mkdir(path);}created++;before.add(path);}
       catch(error){if(!await this.adapter.exists(path)){failures++;failureDetails.push(`${path}: ${error instanceof Error?error.message:String(error)}`);}}
     }
-    const extraRoots=this.minimalFolderRoots([...before].filter((path)=>!desired.has(path)&&!this.hasLocalFolderIntent(path)));
+    const unprotectedBefore:string[]=[];for(const path of before)if(!desired.has(path)&&!await this.hasProtectedFolderIntent(path,repair,repairSnapshotCreatedAt))unprotectedBefore.push(path);
+    const extraRoots=this.minimalFolderRoots(unprotectedBefore);
     for(const root of extraRoots){
       await this.cooperate();
       try{
@@ -349,7 +365,8 @@ export class SyncEngine {
         const cleaned=await this.pruneRetiredTree(root,batch);removed+=cleaned.folders;recovered+=cleaned.recovered;metadata+=cleaned.metadata;
       }catch(error){failures++;failureDetails.push(`${root}: ${error instanceof Error?error.message:String(error)}`);}
     }
-    const after=extraRoots.length?await this.localManagedFolders():before,extra=this.minimalFolderRoots([...after].filter((path)=>!desired.has(path)&&!this.hasLocalFolderIntent(path))),missing=this.minimalFolderRoots([...desired].filter((path)=>!after.has(path))),remaining=extra.length+missing.length;this.trimFolderCreateTimes(after,desired);
+    const after=extraRoots.length?await this.localManagedFolders():before,unprotectedAfter:string[]=[];for(const path of after)if(!desired.has(path)&&!await this.hasProtectedFolderIntent(path,repair,repairSnapshotCreatedAt))unprotectedAfter.push(path);
+    const extra=this.minimalFolderRoots(unprotectedAfter),missing=this.minimalFolderRoots([...desired].filter((path)=>!after.has(path))),remaining=extra.length+missing.length;this.trimFolderCreateTimes(after,desired);
     settings.retiredFolderCount=remaining;
     settings.retiredFolderNote=remaining?`Folder topology differs from the accepted snapshot: ${[...extra.map((path)=>`extra ${path}`),...missing.map((path)=>`missing ${path}`)].slice(0,8).join(" · ")}${remaining>8?` · and ${remaining-8} more`:""}`.slice(0,2000):"";
     if(!failures)settings.lastFolderCleanupAt=Date.now();settings.lastFolderCleanupError=failures?failureDetails.slice(0,8).join(" · ").slice(0,2000):"";
@@ -540,18 +557,18 @@ export class SyncEngine {
       }
       completed++;if(this.progress(completed,pending.length))this.status({phase:"applying",message:"Resuming accepted device state",current:completed,total:pending.length});
     }
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(target));settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(target),target.folderRepair,target.createdAt);settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();
     if(preserved)this.status({phase:"applying",message:`Preserved ${preserved} genuine local change${preserved===1?"":"s"} made during the interrupted download; they will reconcile normally`,level:"success"});
     return retiredCleanup.removed+topology.removed;
   }
 
-  private async stageAndApply(snapshotId:string,final:Map<string,FileState>,topologyPaths:Iterable<string>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<{downloaded:number;deleted:number;prunedFolders:number}>{
+  private async stageAndApply(snapshotId:string,final:Map<string,FileState>,topologyPaths:Iterable<string>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>,folderRepair?:Snapshot["folderRepair"],repairSnapshotCreatedAt?:string):Promise<{downloaded:number;deleted:number;prunedFolders:number}>{
     const changed=[...final].filter(([path,entry])=>physicalLocal.get(path)?.hash!==entry.hash).map(([path])=>path),removed=[...physicalLocal.keys()].filter((path)=>!final.has(path));
     const settings=this.getSettings(),baseId=settings.lastSnapshotId;settings.pendingApplySnapshotId=snapshotId;settings.pendingApplyBaseSnapshotId=baseId;settings.pendingApplyPaths=[...new Set([...changed,...removed,...orphanUnreadableConflicts])].sort();
     settings.pendingApplyPriorHashes=Object.fromEntries(settings.pendingApplyPaths.map((path)=>[path,physicalLocal.get(path)?.hash??null]));
     for(const path of removed){const previous=physicalLocal.get(path);if(previous)settings.retiredPaths[path]={hash:previous.hash,snapshotId,retiredAt:Date.now()};}
     settings.pendingPaths=[];settings.pendingPathTimes={};this.trimRetiredPaths();await this.saveSettings();
-    const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache),retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(topologyPaths);
+    const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache),retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(topologyPaths,folderRepair,repairSnapshotCreatedAt);
     settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();return {...result,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
@@ -565,7 +582,7 @@ export class SyncEngine {
     let remoteHeadId:string|null;
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
     if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!settings.pluginSyncBootstrapPending&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
-      const accepted=requestedBaseId?await this.api.snapshot(requestedBaseId):null,topology=await this.reconcileFolderTopology(this.snapshotFolders(accepted));prunedFolders+=topology.removed;await this.saveSettings();
+      const accepted=requestedBaseId?await this.api.snapshot(requestedBaseId):null,topology=await this.reconcileFolderTopology(this.snapshotFolders(accepted),accepted?.folderRepair,accepted?.createdAt);prunedFolders+=topology.removed;await this.saveSettings();
       this.status({phase:topology.remaining?"applying":"up-to-date",message:topology.remaining?settings.retiredFolderNote:"Up to date · accepted file manifest and observed folders agree",level:topology.remaining?"warning":"success"});
       return {uploaded:0,downloaded:0,deleted:0,prunedFolders,pendingRetiredFolders:settings.retiredFolderCount,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
@@ -758,7 +775,7 @@ export class SyncEngine {
     const remoteEntries = [...(remoteSnapshot?.entries??[])].map(({path,hash,size,mtime}) => ({path,hash,size,mtime})).sort((a,b)=>a.path.localeCompare(b.path));
     const baseFolders=this.manifestFolders(effectiveBaseSnapshot),remoteFolders=this.manifestFolders(remoteSnapshot),mergedFolders=this.mergeFolders(baseFolders,scanned.folders,remoteFolders);
     if(remoteSnapshot?.folderRepair){
-      for(const raw of remoteSnapshot.folderRepair.retiredFolders){const path=normalizePath(raw);if(!settings.folderCreateTimes[path])mergedFolders.delete(path);}
+      for(const raw of remoteSnapshot.folderRepair.retiredFolders){const path=normalizePath(raw);if(!await this.hasProtectedFolderIntent(path,remoteSnapshot.folderRepair,remoteSnapshot.createdAt))mergedFolders.delete(path);}
     }
     for(const folder of remoteSnapshot?.folders??[])if(!this.include(folder)&&!isDeviceLocalObsidianPath(folder))mergedFolders.add(normalizePath(folder));
     const folders=[...mergedFolders].sort(),acceptedRemoteFolders=this.manifestFolders(remoteSnapshot);
@@ -769,7 +786,7 @@ export class SyncEngine {
     const unchanged = entries.length === remoteEntries.length && entries.every((entry, i) => entry.path === remoteEntries[i].path && entry.hash === remoteEntries[i].hash)
       && folders.length===remoteFolderList.length&&folders.every((folder,index)=>folder===remoteFolderList[index]);
     if (unchanged) {
-      const topologyFolders=new Set([...folders,...this.acceptedFolders(entries.map((entry)=>entry.path))]);let downloaded=0,deleted=0;if(remoteSnapshot){const applied=await this.stageAndApply(remoteSnapshot.id,final,topologyFolders,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache);downloaded=applied.downloaded;deleted=applied.deleted;prunedFolders+=applied.prunedFolders;}else{const topology=await this.reconcileFolderTopology(topologyFolders);prunedFolders+=topology.removed;settings.lastSnapshotId=null;settings.initialized=true;if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();}let mirrored=0;
+      const topologyFolders=new Set([...folders,...this.acceptedFolders(entries.map((entry)=>entry.path))]);let downloaded=0,deleted=0;if(remoteSnapshot){const applied=await this.stageAndApply(remoteSnapshot.id,final,topologyFolders,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache,remoteSnapshot.folderRepair,remoteSnapshot.createdAt);downloaded=applied.downloaded;deleted=applied.deleted;prunedFolders+=applied.prunedFolders;}else{const topology=await this.reconcileFolderTopology(topologyFolders);prunedFolders+=topology.removed;settings.lastSnapshotId=null;settings.initialized=true;if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();}let mirrored=0;
       try{mirrored=remoteSnapshot&&clientCanMirrorAll?await this.mirror(remoteSnapshot.id,entries,final,bytes,remoteCache):0;}
       catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"Another device advanced the vault during mirror verification");throw error;}
       this.status({phase:"up-to-date",message:"Up to date · readable recovery copy verified"});
@@ -802,7 +819,7 @@ export class SyncEngine {
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,folders,
       clientTime:new Date().toISOString(),signals:{highEntropyPaths,deviceLocalCleanupPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
     catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
-    const topologyFolders=new Set([...folders,...this.acceptedFolders(entries.map((entry)=>entry.path))]),applied=await this.stageAndApply(snapshot.id,final,topologyFolders,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache),downloaded=applied.downloaded,deleted=applied.deleted;prunedFolders+=applied.prunedFolders;let mirrored:number;
+    const topologyFolders=new Set([...folders,...this.acceptedFolders(entries.map((entry)=>entry.path))]),applied=await this.stageAndApply(snapshot.id,final,topologyFolders,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache,snapshot.folderRepair,snapshot.createdAt),downloaded=applied.downloaded,deleted=applied.deleted;prunedFolders+=applied.prunedFolders;let mirrored:number;
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}
     this.status({phase:"complete",message:conflicts ? `Synced · ${conflicts} conflict${conflicts === 1 ? "" : "s"} preserved` : "Sync complete · readable recovery copy current"});

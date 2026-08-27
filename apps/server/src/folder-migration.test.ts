@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach,describe,expect,it } from "vitest";
 import type { Snapshot } from "@gib-sync/protocol";
 import { Store } from "./db.js";
-import { planLegacyFolderDescendantRepair,planRetiredLegacyFolderRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
+import { planLegacyFolderDescendantRepair,planMissingLegacyFolderRetirementDirective,planRetiredLegacyFolderRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
 
 const roots:string[]=[];afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 function fixture(){const root=mkdtempSync(join(tmpdir(),"gib-sync-folder-migration-"));roots.push(root);const store=new Store(root),vaultId=randomUUID(),parentId=randomUUID(),headId=randomUUID(),now=new Date().toISOString();store.run("INSERT INTO vaults(id,name,wrapped_key,head_id,created_at) VALUES(?,?,?,?,?)",vaultId,"Vault","wrapped",headId,now);const parent:Snapshot={id:parentId,vaultId,parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:now,message:"Legacy",entries:[]};const head:Snapshot={...parent,id:headId,parentId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",message:"Seafile external change (0 changed, 0 deleted, 4 folders)",folders:["A","B","C","D"]};for(const snapshot of [parent,head])store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,snapshot.parentId,snapshot.deviceId,snapshot.deviceName,snapshot.createdAt,snapshot.message,JSON.stringify(snapshot));return {store,vaultId,parentId,headId};}
@@ -40,5 +40,15 @@ describe("legacy folder migration repair",()=>{
     const removed:Snapshot={...seed,id:randomUUID(),parentId:seed.id,deviceId:"desktop",deviceName:"Desktop",folders:[]},recreated:Snapshot={...removed,id:randomUUID(),parentId:removed.id,folders:["A"]};
     for(const snapshot of [removed,recreated])store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,snapshot.parentId,snapshot.deviceId,snapshot.deviceName,snapshot.createdAt,snapshot.message,JSON.stringify(snapshot));
     store.run("UPDATE vaults SET head_id=? WHERE id=?",recreated.id,vaultId);expect(planLegacyFolderDescendantRepair(store,vaultId,recreated.id)).toBeNull();store.db.close();
+  });
+  it("reissues a missing retirement directive after an early canonical repair",()=>{
+    const {store,vaultId,headId}=fixture(),seed=store.getSnapshot(headId)!;
+    const repaired:Snapshot={...seed,id:randomUUID(),parentId:seed.id,deviceId:"server:folder-provenance-repair",deviceName:"Gib Sync server",folders:["Keep"]};
+    const device:Snapshot={...repaired,id:randomUUID(),parentId:repaired.id,deviceId:"desktop",deviceName:"Desktop"};
+    for(const snapshot of [repaired,device])store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshot.id,vaultId,snapshot.parentId,snapshot.deviceId,snapshot.deviceName,snapshot.createdAt,snapshot.message,JSON.stringify(snapshot));
+    store.run("UPDATE vaults SET head_id=? WHERE id=?",device.id,vaultId);
+    expect(planMissingLegacyFolderRetirementDirective(store,vaultId,device.id)).toMatchObject({contaminatedFolders:["A","B","C","D"],desiredFolders:["Keep"],originIds:[headId]});
+    device.folderRepair={retiredFolders:["A","B","C","D"],observedAt:seed.createdAt,originSnapshotIds:[headId]};store.run("UPDATE snapshots SET manifest_json=? WHERE id=?",JSON.stringify(device),device.id);
+    expect(planMissingLegacyFolderRetirementDirective(store,vaultId,device.id)).toBeNull();store.db.close();
   });
 });

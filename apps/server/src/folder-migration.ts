@@ -83,6 +83,22 @@ export function planRetiredLegacyFolderRepair(store:Store,vaultId:string,headId:
   return {vaultId,headId,originIds:origins.map((snapshot)=>snapshot.id).sort(),contaminatedFolders:contaminated,currentFolders:[],desiredFolders:[],observedAt:origins.map((snapshot)=>snapshot.createdAt).sort().at(-1)!};
 }
 
+/**
+ * Early provenance repairs corrected the canonical folder list but did not
+ * carry a retirement directive. Reconstruct that missing directive from the
+ * immutable accepted ancestry so devices can remove the exact stale local
+ * shells without treating unrelated empty folders as disposable.
+ */
+export function planMissingLegacyFolderRetirementDirective(store:Store,vaultId:string,headId:string):LegacyFolderRepairPlan|null{
+  const chain=currentChain(store,vaultId,headId),head=chain.at(-1);if(!head)return null;
+  const origins:Snapshot[]=[];let previous:Snapshot|null=null;
+  for(const snapshot of chain){if(unsafeLegacyFolderSeed(snapshot,previous))origins.push(snapshot);previous=snapshot;}
+  if(!origins.length)return null;
+  const contaminated=[...new Set(origins.flatMap((snapshot)=>snapshot.folders??[]))].sort(),covered=new Set(head.folderRepair?.retiredFolders??[]);
+  const desired=[...(head.folders??[])].sort(),desiredSet=new Set(desired),retired=contaminated.filter((path)=>!desiredSet.has(path));if(!retired.length||retired.every((path)=>covered.has(path)))return null;
+  return {vaultId,headId,originIds:origins.map((snapshot)=>snapshot.id).sort(),contaminatedFolders:retired,currentFolders:desired,desiredFolders:desired,observedAt:origins.map((snapshot)=>snapshot.createdAt).sort().at(-1)!};
+}
+
 export function repairUnsafeLegacyFolderHeads(store:Store):number{
   let repaired=0;
   for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){

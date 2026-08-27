@@ -32,6 +32,7 @@ export function validateCurrentSnapshot(snapshot:Snapshot):string|null{
     if(snapshot.folderRepair){
       canonicalManifest([],snapshot.folderRepair.retiredFolders);
       if(!Number.isFinite(Date.parse(snapshot.folderRepair.observedAt)))throw new Error("Folder repair observation time is invalid");
+      if(snapshot.folderRepair.issuedAt&&!Number.isFinite(Date.parse(snapshot.folderRepair.issuedAt)))throw new Error("Folder repair issue time is invalid");
       if(!snapshot.folderRepair.originSnapshotIds.length||snapshot.folderRepair.originSnapshotIds.some((id)=>!id.trim()))throw new Error("Folder repair origin is invalid");
     }
     return null;

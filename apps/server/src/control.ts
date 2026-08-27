@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { ContainmentService } from "./containment.js";
 import { Store } from "./db.js";
 import { auditHeadIntegrity } from "./integrity.js";
-import { planLegacyFolderDescendantRepair,planRetiredLegacyFolderRepair } from "./folder-migration.js";
+import { planLegacyFolderDescendantRepair,planMissingLegacyFolderRetirementDirective,planRetiredLegacyFolderRepair } from "./folder-migration.js";
 
 function value(args:string[],name:string):string|null{const index=args.indexOf(name);return index>=0?args[index+1]??null:null;}
 function required(args:string[],name:string):string{const result=value(args,name);if(!result)throw new Error(`${name} is required`);return result;}
@@ -13,7 +13,7 @@ try{
   if(args[0]==="audit"){
     const selected=vault(),audit=selected.head_id?auditHeadIntegrity(store,selected.id,selected.head_id):{valid:true,issues:[]};console.log(JSON.stringify({vault:selected.name,hasHead:Boolean(selected.head_id),...audit},null,2));
   }else if(args[0]==="folder-repair"&&args[1]==="preview"){
-    const selected=vault(),plan=selected.head_id?(planLegacyFolderDescendantRepair(store,selected.id,selected.head_id)??planRetiredLegacyFolderRepair(store,selected.id,selected.head_id)):null;console.log(JSON.stringify({vault:selected.name,repairNeeded:Boolean(plan),currentFolders:plan?.currentFolders.length??0,contaminatedFolders:plan?.contaminatedFolders.length??0,desiredFolders:plan?.desiredFolders.length??0},null,2));
+    const selected=vault(),plan=selected.head_id?(planLegacyFolderDescendantRepair(store,selected.id,selected.head_id)??planRetiredLegacyFolderRepair(store,selected.id,selected.head_id)??planMissingLegacyFolderRetirementDirective(store,selected.id,selected.head_id)):null;console.log(JSON.stringify({vault:selected.name,repairNeeded:Boolean(plan),currentFolders:plan?.currentFolders.length??0,contaminatedFolders:plan?.contaminatedFolders.length??0,desiredFolders:plan?.desiredFolders.length??0},null,2));
   }else if(args[0]!=="containment")throw new Error("Usage: containment status|enable|disable | audit --vault-name NAME | folder-repair preview --vault-name NAME");
   else if(args[1]==="status")console.log(JSON.stringify(containment.state(),null,2));
   else if(args[1]==="enable"){
