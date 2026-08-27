@@ -26,6 +26,7 @@ export interface LegacyFolderRepairPlan{
   desiredFolders:string[];
   currentFolders:string[];
   observedAt:string;
+  issuedAt?:string;
 }
 
 function currentChain(store:Store,vaultId:string,headId:string):Snapshot[]{
@@ -91,6 +92,10 @@ export function planRetiredLegacyFolderRepair(store:Store,vaultId:string,headId:
  */
 export function planMissingLegacyFolderRetirementDirective(store:Store,vaultId:string,headId:string):LegacyFolderRepairPlan|null{
   const chain=currentChain(store,vaultId,headId),head=chain.at(-1);if(!head)return null;
+  if(head.folderRepair&&!head.folderRepair.issuedAt){
+    const firstDirective=chain.find((snapshot)=>snapshot.folderRepair&&JSON.stringify(snapshot.folderRepair.retiredFolders)===JSON.stringify(head.folderRepair!.retiredFolders)&&JSON.stringify(snapshot.folderRepair.originSnapshotIds)===JSON.stringify(head.folderRepair!.originSnapshotIds));
+    return {vaultId,headId,originIds:head.folderRepair.originSnapshotIds,contaminatedFolders:head.folderRepair.retiredFolders,currentFolders:[...(head.folders??[])].sort(),desiredFolders:[...(head.folders??[])].sort(),observedAt:head.folderRepair.observedAt,issuedAt:firstDirective?.createdAt??head.createdAt};
+  }
   const origins:Snapshot[]=[];let previous:Snapshot|null=null;
   for(const snapshot of chain){if(unsafeLegacyFolderSeed(snapshot,previous))origins.push(snapshot);previous=snapshot;}
   if(!origins.length)return null;

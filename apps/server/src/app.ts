@@ -640,7 +640,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL")){
       if(!containment.allows(vault.id)||integrityBlockedVaults.has(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id)??planRetiredLegacyFolderRepair(store,vault.id,vault.head_id)??planMissingLegacyFolderRetirementDirective(store,vault.id,vault.head_id);if(!plan)continue;
       const head=store.getSnapshot(vault.head_id);if(!head)continue;
-      const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders,{retiredFolders:plan.contaminatedFolders,observedAt:plan.observedAt,originSnapshotIds:plan.originIds});
+      const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders,{retiredFolders:plan.contaminatedFolders,observedAt:plan.observedAt,originSnapshotIds:plan.originIds,...(plan.issuedAt?{issuedAt:plan.issuedAt}:{})});
       if(repaired){
         safeguards.event(vault.id,"legacy_folder_descendants_repaired","info",`Repaired ${plan.contaminatedFolders.length} inherited empty folder records while preserving file content and later device folder intent.`);
         store.run("UPDATE health_events SET cleared_at=? WHERE vault_id=? AND cleared_at IS NULL AND code='legacy_folder_migration_reverted'",new Date().toISOString(),vault.id);

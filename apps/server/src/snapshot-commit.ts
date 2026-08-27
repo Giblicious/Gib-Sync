@@ -18,7 +18,7 @@ export class SnapshotCommitter{
     if(manifest.folders!==undefined)snapshot.folders=manifest.folders;
     if(input.folderRepair){
       const retiredFolders=canonicalManifest([],input.folderRepair.retiredFolders).folders??[];
-      snapshot.folderRepair={retiredFolders,observedAt:input.folderRepair.observedAt,originSnapshotIds:[...new Set(input.folderRepair.originSnapshotIds)].sort()};
+      snapshot.folderRepair={retiredFolders,observedAt:input.folderRepair.observedAt,originSnapshotIds:[...new Set(input.folderRepair.originSnapshotIds)].sort(),...(input.folderRepair.issuedAt?{issuedAt:input.folderRepair.issuedAt}:{})};
     }
     await this.storage.put(this.storageRow(input.vaultId),`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json");
     this.store.db.exec("BEGIN IMMEDIATE");

@@ -49,6 +49,8 @@ describe("legacy folder migration repair",()=>{
     store.run("UPDATE vaults SET head_id=? WHERE id=?",device.id,vaultId);
     expect(planMissingLegacyFolderRetirementDirective(store,vaultId,device.id)).toMatchObject({contaminatedFolders:["A","B","C","D"],desiredFolders:["Keep"],originIds:[headId]});
     device.folderRepair={retiredFolders:["A","B","C","D"],observedAt:seed.createdAt,originSnapshotIds:[headId]};store.run("UPDATE snapshots SET manifest_json=? WHERE id=?",JSON.stringify(device),device.id);
+    expect(planMissingLegacyFolderRetirementDirective(store,vaultId,device.id)).toMatchObject({contaminatedFolders:["A","B","C","D"],issuedAt:device.createdAt});
+    device.folderRepair.issuedAt=device.createdAt;store.run("UPDATE snapshots SET manifest_json=? WHERE id=?",JSON.stringify(device),device.id);
     expect(planMissingLegacyFolderRetirementDirective(store,vaultId,device.id)).toBeNull();store.db.close();
   });
 });

@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = 7;
-export const MINIMUM_SAFE_SERVER_VERSION = "0.8.53";
+export const MINIMUM_SAFE_SERVER_VERSION = "0.8.54";
 export const REQUIRED_SERVER_CAPABILITIES = ["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","folder-retirement-directive-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1"] as const;
 
 export interface ClientCompatibility {
@@ -27,7 +27,7 @@ export interface FolderRepairDirective {
   retiredFolders: string[];
   /** Time the unsafe external folder baseline was observed. */
   observedAt: string;
-  /** Time the server issued the cleanup directive. Added in 0.8.53. */
+  /** Time the server issued the cleanup directive. Added in 0.8.54. */
   issuedAt?: string;
   originSnapshotIds: string[];
 }
