@@ -2,7 +2,7 @@ import { webcrypto } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { DataAdapter } from "obsidian";
 import type { Snapshot } from "@gib-sync/protocol";
-import { FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
+import { cooperativeYield, FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
 import { ApiError } from "./api";
 import type { GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes, toBase64Url } from "./crypto";
@@ -53,6 +53,7 @@ function settings(): GibSyncSettings {
 }
 
 describe("SyncEngine", () => {
+  it("uses a background-safe cooperative yield primitive",async()=>{await expect(cooperativeYield()).resolves.toBeUndefined();});
   it("ignores a newly created file that disappears from a full scan before it is read",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("quick draft.md",new TextEncoder().encode("temporary\n"));
     const list=adapter.list.bind(adapter);adapter.list=async(path:string)=>{const result=await list(path);if(path==="")adapter.files.delete("quick draft.md");return result;};

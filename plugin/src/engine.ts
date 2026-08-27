@@ -18,6 +18,13 @@ const RETIRED_PATH_LIMIT=5000;
 const PROTECTED_FOLDER_ROOTS=new Set([".obsidian",".obsidian/plugins",".obsidian/themes",".trash",".git",".gib-sync"]);
 const DISPOSABLE_FOLDER_METADATA=new Set([".ds_store",".nomedia","desktop.ini","thumbs.db"]);
 
+export function cooperativeYield():Promise<void>{
+  const taskScheduler=(globalThis as typeof globalThis&{scheduler?:{yield?:()=>Promise<void>}}).scheduler;
+  if(typeof taskScheduler?.yield==="function")return taskScheduler.yield();
+  if(typeof MessageChannel!=="undefined")return new Promise((resolve)=>{const channel=new MessageChannel();channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};channel.port2.postMessage(undefined);});
+  return Promise.resolve();
+}
+
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
   return bytes.slice().buffer;
@@ -44,7 +51,7 @@ export class SyncEngine {
     private readonly status: (progress: SyncProgress) => void,
     private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
     private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{},
-    private readonly yieldControl:()=>Promise<void>=()=>new Promise((resolve)=>globalThis.setTimeout(resolve,0)),
+    private readonly yieldControl:()=>Promise<void>=cooperativeYield,
     private readonly isMobileDevice=false
   ) {}
 
