@@ -101,6 +101,14 @@ docker exec gib-sync npm run control -w @gib-sync/server -- containment status
 docker exec gib-sync npm run control -w @gib-sync/server -- containment disable --reason "Incident resolved"
 ```
 
+Obsolete or unrecoverable registrations can be isolated without deleting their snapshots or Seafile library. Retirement is durable across restarts, blocks every device token for that registration, and excludes it from external scans and mirror workers. It is reversible:
+
+```sh
+docker exec gib-sync npm run control -w @gib-sync/server -- vault-retirement retire --vault-id UUID --reason "Abandoned duplicate setup"
+docker exec gib-sync npm run control -w @gib-sync/server -- vault-retirement status
+docker exec gib-sync npm run control -w @gib-sync/server -- vault-retirement restore --vault-id UUID --reason "Operator-approved recovery"
+```
+
 Persist and back up `/data`. Existing encrypted vaults migrate without moving their sidecar objects. Their readable recovery path is created automatically under `Obsidian/<vault name>` and materialized by the first v0.3 sync.
 
 ## Install and connect

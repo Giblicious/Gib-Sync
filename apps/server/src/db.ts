@@ -35,7 +35,7 @@ export class Store {
         reason TEXT NOT NULL, created_at TEXT NOT NULL);
     `);
     const columns = new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row) => row.name));
-    for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT",mirror_generation_id:"TEXT"})) {
+    for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT",mirror_generation_id:"TEXT",retired_at:"TEXT",retired_reason:"TEXT"})) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE vaults ADD COLUMN ${name} ${type}`);
     }
     const pairingColumns=new Set(this.all<{name:string}>("PRAGMA table_info(pairings)").map((row)=>row.name));
