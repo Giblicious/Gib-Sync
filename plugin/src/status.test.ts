@@ -15,15 +15,22 @@ describe("status indicator state",()=>{
     live.phase="error";live.lastError="Offline";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"error",description:"Offline"});
     live.phase="up-to-date";live.verified=true;live.lastSuccessAt=new Date().toISOString();expect(deriveIndicatorState(live,true,false).key).toBe("synced");
   });
-  it("pulses a check only for checking a verified device with no pending changes",()=>{
+  it("always pulses a check while checking, using green only for verified devices without pending changes",()=>{
     const live=initialLiveStatus(true);live.running=true;live.phase="scanning";
-    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"circle-dashed",tone:"neutral",animated:true});
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"neutral",animated:true});
     live.lastSuccessAt=new Date().toISOString();live.verified=true;
     expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"success",animated:true});
     live.pendingChanges=1;
-    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"circle-dashed",tone:"neutral"});
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"neutral",animated:true});
     live.running=false;live.phase="up-to-date";
     expect(deriveIndicatorState(live,true,false).key).toBe("queued");
+  });
+  it("keeps the checking checkmark across every non-transfer engine phase",()=>{
+    const live=initialLiveStatus(true);live.running=true;
+    for(const phase of ["checking","scanning","reading-remote","merging"] as const){
+      live.phase=phase;
+      expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"neutral",animated:true});
+    }
   });
   it("does not infer verification from a persisted successful sync or an idle phase",()=>{
     const live=initialLiveStatus(true);live.lastSuccessAt=new Date().toISOString();
