@@ -3,7 +3,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { DataAdapter } from "obsidian";
 import type { Snapshot } from "@gib-sync/protocol";
 import { cooperativeYield, FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
-import { ApiError } from "./api";
+import { ApiError,ApiTransportError } from "./api";
+import { recoverSync } from "./sync-recovery";
 import type { GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes, toBase64Url } from "./crypto";
 import { DEFAULT_SETTINGS, type GibSyncSettings } from "./settings";
@@ -34,7 +35,7 @@ class MemoryApi {
   head: Snapshot | null = null; blobs = new Map<string,Uint8Array>(); contents=new Map<string,Uint8Array>();contentCalls:string[]=[];mirror = new Map<string,Uint8Array>(); snapshots = new Map<string,Snapshot>(); commits = 0;readyHeads:string[]=[];lastCommitBody:any=null;
   async state() { return {head:this.head}; }
   async headState() { return {headId:this.head?.id??null}; }
-  async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new Error("missing");return snapshot; }
+  async snapshot(id: string) { const snapshot=this.snapshots.get(id)??(this.head?.id===id?this.head:null);if(!snapshot)throw new ApiError("missing",404,null);return snapshot; }
   async getBlob(hash: string) { return this.blobs.get(hash)!; }
   async getContent(hash:string){this.contentCalls.push(hash);return this.contents.get(hash)!;}
   async putBlob(hash: string, bytes: Uint8Array) { this.blobs.set(hash,bytes); }
@@ -53,6 +54,28 @@ function settings(): GibSyncSettings {
 }
 
 describe("SyncEngine", () => {
+  it("propagates a temporary baseline fetch failure before file mutations",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("unchanged\n"));
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    await engine.sync();const commits=api.commits,writes=adapter.writeCalls.length;config.fullScanRequired=true;
+    api.snapshot=async()=>{throw new ApiError("Temporary server interruption",503,null);};
+    await expect(engine.sync()).rejects.toMatchObject({status:503});expect(api.commits).toBe(commits);expect(adapter.writeCalls.length).toBe(writes);
+  });
+  it("does not report transfer phases for a full verification with no changes",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("stable\n"));
+    const phases:string[]=[],engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},p=>phases.push(p.phase));
+    await engine.sync();config.fullScanRequired=true;phases.length=0;
+    api.mirrorPlan=async()=>({uploadPaths:[],deletePaths:[],alreadyCurrent:true});await engine.sync();
+    expect(phases).not.toContain("applying");expect(phases).not.toContain("mirroring");expect(phases).not.toContain("uploading");expect(phases).not.toContain("committing");
+  });
+  it("recovers a lost commit response without duplicate commits or conflict copies",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("saved content\n"));
+    const commit=api.commit.bind(api);let interrupted=true;
+    api.commit=async body=>{const accepted=await commit(body);if(interrupted){interrupted=false;throw new ApiTransportError(new Error("Response connection lost"));}return accepted;};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
+    const result=await recoverSync(()=>engine.sync(),{shouldContinue:()=>true,onRetry:()=>{},wait:async()=>{}});
+    expect(api.commits).toBe(1);expect(result.conflicts).toBe(0);expect(config.lastSnapshotId).toBe(api.head?.id);expect([...adapter.files.keys()]).toEqual(["note.md"]);
+  });
   it("uses a background-safe cooperative yield primitive",async()=>{await expect(cooperativeYield()).resolves.toBeUndefined();});
   it("ignores a newly created file that disappears from a full scan before it is read",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("quick draft.md",new TextEncoder().encode("temporary\n"));

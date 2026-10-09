@@ -6,7 +6,21 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
 }
 
-export const CLIENT_VERSION="0.8.56";
+export class ApiTransportError extends Error {
+  constructor(cause:unknown){super(cause instanceof Error?cause.message:"Connection interrupted",{cause});}
+}
+
+async function transport<T>(request:()=>Promise<T>):Promise<T>{
+  try{return await request();}catch(error){throw new ApiTransportError(error);}
+}
+
+function errorBody(response:{json:unknown}):any{
+  // Proxies often return HTML for 502/503 errors. Obsidian's JSON accessor
+  // can throw; preserve the HTTP status so recovery still classifies it.
+  try{return response.json;}catch{return null;}
+}
+
+export const CLIENT_VERSION="0.8.57";
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
@@ -18,12 +32,12 @@ export class GibSyncApi {
   private url(path: string, override?: string) { return `${(override ?? this.settings().serverUrl).replace(/\/$/, "")}${path}`; }
   private clientHeaders(){return {"X-Gib-Sync-Client-Version":CLIENT_VERSION,"X-Gib-Sync-Protocol":String(PROTOCOL_VERSION)};}
   private async json<T>(method: string, path: string, body?: unknown, token?: string, server?: string): Promise<T> {
-    const response = await requestUrl({
+    const response = await transport(()=>requestUrl({
       url: this.url(path, server), method,
       headers: { ...this.clientHeaders(),...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body), throw: false
-    });
-    if (response.status < 200 || response.status >= 300) throw new ApiError(response.json?.message??response.json?.error ?? `Gib Sync request failed (${response.status})`, response.status, response.json);
+    }));
+    if(response.status<200||response.status>=300){const body=errorBody(response);throw new ApiError(body?.message??body?.error??`Gib Sync request failed (${response.status})`,response.status,body);}
     return response.json as T;
   }
   discover(server:string,seafileUrl:string,seafileUsername:string,seafilePassword:string) { return this.json<StorageDiscovery>("POST","/v1/storage/discover",{seafileUrl,seafileUsername,seafilePassword},undefined,server); }
@@ -59,7 +73,7 @@ export class GibSyncApi {
   createPairing() { return this.json<QuickCodePairing>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
   claimQuickCode(server:string,code:string,deviceName:string){return this.json<QuickCodeClaim>("POST","/v1/pairings/claim-code",{code,deviceName},undefined,server);}
   async getBlob(hash: string): Promise<Uint8Array> {
-    const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "GET", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}` }, throw: false });
+    const response = await transport(()=>requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "GET", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}` }, throw: false }));
     if (response.status !== 200) throw new ApiError(`Blob download failed (${response.status})`, response.status, null);
     return new Uint8Array(response.arrayBuffer);
   }
@@ -68,23 +82,23 @@ export class GibSyncApi {
     // convenient for API responses but can exhaust a mobile WebView when the
     // vault contains large audio, PDF, or model files. Fetch keeps one binary
     // response body alive through the write instead.
-    const response=await fetch(this.url(`/v1/content/${hash}`),{method:"GET",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`},cache:"no-store"});
+    const response=await transport(()=>fetch(this.url(`/v1/content/${hash}`),{method:"GET",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`},cache:"no-store"}));
     if(!response.ok)throw new ApiError(`Large-file download failed (${response.status})`,response.status,null);
     if(response.headers.get("x-content-sha256")!==hash)throw new Error("Large-file integrity header is missing or invalid");
-    if(!response.body||expectedSize===undefined)return new Uint8Array(await response.arrayBuffer());
+    if(!response.body||expectedSize===undefined)return new Uint8Array(await transport(()=>response.arrayBuffer()));
     const bytes=new Uint8Array(expectedSize),reader=response.body.getReader();let offset=0;
-    try{for(;;){const {done,value}=await reader.read();if(done)break;if(offset+value.byteLength>bytes.byteLength)throw new Error("Large-file response exceeded its declared size");bytes.set(value,offset);offset+=value.byteLength;}}
+    try{for(;;){const {done,value}=await transport(()=>reader.read());if(done)break;if(offset+value.byteLength>bytes.byteLength)throw new Error("Large-file response exceeded its declared size");bytes.set(value,offset);offset+=value.byteLength;}}
     finally{reader.releaseLock();}
     if(offset!==bytes.byteLength)throw new Error(`Large-file response ended early (${offset} of ${bytes.byteLength} bytes)`);
     return bytes;
   }
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
     const body = exactArrayBuffer(bytes);
-    const response = await requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "PUT", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream" }, body, throw: false });
+    const response = await transport(()=>requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "PUT", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream" }, body, throw: false }));
     if (response.status < 200 || response.status >= 300) throw new ApiError(`Blob upload failed (${response.status})`, response.status, response.text);
   }
   async putMirrorFile(snapshotId:string,path:string,hash:string,bytes:Uint8Array):Promise<void>{
-    const response=await requestUrl({url:this.url(`/v1/mirror/file?path=${encodeURIComponent(path)}`),method:"PUT",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream","X-Gib-Sync-Snapshot":snapshotId,"X-Gib-Sync-Hash":hash},body:exactArrayBuffer(bytes),throw:false});
-    if(response.status<200||response.status>=300)throw new ApiError(`Readable mirror upload failed for ${path} (${response.status})`,response.status,response.json??response.text);
+    const response=await transport(()=>requestUrl({url:this.url(`/v1/mirror/file?path=${encodeURIComponent(path)}`),method:"PUT",headers:{...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}`,"Content-Type":"application/octet-stream","X-Gib-Sync-Snapshot":snapshotId,"X-Gib-Sync-Hash":hash},body:exactArrayBuffer(bytes),throw:false}));
+    if(response.status<200||response.status>=300)throw new ApiError(`Readable mirror upload failed for ${path} (${response.status})`,response.status,errorBody(response));
   }
 }

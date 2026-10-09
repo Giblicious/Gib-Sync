@@ -31,7 +31,7 @@ function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
 }
 
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; prunedFolders:number; pendingRetiredFolders:number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
-export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; }
+export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; remoteChanged?:boolean; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
 export class FileChangedDuringReadError extends Error {
   override readonly name="FileChangedDuringReadError";
@@ -487,21 +487,27 @@ export class SyncEngine {
       count++;
       if(cursor.parentId===requestedBaseId)return count;
       if(!cursor.parentId)return 0;
-      try{cursor=await this.api.snapshot(cursor.parentId);}catch{return 0;}
+      try{cursor=await this.api.snapshot(cursor.parentId);}catch(error){if(error instanceof ApiError&&error.status===404)return 0;throw error;}
     }
     return 0;
   }
   private retryableMirrorError(error:unknown):boolean{return error instanceof ApiError&&(error.status===409||error.status===422);}
 
+  private async optionalSnapshot(id:string):Promise<Snapshot|null>{
+    try{return await this.api.snapshot(id);}catch(error){if(error instanceof ApiError&&error.status===404)return null;throw error;}
+  }
+
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
-    this.status({phase:"mirroring",message:"Planning the readable Seafile recovery copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
+    this.status({phase:"checking",message:"Verifying the Seafile copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
+    if(plan.uploadPaths.length||plan.deletePaths.length)this.status({phase:"mirroring",message:"Updating the Seafile copy",current:0,total:plan.uploadPaths.length||undefined});
     let mirrored=0;for(const path of plan.uploadPaths){await this.cooperate();const entry=final.get(path);if(!entry)throw new Error(`Mirror plan referenced missing path: ${path}`);const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES)bytes.set(entry.hash,clear);
       await this.api.putMirrorFile(snapshotId,path,entry.hash,clear);if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}mirrored++;if(this.progress(mirrored,plan.uploadPaths.length))this.status({phase:"mirroring",message:`Writing readable recovery files (${mirrored}/${plan.uploadPaths.length})`,current:mirrored,total:plan.uploadPaths.length});}
-    await this.api.mirrorComplete(snapshotId);this.status({phase:"mirroring",message:`Readable recovery copy is current · ${entries.length} files`});return mirrored;
+    await this.api.mirrorComplete(snapshotId);this.status({phase:"checking",message:`Seafile copy verified · ${entries.length} files`});return mirrored;
   }
 
   private async applyFinal(final:Map<string,FileState>,physicalLocal:Map<string,FileState>,desktopOnlyPlugins:Set<string>,scanned:LocalScan,orphanUnreadableConflicts:string[],bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<{downloaded:number;deleted:number}>{
-    let downloaded=0,deleted=0;this.status({phase:"applying",message:"Applying the accepted snapshot to this device"});
+    let downloaded=0,deleted=0;this.status({phase:"checking",message:"Checking which files this device needs"});
+    const operationTotal=[...final].filter(([path,entry])=>physicalLocal.get(path)?.hash!==entry.hash).length+[...physicalLocal.keys()].filter(path=>!final.has(path)&&this.include(path)).length;
     const applyOrder=[...final].sort(([left,leftEntry],[right,rightEntry])=>{
       const rank=(path:string,entry:FileState)=>path===".obsidian/community-plugins.json"?4:entry.size>=LOW_MEMORY_DOWNLOAD_BYTES?3:obsidianPluginPath(path)?0:isObsidianSystemPath(path)?2:1;
       return rank(left,leftEntry)-rank(right,rightEntry)||left.localeCompare(right);
@@ -513,13 +519,14 @@ export class SyncEngine {
         try{const enabled=JSON.parse(decoder.decode(serverClear)) as unknown;if(Array.isArray(enabled)){deviceClear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnlyPlugins.has(id)),null,2)}\n`);const hash=await hashBytes(deviceClear);deviceEntry={...entry,hash,size:deviceClear.length};}}catch{}
       }
       if(physicalLocal.get(path)?.hash===deviceEntry.hash)continue;
-      if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded,total:applyOrder.length});
+      this.status({phase:"applying",message:"Updating files on this device",current:downloaded+deleted,total:operationTotal});
+      if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded+deleted,total:operationTotal});
       const clear=deviceClear??bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES&&!deviceClear)bytes.set(entry.hash,clear);
       await this.ensureParent(path);this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}downloaded++;
     }
     for(const path of physicalLocal.keys())if(!final.has(path)&&this.include(path)){
       await this.cooperate();if(scanned.unreadableConflictPaths.has(path)){this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});continue;}
-      this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;
+      this.status({phase:"applying",message:"Applying accepted file deletions",current:downloaded+deleted,total:operationTotal});this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;
     }
     for(const path of orphanUnreadableConflicts){await this.cooperate();try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}}
     return {downloaded,deleted};
@@ -544,8 +551,8 @@ export class SyncEngine {
     // v0.8.33 recorded lastSnapshotId before applying. Treat it as the staged
     // target when upgrading an interrupted journal that predates explicit ids.
     const targetId=settings.pendingApplySnapshotId??settings.lastSnapshotId;if(!targetId)throw new SyncSafetyError("An accepted device update is pending, but its target snapshot was not recorded.");
-    const target=await this.api.snapshot(targetId).catch(()=>null);if(!target)throw new SyncSafetyError("An accepted device update is pending, but its exact server snapshot is unavailable. No local files were uploaded or deleted.");
-    const priorId=settings.pendingApplyBaseSnapshotId??target.parentId,prior=priorId?await this.api.snapshot(priorId).catch(()=>null):null,targetMap=this.map(target),priorMap=this.map(prior),cache=new Map<string,Uint8Array>(),desktopOnly=new Set<string>();let completed=0,preserved=0;
+    const target=await this.optionalSnapshot(targetId);if(!target)throw new SyncSafetyError("An accepted device update is pending, but its exact server snapshot is unavailable. No local files were uploaded or deleted.");
+    const priorId=settings.pendingApplyBaseSnapshotId??target.parentId,prior=priorId?await this.optionalSnapshot(priorId):null,targetMap=this.map(target),priorMap=this.map(prior),cache=new Map<string,Uint8Array>(),desktopOnly=new Set<string>();let completed=0,preserved=0;
     if(this.isMobileDevice)for(const [path,entry] of targetMap){const plugin=obsidianPluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
     for(const path of pending){const old=priorMap.get(path);if(!targetMap.has(path)&&old)settings.retiredPaths[path]={hash:old.hash,snapshotId:target.id,retiredAt:Date.now()};}
     this.trimRetiredPaths();await this.saveSettings();
@@ -588,6 +595,7 @@ export class SyncEngine {
     this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
     let remoteHeadId:string|null;
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
+    if(remoteHeadId!==requestedBaseId)this.status({phase:"checking",message:"New server changes found",remoteChanged:true});
     if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!settings.pluginSyncBootstrapPending&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       const accepted=requestedBaseId?await this.api.snapshot(requestedBaseId):null,topology=await this.reconcileFolderTopology(this.snapshotFolders(accepted),accepted?.folderRepair,accepted?.createdAt);prunedFolders+=topology.removed;await this.saveSettings();
       this.status({phase:topology.remaining?"applying":"up-to-date",message:topology.remaining?settings.retiredFolderNote:"Up to date · accepted file manifest and observed folders agree",level:topology.remaining?"warning":"success"});
@@ -595,7 +603,7 @@ export class SyncEngine {
     }
     const remoteSnapshot=(await this.api.state()).head;
     if(settings.pendingApplyPaths.length){prunedFolders+=await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;}
-    const baseSnapshot = requestedBaseId ? await this.api.snapshot(requestedBaseId).catch(() => null) : null;
+    const baseSnapshot = requestedBaseId ? await this.optionalSnapshot(requestedBaseId) : null;
     const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
     const fullScan=settings.fullScanRequired||settings.pluginSyncBootstrapPending||!settings.initialized||!baseSnapshot||auditDue;
     this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
@@ -807,13 +815,14 @@ export class SyncEngine {
       catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"The server vault changed during onboarding verification");throw error;}
     }
 
-    this.status({phase:"uploading",message:"Preparing encrypted uploads"}); let uploaded = 0;
+    const uploadTotal=entries.filter(entry=>!remoteHashes.has(entry.hash)).length;
+    this.status({phase:uploadTotal?"uploading":"checking",message:uploadTotal?"Uploading changed files":"Verifying the planned snapshot",current:uploadTotal?0:undefined,total:uploadTotal||undefined}); let uploaded = 0;
     for (const entry of entries) {
       await this.cooperate();
       if(remoteHashes.has(entry.hash))continue;
       const localEntry=local.get(entry.path);const clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(entry.path,localEntry,bytes):undefined);if(!clear)throw new Error(`Unable to prepare changed file ${entry.path}`);
       await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
-      if(this.progress(uploaded))this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded});
+      if(this.progress(uploaded,uploadTotal))this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded,total:uploadTotal});
     }
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
     let snapshot:Snapshot;

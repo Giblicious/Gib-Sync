@@ -67,7 +67,7 @@
 .gib-sync-desktop-status.is-active .gib-sync-indicator-icon, .gib-sync-indicator.is-active .gib-sync-indicator-icon { color: var(--interactive-accent); }
 .gib-sync-desktop-status.is-warning .gib-sync-indicator-icon, .gib-sync-indicator.is-warning .gib-sync-indicator-icon { color: var(--color-orange); }
 .gib-sync-desktop-status.is-error .gib-sync-indicator-icon, .gib-sync-indicator.is-error .gib-sync-indicator-icon { color: var(--color-red); }
-.gib-sync-desktop-status.is-animated .gib-sync-indicator-icon, .gib-sync-indicator.is-animated .gib-sync-indicator-icon { animation: gib-sync-spin 1.2s linear infinite; }
+.gib-sync-desktop-status.is-checking.is-animated .gib-sync-indicator-icon, .gib-sync-indicator.is-checking.is-animated .gib-sync-indicator-icon { animation: gib-sync-pulse 2s ease-in-out infinite; }
 .gib-sync-indicator-badge { position: absolute; top: -5px; right: -7px; min-width: 14px; height: 14px; padding: 0 3px; border: 2px solid var(--background-primary); border-radius: 8px; background: var(--color-orange); color: white; font-size: 9px; font-weight: 700; line-height: 10px; text-align: center; }
 .gib-sync-status-short-text { line-height: 1; }
 .gib-sync-indicator:not(.gib-sync-mobile-sidebar-indicator) { position: relative; align-items: center; justify-content: center; cursor: pointer; }

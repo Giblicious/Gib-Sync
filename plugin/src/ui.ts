@@ -236,6 +236,7 @@ export class StatusOverviewModal extends Modal{
     if(action==="resolve"){new NativeSyncConflictModal(this.app,this.plugin).open();return;}
     if(action==="review"){this.close();this.plugin.openSafeguards();return;}
     if(action==="resume"){void this.plugin.setPaused(false);return;}
+    if(action==="settings"){this.openSettings();return;}
     this.close();void this.plugin.runSync();
   }
   private render(){
@@ -243,7 +244,7 @@ export class StatusOverviewModal extends Modal{
     const model=buildQuickStatusModel({state,live,configured:Boolean(this.plugin.settings.deviceToken),nativeSyncBlocked:this.plugin.isNativeSyncBlocking(),paused:this.plugin.settings.paused});
     const hero=root.createDiv({cls:`gib-sync-status-overview is-${state.tone}`});const icon=hero.createSpan({cls:"gib-sync-status-overview-icon"});setIcon(icon,state.icon);
     const copy=hero.createDiv({cls:"gib-sync-status-overview-copy"});copy.createEl("strong",{text:state.label});copy.createEl("div",{text:model.description,cls:"gib-sync-status-overview-description"});copy.createEl("small",{text:model.meta,cls:"gib-sync-status-overview-meta"});
-    if(live.running&&live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
+    if(state.key==="syncing"&&live.total){const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${Math.min(100,((live.current||0)/live.total)*100)}%`}});}
     const actions=root.createDiv({cls:"gib-sync-status-overview-actions"});
     const primary=actions.createEl("button",{text:model.primaryLabel,cls:"mod-cta"});primary.disabled=model.primaryDisabled;primary.onclick=()=>this.runPrimary(model.primaryAction);
     const details=actions.createEl("button",{text:"Details"});details.onclick=()=>this.openSettings();
@@ -350,7 +351,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
   }
   private scheduleLiveRender(){if(this.liveRenderTimer!==null)return;this.liveRenderTimer=window.setTimeout(()=>{this.liveRenderTimer=null;if(this.page==="console")this.renderConsole();else if(this.page==="status")this.renderLive();},250);}
   private renderLive(){if(!this.liveRoot)return;const root=this.liveRoot,detailsOpen=root.querySelector<HTMLDetailsElement>(".gib-sync-status-details")?.open??false;root.empty();const live=this.plugin.liveStatus;const server=this.plugin.serverStatus;const storage=server?.storage||this.plugin.settings.storage,state=this.plugin.indicatorState();
-    const header=root.createDiv({cls:`gib-sync-status-head is-${state.tone}`});header.createDiv({cls:"gib-sync-status-dot"});const copy=header.createDiv();copy.createEl("strong",{text:state.label});copy.createEl("div",{cls:"gib-sync-muted",text:state.description});header.createDiv({cls:"gib-sync-status-freshness",text:live.running?"Working now":live.lastSuccessAt?`Checked ${when(live.lastSuccessAt)}`:"Not checked yet"});
+    const header=root.createDiv({cls:`gib-sync-status-head is-${state.tone}`});header.createDiv({cls:"gib-sync-status-dot"});const copy=header.createDiv();copy.createEl("strong",{text:state.label});copy.createEl("div",{cls:"gib-sync-muted",text:state.description});header.createDiv({cls:"gib-sync-status-freshness",text:live.lastSuccessAt?`Last verified ${when(live.lastSuccessAt)}`:"Not verified yet"});
     const track=root.createDiv({cls:"gib-sync-progress"});track.createDiv({cls:"gib-sync-progress-value",attr:{style:`width:${live.total?Math.min(100,((live.current||0)/live.total)*100):0}%`}});
     const issues=server?.healthAlerts.filter((alert)=>alert.level==="warning"||alert.level==="error")??[];
     if(this.plugin.compatibility&&!this.plugin.compatibility.compatible){const update=root.createDiv({cls:"gib-sync-attention-card is-warning"});update.createEl("strong",{text:"Gib Sync compatibility update required"});update.createEl("p",{text:`${this.plugin.compatibility.reason} Synchronization is disabled until compatibility is restored.`});}

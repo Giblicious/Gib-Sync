@@ -1,7 +1,7 @@
 import type { LiveSyncStatus } from "./settings";
 import type { IndicatorState } from "./status";
 
-export type QuickStatusAction="setup"|"resolve"|"review"|"resume"|"sync";
+export type QuickStatusAction="setup"|"resolve"|"review"|"resume"|"settings"|"sync";
 
 export interface QuickStatusModel {
   description:string;
@@ -43,23 +43,26 @@ export function buildQuickStatusModel(input:{
   else if(paused)description="Automatic syncing is paused.";
   else if(state.key==="blocked")description=state.description||"Synchronization is safely paused.";
   else if(state.key==="attention"&&state.attentionCount>0)description=`${state.attentionCount} held change${state.attentionCount===1?"":"s"} need review.`;
-  else if(state.key==="syncing")description=live.message||"Syncing your vault…";
-  else if(state.key==="queued")description="Changes are waiting to sync.";
+  else if(state.key==="syncing"||state.key==="checking"||state.key==="retrying"||state.key==="offline")description=state.description;
+  else if(state.key==="queued")description=state.description;
   else if(state.key==="error")description=live.lastError||state.description||"Sync could not finish.";
   else if(state.key==="attention")description=state.description||"Gib Sync needs your attention.";
   else description="Your vault is up to date.";
 
   let meta:string;
   if(!configured)meta="Not connected";
-  else if(state.key==="syncing"&&live.total)meta=`${Math.min(live.current??0,live.total)} of ${live.total} items`;
+  else if(state.key==="syncing"&&live.total)meta=`${Math.min(live.current??0,live.total)} of ${live.total} files`;
   else if(state.key==="syncing")meta="Working now";
-  else if(state.key==="queued")meta="Waiting to start";
-  else meta=live.lastSuccessAt?`Last synced ${relativeTime(live.lastSuccessAt,now)}`:"No successful sync yet";
+  else if(state.key==="retrying")meta=live.nextSyncAt?`Retrying in ${Math.max(1,Math.ceil((Date.parse(live.nextSyncAt)-now)/1000))} sec`:"Retrying automatically";
+  else if(state.key==="queued")meta=live.pendingChanges?`${live.pendingChanges} pending change${live.pendingChanges===1?"":"s"}`:"Waiting to check";
+  else meta=live.lastSuccessAt?`Last verified ${relativeTime(live.lastSuccessAt,now)}`:"Not verified yet";
 
   if(!configured)return {description,meta,primaryAction:"setup",primaryLabel:"Set up",primaryDisabled:false};
   if(nativeSyncBlocked)return {description,meta,primaryAction:"resolve",primaryLabel:"Resolve",primaryDisabled:false};
   if(state.attentionCount>0)return {description,meta,primaryAction:"review",primaryLabel:"Review",primaryDisabled:false};
   if(paused)return {description,meta,primaryAction:"resume",primaryLabel:"Resume",primaryDisabled:false};
-  if(state.key==="blocked")return {description,meta,primaryAction:"sync",primaryLabel:"Server paused",primaryDisabled:true};
-  return {description,meta,primaryAction:"sync",primaryLabel:live.running?"Syncing…":state.key==="error"?"Try again":"Sync now",primaryDisabled:live.running};
+  if(state.key==="blocked")return state.label==="Server paused"||/emergency containment/i.test(state.description)
+    ?{description,meta,primaryAction:"sync",primaryLabel:"Server paused",primaryDisabled:true}
+    :{description,meta,primaryAction:"settings",primaryLabel:"Open settings",primaryDisabled:false};
+  return {description,meta,primaryAction:"sync",primaryLabel:live.running?(state.key==="checking"?"Checking…":state.key==="retrying"?"Retrying…":"Syncing…"):state.key==="error"||state.key==="offline"?"Try again":"Sync now",primaryDisabled:live.running};
 }

@@ -11,9 +11,33 @@ describe("status indicator state",()=>{
   });
   it("distinguishes active, queued, failed, and synchronized states",()=>{
     const live=initialLiveStatus(true);live.running=true;live.phase="uploading";expect(deriveIndicatorState(live,true,false).key).toBe("syncing");
-    live.running=false;live.phase="scheduled";expect(deriveIndicatorState(live,true,false).key).toBe("queued");
+    live.running=false;live.phase="scheduled";live.pendingChanges=1;expect(deriveIndicatorState(live,true,false).key).toBe("queued");live.pendingChanges=0;
     live.phase="error";live.lastError="Offline";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"error",description:"Offline"});
-    live.phase="up-to-date";expect(deriveIndicatorState(live,true,false).key).toBe("synced");
+    live.phase="up-to-date";live.verified=true;live.lastSuccessAt=new Date().toISOString();expect(deriveIndicatorState(live,true,false).key).toBe("synced");
+  });
+  it("pulses a check only for checking a verified device with no pending changes",()=>{
+    const live=initialLiveStatus(true);live.running=true;live.phase="scanning";
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"circle-dashed",tone:"neutral",animated:true});
+    live.lastSuccessAt=new Date().toISOString();live.verified=true;
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"success",animated:true});
+    live.pendingChanges=1;
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"circle-dashed",tone:"neutral"});
+    live.running=false;live.phase="up-to-date";
+    expect(deriveIndicatorState(live,true,false).key).toBe("queued");
+  });
+  it("does not infer verification from a persisted successful sync or an idle phase",()=>{
+    const live=initialLiveStatus(true);live.lastSuccessAt=new Date().toISOString();
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",tone:"neutral",animated:false});
+  });
+  it("shows retries and offline distinctly without masking server health errors",()=>{
+    const live=initialLiveStatus(true);live.phase="retrying";live.running=true;
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"retrying",tone:"active",animated:false});
+    expect(deriveIndicatorState(live,true,false,0,{errors:1,warnings:0}).key).toBe("error");
+    live.phase="offline";live.running=false;
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"offline",tone:"neutral"});
+    expect(deriveIndicatorState(live,true,false,0,{errors:1,warnings:0}).key).toBe("error");
+    live.phase="uploading";live.running=true;
+    expect(deriveIndicatorState(live,true,false,0,{errors:1,warnings:0}).key).toBe("error");
   });
   it("does not show green when the server reports a health problem",()=>{
     const live=initialLiveStatus(true);live.phase="up-to-date";

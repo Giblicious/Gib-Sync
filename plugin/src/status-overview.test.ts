@@ -11,14 +11,14 @@ describe("quick status popup model",()=>{
   it("keeps the healthy summary concise and useful",()=>{
     const live=initialLiveStatus(true);live.phase="up-to-date";live.lastSuccessAt="2026-08-15T12:00:00.000Z";live.lastResult="a very long technical result";
     expect(buildQuickStatusModel({state:state(),live,configured:true,nativeSyncBlocked:false,paused:false,now:Date.parse("2026-08-15T12:02:00.000Z")})).toEqual({
-      description:"Your vault is up to date.",meta:"Last synced 2 min ago",primaryAction:"sync",primaryLabel:"Sync now",primaryDisabled:false
+      description:"Your vault is up to date.",meta:"Last verified 2 min ago",primaryAction:"sync",primaryLabel:"Sync now",primaryDisabled:false
     });
   });
 
   it("shows practical progress while syncing",()=>{
     const live=initialLiveStatus(true);live.running=true;live.phase="uploading";live.message="Uploading changes";live.current=12;live.total=40;
-    expect(buildQuickStatusModel({state:state({key:"syncing",label:"Syncing",tone:"active"}),live,configured:true,nativeSyncBlocked:false,paused:false})).toMatchObject({
-      description:"Uploading changes",meta:"12 of 40 items",primaryLabel:"Syncing…",primaryDisabled:true
+    expect(buildQuickStatusModel({state:state({key:"syncing",label:"Syncing",tone:"active",description:"Syncing 12 of 40 files"}),live,configured:true,nativeSyncBlocked:false,paused:false})).toMatchObject({
+      description:"Syncing 12 of 40 files",meta:"12 of 40 files",primaryLabel:"Syncing…",primaryDisabled:true
     });
   });
 

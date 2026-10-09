@@ -1,13 +1,14 @@
 import type { Plugin } from "obsidian";
 import type { StorageLocation } from "@gib-sync/protocol";
 
-export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
+export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"checking"|"retrying"|"offline"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
 export interface SyncActivity { at:string; phase:SyncPhase; level:ActivityLevel; message:string; current?:number; total?:number; repeats?:number; }
 export interface LiveSyncStatus {
   phase:SyncPhase; message:string; running:boolean; current?:number; total?:number;
   startedAt:string|null; completedAt:string|null; lastSuccessAt:string|null; lastErrorAt:string|null; lastError:string;
   lastResult:string; nextSyncAt:string|null; activities:SyncActivity[];
+  verified?:boolean; pendingChanges?:number;
 }
 
 export interface RetiredPathState {
