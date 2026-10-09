@@ -20,7 +20,7 @@ function errorBody(response:{json:unknown}):any{
   try{return response.json;}catch{return null;}
 }
 
-export const CLIENT_VERSION="0.8.58";
+export const CLIENT_VERSION="0.8.59";
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   if(bytes.buffer instanceof ArrayBuffer&&bytes.byteOffset===0&&bytes.byteLength===bytes.buffer.byteLength)return bytes.buffer;
