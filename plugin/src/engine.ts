@@ -30,6 +30,16 @@ function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
   return bytes.slice().buffer;
 }
 
+// Receipts compare content and canonical explicit folders, not timestamps or
+// display names. Implicit parent folders are removed by the server on commit.
+export async function commitFingerprint(entries:ManifestEntry[],folders:readonly string[]=[]):Promise<string>{
+  const parents=new Set<string>();
+  for(const entry of entries){const parts=entry.path.split("/");for(let i=1;i<parts.length;i++)parents.add(parts.slice(0,i).join("/"));}
+  const files=entries.map(({path,hash,size})=>[path,hash,size]).sort((a,b)=>String(a[0])<String(b[0])?-1:String(a[0])>String(b[0])?1:0);
+  const explicit=[...new Set(folders)].filter(path=>!parents.has(path)).sort();
+  return hashBytes(encoder.encode(JSON.stringify({files,folders:explicit})));
+}
+
 export interface SyncResult { uploaded: number; downloaded: number; deleted: number; prunedFolders:number; pendingRetiredFolders:number; conflicts: number; resolved:number; mirrored:number; snapshotId: string | null; processedPaths:string[]; fullScan:boolean; }
 export interface SyncProgress { phase:SyncPhase; message:string; current?:number; total?:number; level?:"info"|"success"|"warning"|"error"; remoteChanged?:boolean; }
 export class SyncSafetyError extends Error { override readonly name="SyncSafetyError"; }
@@ -52,7 +62,8 @@ export class SyncEngine {
     private readonly wait: (milliseconds:number) => Promise<void> = (milliseconds) => new Promise((resolve)=>window.setTimeout(resolve,milliseconds)),
     private readonly expectLocalMutation:(path:string,hash:string|null)=>void=()=>{},
     private readonly yieldControl:()=>Promise<void>=cooperativeYield,
-    private readonly isMobileDevice=false
+    private readonly isMobileDevice=false,
+    private readonly canApplyLocalMutation:(path:string)=>boolean=()=>true
   ) {}
 
   private async cooperate(force=false):Promise<void>{
@@ -73,7 +84,7 @@ export class SyncEngine {
     const scanned=await this.scan(),local=scanned.files,head=(await this.api.state()).head,remote=this.map(head),cache=new Map<string,Uint8Array>();for(const path of scanned.unreadableConflictPaths){const accepted=remote.get(path);if(accepted)local.set(path,accepted);}let downloaded=0,deleted=0;
     for(const [path,entry] of remote){await this.cooperate();if(local.get(path)?.hash===entry.hash)continue;const clear=await this.remoteBytes(entry,cache);await this.ensureParent(path);this.expectLocalMutation(path,entry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));downloaded++;}
     for(const [path,entry] of local)if(!remote.has(path)&&this.include(path)){await this.cooperate();if(head)settings.retiredPaths[path]={hash:entry.hash,snapshotId:head.id,retiredAt:Date.now()};this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;}
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(head),head?.folderRepair,head?.createdAt);settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(head),head?.folderRepair,head?.createdAt);settings.lastSnapshotId=head?.id??null;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingApplyPriorEntries={};settings.localReconcileBases={};settings.pendingCommit=null;if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;this.trimRetiredPaths();await this.saveSettings();return {downloaded,deleted,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
   private async entropy(bytes:Uint8Array):Promise<number>{
@@ -497,6 +508,49 @@ export class SyncEngine {
     try{return await this.api.snapshot(id);}catch(error){if(error instanceof ApiError&&error.status===404)return null;throw error;}
   }
 
+  private async recoverPendingCommit():Promise<void>{
+    const settings=this.getSettings(),intent=settings.pendingCommit;if(!intent)return;
+    this.status({phase:"checking",message:"Verifying an interrupted upload before comparing newer edits"});
+    let cursor=(await this.api.state()).head,accepted:Snapshot|null=null,verifiedAbsent=false;
+    for(let count=0;count<128;count++){
+      await this.cooperate();
+      if((cursor?.id??null)===intent.parentId){verifiedAbsent=true;break;}
+      if(!cursor){verifiedAbsent=true;break;}
+      if(cursor.parentId===intent.parentId){
+        if(cursor.deviceId===settings.deviceId&&await commitFingerprint(cursor.entries,cursor.folders)===intent.fingerprint)accepted=cursor;
+        else verifiedAbsent=true;
+        break;
+      }
+      if(!cursor.parentId){verifiedAbsent=true;break;}
+      cursor=await this.optionalSnapshot(cursor.parentId);
+      if(!cursor)throw new SyncSafetyError("The interrupted upload's history could not be verified. Local edits are safe; no files were changed.");
+    }
+    if(!accepted){
+      if(!verifiedAbsent)throw new SyncSafetyError("The interrupted upload's receipt needs older server history before sync can safely continue. Local edits are safe.");
+      settings.pendingCommit=null;await this.saveSettings();return;
+    }
+    if(settings.pendingApplySnapshotId&&settings.pendingApplySnapshotId!==accepted.id)throw new SyncSafetyError("The saved upload and download journals disagree. Local files were left unchanged.");
+    settings.pendingApplySnapshotId=accepted.id;
+    settings.pendingApplyBaseSnapshotId=settings.lastSnapshotId;
+    settings.pendingApplyPriorHashes={...intent.priorHashes,...settings.pendingApplyPriorHashes};
+    settings.pendingApplyPriorEntries={...intent.priorEntries,...settings.pendingApplyPriorEntries};
+    settings.pendingApplyPaths=[...new Set([...Object.keys(intent.priorHashes),...settings.pendingApplyPaths])].filter(path=>this.include(path)).sort();
+    settings.fullScanRequired=true;
+    await this.saveSettings();
+    this.status({phase:"checking",message:"Verified this device's accepted upload; resuming its checkpoint without creating a self-conflict",level:"success"});
+  }
+
+  private async assertLocalUnchanged(path:string,prior:FileState|undefined):Promise<void>{
+    if(!this.canApplyLocalMutation(path)){this.getSettings().fullScanRequired=true;throw new FileChangedDuringReadError(path);}
+    const stat=await this.adapter.stat(path);
+    let same=!stat&&!prior;
+    if(stat?.type==="file"&&prior){
+      if(stat.size>=LOW_MEMORY_DOWNLOAD_BYTES)same=stat.size===prior.size&&stat.mtime===prior.mtime;
+      else try{same=await hashBytes(new Uint8Array(await this.adapter.readBinary(path)))===prior.hash;}catch(error){if(!await this.disappeared(path))throw error;}
+    }
+    if(!same||!this.canApplyLocalMutation(path)){this.getSettings().fullScanRequired=true;throw new FileChangedDuringReadError(path);}
+  }
+
   private async mirror(snapshotId:string,entries:ManifestEntry[],final:Map<string,FileState>,bytes:Map<string,Uint8Array>,remoteCache:Map<string,Uint8Array>):Promise<number>{
     this.status({phase:"checking",message:"Verifying the Seafile copy"});const plan=await this.api.mirrorPlan(snapshotId,entries);if(plan.alreadyCurrent)return 0;
     if(plan.uploadPaths.length||plan.deletePaths.length)this.status({phase:"mirroring",message:"Updating the Seafile copy",current:0,total:plan.uploadPaths.length||undefined});
@@ -522,11 +576,11 @@ export class SyncEngine {
       this.status({phase:"applying",message:"Updating files on this device",current:downloaded+deleted,total:operationTotal});
       if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)this.status({phase:"applying",message:`Downloading large file with mobile-safe memory use · ${path} · ${(entry.size/1024/1024).toFixed(1)} MB`,current:downloaded+deleted,total:operationTotal});
       const clear=deviceClear??bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);if(entry.size<LOW_MEMORY_DOWNLOAD_BYTES&&!deviceClear)bytes.set(entry.hash,clear);
-      await this.ensureParent(path);this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}downloaded++;
+      await this.ensureParent(path);await this.assertLocalUnchanged(path,physicalLocal.get(path));this.expectLocalMutation(path,deviceEntry.hash);await this.adapter.writeBinary(path,exactArrayBuffer(clear));if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES){bytes.delete(entry.hash);remoteCache.delete(entry.hash);}downloaded++;
     }
     for(const path of physicalLocal.keys())if(!final.has(path)&&this.include(path)){
       await this.cooperate();if(scanned.unreadableConflictPaths.has(path)){this.status({phase:"applying",message:`Left inaccessible generated conflict entry isolated on this device · ${path}`,level:"warning"});continue;}
-      this.status({phase:"applying",message:"Applying accepted file deletions",current:downloaded+deleted,total:operationTotal});this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;
+      this.status({phase:"applying",message:"Applying accepted file deletions",current:downloaded+deleted,total:operationTotal});await this.assertLocalUnchanged(path,physicalLocal.get(path));this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;
     }
     for(const path of orphanUnreadableConflicts){await this.cooperate();try{this.expectLocalMutation(path,null);await this.adapter.remove(path);deleted++;this.status({phase:"applying",message:`Removed orphaned generated conflict copy after its handle released · ${path}`,level:"success"});}catch{this.status({phase:"applying",message:`Generated conflict copy is still locked locally and absent from the accepted vault · ${path} · it will be retried without upload`,level:"warning"});}}
     return {downloaded,deleted};
@@ -547,7 +601,7 @@ export class SyncEngine {
     return {clear,hash};
   }
   private async resumePendingApplication():Promise<number>{
-    const settings=this.getSettings(),pending=[...new Set(settings.pendingApplyPaths.map((path)=>normalizePath(path)).filter(Boolean))];if(!pending.length)return 0;
+    const settings=this.getSettings(),pending=[...new Set(settings.pendingApplyPaths.map((path)=>normalizePath(path)).filter(Boolean))];if(!pending.length&&!settings.pendingApplySnapshotId)return 0;
     // v0.8.33 recorded lastSnapshotId before applying. Treat it as the staged
     // target when upgrading an interrupted journal that predates explicit ids.
     const targetId=settings.pendingApplySnapshotId??settings.lastSnapshotId;if(!targetId)throw new SyncSafetyError("An accepted device update is pending, but its target snapshot was not recorded.");
@@ -563,15 +617,22 @@ export class SyncEngine {
       const priorHash=Object.prototype.hasOwnProperty.call(settings.pendingApplyPriorHashes,path)?settings.pendingApplyPriorHashes[path]:(old?.hash??null);
       if(entry){
         const expected=await this.deviceBytes(path,entry,cache,desktopOnly);if(currentHash===expected.hash){completed++;continue;}
-        if(currentHash!==null&&currentHash!==priorHash){preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);completed++;continue;}
-        await this.ensureParent(path);this.expectLocalMutation(path,expected.hash);await this.adapter.writeBinary(path,exactArrayBuffer(expected.clear));
+        if(currentHash!==null&&currentHash!==priorHash){
+          const replayBase=settings.pendingApplyPriorEntries[path]??(old?.hash===priorHash?old:undefined);
+          // A legacy journal without a provable source must preserve both
+          // versions; never reinterpret its new editor bytes as a replacement
+          // of an incoming version the editor has not actually seen.
+          settings.localReconcileBases[path]=replayBase??null;
+          preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);completed++;continue;
+        }
+        await this.ensureParent(path);await this.assertLocalUnchanged(path,currentHash&&stat?{path,hash:currentHash,size:stat.size,mtime:stat.mtime}:undefined);this.expectLocalMutation(path,expected.hash);await this.adapter.writeBinary(path,exactArrayBuffer(expected.clear));
       }else if(stat){
-        if(old&&currentHash===old.hash){this.expectLocalMutation(path,null);await this.adapter.remove(path);}
-        else{preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);}
+        if(priorHash!==null&&currentHash===priorHash){await this.assertLocalUnchanged(path,{path,hash:currentHash,size:stat.size,mtime:stat.mtime});this.expectLocalMutation(path,null);await this.adapter.remove(path);}
+        else{settings.localReconcileBases[path]=settings.pendingApplyPriorEntries[path]??old??null;preserved++;settings.pendingPathTimes[path]=settings.pendingPathTimes[path]??Date.now();if(!settings.pendingPaths.includes(path))settings.pendingPaths.push(path);}
       }
       completed++;if(this.progress(completed,pending.length))this.status({phase:"applying",message:"Resuming accepted device state",current:completed,total:pending.length});
     }
-    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(target),target.folderRepair,target.createdAt);settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();
+    const retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(this.snapshotFolders(target),target.folderRepair,target.createdAt);settings.lastSnapshotId=target.id;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingApplyPriorEntries={};settings.pendingCommit=null;settings.pendingPaths=[...new Set(settings.pendingPaths)].sort();if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();
     if(preserved)this.status({phase:"applying",message:`Preserved ${preserved} genuine local change${preserved===1?"":"s"} made during the interrupted download; they will reconcile normally`,level:"success"});
     return retiredCleanup.removed+topology.removed;
   }
@@ -580,32 +641,36 @@ export class SyncEngine {
     const changed=[...final].filter(([path,entry])=>physicalLocal.get(path)?.hash!==entry.hash).map(([path])=>path),removed=[...physicalLocal.keys()].filter((path)=>!final.has(path));
     const settings=this.getSettings(),baseId=settings.lastSnapshotId;settings.pendingApplySnapshotId=snapshotId;settings.pendingApplyBaseSnapshotId=baseId;settings.pendingApplyPaths=[...new Set([...changed,...removed,...orphanUnreadableConflicts])].sort();
     settings.pendingApplyPriorHashes=Object.fromEntries(settings.pendingApplyPaths.map((path)=>[path,physicalLocal.get(path)?.hash??null]));
+    settings.pendingApplyPriorEntries=Object.fromEntries(settings.pendingApplyPaths.flatMap(path=>{const entry=physicalLocal.get(path);return entry?[[path,{path,hash:entry.hash,size:entry.size,mtime:entry.mtime}]]:[]}));
     for(const path of removed){const previous=physicalLocal.get(path);if(previous)settings.retiredPaths[path]={hash:previous.hash,snapshotId,retiredAt:Date.now()};}
-    settings.pendingPaths=[];settings.pendingPathTimes={};this.trimRetiredPaths();await this.saveSettings();
+    // The controller acknowledges consumed path revisions after success. Never
+    // erase edits observed while upload/commit was awaiting the network.
+    this.trimRetiredPaths();await this.saveSettings();
     const result=await this.applyFinal(final,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache),retiredCleanup=await this.pruneRetiredEmptyFolders(),topology=await this.reconcileFolderTopology(topologyPaths,folderRepair,repairSnapshotCreatedAt);
-    settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();return {...result,prunedFolders:retiredCleanup.removed+topology.removed};
+    settings.lastSnapshotId=snapshotId;settings.initialized=true;settings.pendingApplyPaths=[];settings.pendingApplySnapshotId=null;settings.pendingApplyBaseSnapshotId=null;settings.pendingApplyPriorHashes={};settings.pendingApplyPriorEntries={};settings.localReconcileBases={};settings.pendingCommit=null;if(settings.syncPlugins)settings.pluginSyncBootstrapPending=false;await this.saveSettings();return {...result,prunedFolders:retiredCleanup.removed+topology.removed};
   }
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
+    await this.recoverPendingCommit();
     const initialFolderCleanup=await this.pruneRetiredEmptyFolders();let prunedFolders=initialFolderCleanup.removed;if(initialFolderCleanup.attempted)await this.saveSettings();
     let requestedBaseId=settings.lastSnapshotId;
-    const pendingPaths=[...new Set(settings.pendingPaths.map((path)=>normalizePath(path)).filter(Boolean))];
+    let pendingPaths=[...new Set(settings.pendingPaths.map((path)=>normalizePath(path)).filter(Boolean))];
     const lastAudit=settings.lastFullScanAt?Date.parse(settings.lastFullScanAt):0,auditDue=!lastAudit||Date.now()-lastAudit>=6*60*60*1000;
     this.status({phase:"reading-remote",message:"Checking for a newer server snapshot"});
     let remoteHeadId:string|null;
     try{remoteHeadId=(await this.api.headState()).headId;}catch(error){if(!(error instanceof ApiError&&error.status===404))throw error;remoteHeadId=(await this.api.state()).head?.id??null;}
     if(remoteHeadId!==requestedBaseId)this.status({phase:"checking",message:"New server changes found",remoteChanged:true});
-    if(settings.initialized&&!settings.pendingApplyPaths.length&&!settings.fullScanRequired&&!settings.pluginSyncBootstrapPending&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
+    if(settings.initialized&&!settings.pendingApplySnapshotId&&!settings.pendingApplyPaths.length&&!Object.keys(settings.localReconcileBases).length&&!settings.fullScanRequired&&!settings.pluginSyncBootstrapPending&&!auditDue&&!pendingPaths.length&&remoteHeadId===requestedBaseId){
       const accepted=requestedBaseId?await this.api.snapshot(requestedBaseId):null,topology=await this.reconcileFolderTopology(this.snapshotFolders(accepted),accepted?.folderRepair,accepted?.createdAt);prunedFolders+=topology.removed;await this.saveSettings();
       this.status({phase:topology.remaining?"applying":"up-to-date",message:topology.remaining?settings.retiredFolderNote:"Up to date · accepted file manifest and observed folders agree",level:topology.remaining?"warning":"success"});
       return {uploaded:0,downloaded:0,deleted:0,prunedFolders,pendingRetiredFolders:settings.retiredFolderCount,conflicts:0,resolved:0,mirrored:0,snapshotId:requestedBaseId,processedPaths:[],fullScan:false};
     }
     const remoteSnapshot=(await this.api.state()).head;
-    if(settings.pendingApplyPaths.length){prunedFolders+=await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;}
+    if(settings.pendingApplySnapshotId||settings.pendingApplyPaths.length){prunedFolders+=await this.resumePendingApplication();requestedBaseId=settings.lastSnapshotId;pendingPaths=[...new Set(settings.pendingPaths.map((path)=>normalizePath(path)).filter(Boolean))];}
     const baseSnapshot = requestedBaseId ? await this.optionalSnapshot(requestedBaseId) : null;
     const ownDescendants=baseSnapshot&&pendingPaths.length?await this.ownDescendantCount(requestedBaseId,remoteSnapshot,settings.deviceId):0;
-    const fullScan=settings.fullScanRequired||settings.pluginSyncBootstrapPending||!settings.initialized||!baseSnapshot||auditDue;
+    const fullScan=settings.fullScanRequired||Boolean(Object.keys(settings.localReconcileBases).length)||settings.pluginSyncBootstrapPending||!settings.initialized||!baseSnapshot||auditDue;
     this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
     const scanBaseline=ownDescendants&&remoteSnapshot?remoteSnapshot:baseSnapshot;
     const scanned=fullScan?await this.scan():await this.scanIncremental(scanBaseline!,pendingPaths),local=scanned.files;
@@ -617,7 +682,12 @@ export class SyncEngine {
         effectiveBaseSnapshot=remoteSnapshot;
         this.status({phase:"merging",message:`Recovered a stale local checkpoint across ${ownDescendants} prior sync${ownDescendants===1?"":"s"} from this device; applying only newly observed local changes`,level:"success"});
       }else{
-        this.status({phase:"merging",message:"A stale local checkpoint followed this device's own sync, but unjournaled vault differences require normal lossless reconciliation",level:"warning"});
+        // Recover each observed path independently. An unrelated unjournaled
+        // bookmark/config difference must not turn a note into a self-conflict.
+        const recovered=new Map(this.map(baseSnapshot));let count=0;
+        for(const path of allPaths)if([...pending].some(prefix=>path===prefix||path.startsWith(`${prefix.replace(/\/$/,"")}/`))){const entry=remoteMap.get(path);if(entry)recovered.set(path,entry);else recovered.delete(path);count++;}
+        effectiveBaseSnapshot={...baseSnapshot!,entries:[...recovered.values()]};
+        this.status({phase:"merging",message:`Recovered ${count} observed paths across this device's prior uploads; unrecorded differences retain normal lossless reconciliation`,level:"info"});
       }
     }
     let onboardingReconcile=false;
@@ -636,6 +706,11 @@ export class SyncEngine {
         onboardingReconcile=true;
         this.status({phase:"merging",message:overlap>=0.9?`Matching vault recognized · ${exactMatches}/${comparedSize} files agree; preserving every difference`:`Interrupted onboarding recognized · ${exactUserMatches}/${localUserFiles.length} local user files already match; resuming the server-first download while preserving local-only files`,level:"success"});
       }
+    }
+    if(Object.keys(settings.localReconcileBases).length&&effectiveBaseSnapshot){
+      const replay=this.map(effectiveBaseSnapshot);for(const [path,entry] of Object.entries(settings.localReconcileBases))if(this.include(path)){if(entry)replay.set(path,entry);else replay.delete(path);}
+      effectiveBaseSnapshot={...effectiveBaseSnapshot,entries:[...replay.values()]};
+      this.status({phase:"merging",message:`Replaying ${Object.keys(settings.localReconcileBases).length} edits made during a download against their actual prior content`,level:"info"});
     }
     const base = this.map(effectiveBaseSnapshot), remote = this.map(remoteSnapshot);for(const path of scanned.unreadableConflictPaths){const accepted=base.get(path)??remote.get(path);if(accepted)local.set(path,accepted);}
     const physicalLocal=new Map(local),bootstrapPluginSync=settings.syncPlugins&&settings.pluginSyncBootstrapPending,acceptedPluginState=Boolean(bootstrapPluginSync&&remoteSnapshot&&[...remote.keys()].some((path)=>this.pluginSyncPath(path)));
@@ -815,7 +890,10 @@ export class SyncEngine {
       catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"The server vault changed during onboarding verification");throw error;}
     }
 
-    const uploadTotal=entries.filter(entry=>!remoteHashes.has(entry.hash)).length;
+    const applyPaths=new Set([...entries.filter(entry=>physicalLocal.get(entry.path)?.hash!==entry.hash).map(entry=>entry.path),...[...physicalLocal.keys()].filter(path=>!entryPaths.has(path))]);
+    const priorEntries=Object.fromEntries([...applyPaths].flatMap(path=>{const entry=physicalLocal.get(path);return entry?[[path,{path,hash:entry.hash,size:entry.size,mtime:entry.mtime}]]:[]}));
+    const proposalHashes=new Set(entries.map(entry=>entry.hash)),replayUploads=[...new Map(Object.values(priorEntries).filter(entry=>!remoteHashes.has(entry.hash)&&!proposalHashes.has(entry.hash)).map(entry=>[entry.hash,entry])).values()];
+    const uploadTotal=entries.filter(entry=>!remoteHashes.has(entry.hash)).length+replayUploads.length;
     this.status({phase:uploadTotal?"uploading":"checking",message:uploadTotal?"Uploading changed files":"Verifying the planned snapshot",current:uploadTotal?0:undefined,total:uploadTotal||undefined}); let uploaded = 0;
     for (const entry of entries) {
       await this.cooperate();
@@ -824,6 +902,10 @@ export class SyncEngine {
       await this.api.putBlob(entry.hash, await encryptBlob(clear, settings.vaultKey, entry.hash)); uploaded++;
       if(this.progress(uploaded,uploadTotal))this.status({phase:"uploading",message:`Uploaded ${uploaded} encrypted file${uploaded===1?"":"s"}`,current:uploaded,total:uploadTotal});
     }
+    // A merged result may differ from the editor's pre-download file. Keep that
+    // encrypted replay base so edits made mid-download can merge, not overwrite
+    // the already accepted remote additions after application resumes.
+    for(const entry of replayUploads){await this.cooperate();const clear=await this.localBytes(entry.path,entry,bytes);await this.api.putBlob(entry.hash,await encryptBlob(clear,settings.vaultKey,entry.hash));uploaded++;}
     this.status({phase:"committing",message:"Committing an atomic snapshot"});
     let snapshot:Snapshot;
     const highEntropyPaths:string[]=[];
@@ -832,9 +914,13 @@ export class SyncEngine {
       const clear=bytes.get(entry.hash);if(clear&&await this.entropy(clear)>7.2)highEntropyPaths.push(entry.path);
     }
     const deviceLocalCleanupPaths=remoteEntries.filter((entry)=>isDeviceLocalObsidianPath(entry.path)&&!entryPaths.has(entry.path)).slice(0,5000).map((entry)=>entry.path);
+    // Write-ahead receipt survives a lost HTTP response, app suspension, or a
+    // later settings-save failure. Save must finish before the server request.
+    settings.pendingCommit={parentId:remoteSnapshot?.id??null,fingerprint:await commitFingerprint(entries,folders),priorHashes:Object.fromEntries([...applyPaths].map(path=>[path,physicalLocal.get(path)?.hash??null])),priorEntries};
+    await this.saveSettings();
     try{snapshot=await this.api.commit({ parentId: remoteSnapshot?.id ?? null, message: conflicts ? `Sync with ${conflicts} preserved conflict${conflicts === 1 ? "" : "s"}` : "Sync", entries,folders,
       clientTime:new Date().toISOString(),signals:{highEntropyPaths,deviceLocalCleanupPaths,vaultIdentity:settings.vaultIdentity,staleBaseline:Boolean(baseSnapshot&&remoteSnapshot&&baseSnapshot.id!==remoteSnapshot.id)} });}
-    catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
+    catch(error){if(error instanceof ApiError&&error.status>=400&&error.status<500&&error.status!==408){settings.pendingCommit=null;await this.saveSettings();}if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"Another device committed at the same time");throw error;}
     const topologyFolders=new Set([...folders,...this.acceptedFolders(entries.map((entry)=>entry.path))]),applied=await this.stageAndApply(snapshot.id,final,topologyFolders,physicalLocal,desktopOnlyPlugins,scanned,orphanUnreadableConflicts,bytes,remoteCache,snapshot.folderRepair,snapshot.createdAt),downloaded=applied.downloaded,deleted=applied.deleted;prunedFolders+=applied.prunedFolders;let mirrored:number;
     try{mirrored=clientCanMirrorAll?await this.mirror(snapshot.id,entries,final,bytes,remoteCache):0;}
     catch(error){if(this.retryableMirrorError(error))return this.convergeAfterConflict(attempt,"The commit succeeded and another device advanced the vault during mirroring");throw error;}

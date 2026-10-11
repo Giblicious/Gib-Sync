@@ -1,5 +1,5 @@
 import type { Plugin } from "obsidian";
-import type { StorageLocation } from "@gib-sync/protocol";
+import type { ManifestEntry,StorageLocation } from "@gib-sync/protocol";
 
 export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"checking"|"retrying"|"offline"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
@@ -16,6 +16,12 @@ export interface RetiredPathState {
   snapshotId:string;
   retiredAt:number;
 }
+export interface PendingCommit {
+  parentId:string|null;
+  fingerprint:string;
+  priorHashes:Record<string,string|null>;
+  priorEntries?:Record<string,ManifestEntry>;
+}
 export interface GibSyncSettings {
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
@@ -26,6 +32,8 @@ export interface GibSyncSettings {
   vaultIdentity: string;
   pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[];
   pendingApplySnapshotId:string|null; pendingApplyBaseSnapshotId:string|null; pendingApplyPriorHashes:Record<string,string|null>; retiredPaths:Record<string,RetiredPathState>;
+  pendingCommit:PendingCommit|null;
+  pendingApplyPriorEntries:Record<string,ManifestEntry>; localReconcileBases:Record<string,ManifestEntry|null>;
   folderCreateTimes:Record<string,number>; folderCleanupVersion:number; lastFolderCleanupAt:number; lastFolderCleanupError:string; retiredFolderCount:number; retiredFolderNote:string; fullScanRequired: boolean; lastFullScanAt: string | null;
   storage: StorageLocation | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string; lastResult: string;
 }
@@ -35,7 +43,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,pluginSyncBootstrapPending:false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null,
-  storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
+  pendingCommit:null,pendingApplyPriorEntries:{},localReconcileBases:{}, storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
 export const initialLiveStatus = (configured:boolean): LiveSyncStatus => ({ phase:configured?"idle":"not-configured",message:configured?"Ready":"Not configured",running:false,
@@ -74,6 +82,14 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   settings.pendingApplyBaseSnapshotId=typeof stored?.pendingApplyBaseSnapshotId==="string"&&stored.pendingApplyBaseSnapshotId?stored.pendingApplyBaseSnapshotId:null;
   settings.pendingApplyPriorHashes=stored?.pendingApplyPriorHashes&&typeof stored.pendingApplyPriorHashes==="object"&&!Array.isArray(stored.pendingApplyPriorHashes)
     ?Object.fromEntries(Object.entries(stored.pendingApplyPriorHashes).filter(([path,hash])=>Boolean(path)&&(hash===null||(typeof hash==="string"&&/^[a-f0-9]{64}$/i.test(hash))))):{};
+  const commit=stored?.pendingCommit;
+  const validEntries=(value:unknown):Record<string,ManifestEntry>=>value&&typeof value==="object"&&!Array.isArray(value)
+    ?Object.fromEntries(Object.entries(value).filter(([path,entry])=>Boolean(path)&&entry&&typeof entry==="object"&&entry.path===path&&typeof entry.hash==="string"&&/^[a-f0-9]{64}$/i.test(entry.hash)&&typeof entry.size==="number"&&Number.isSafeInteger(entry.size)&&entry.size>=0&&typeof entry.mtime==="number"&&Number.isFinite(entry.mtime)).map(([path,entry])=>[path,{path,hash:entry.hash,size:entry.size,mtime:entry.mtime}])):{};
+  settings.pendingApplyPriorEntries=validEntries(stored?.pendingApplyPriorEntries);
+  const replay=stored?.localReconcileBases;
+  settings.localReconcileBases={...validEntries(replay),...Object.fromEntries(Object.entries(replay&&typeof replay==="object"&&!Array.isArray(replay)?replay:{}).filter(([path,entry])=>Boolean(path)&&entry===null))};
+  settings.pendingCommit=commit&&(commit.parentId===null||typeof commit.parentId==="string"&&Boolean(commit.parentId))&&typeof commit.fingerprint==="string"&&/^[a-f0-9]{64}$/i.test(commit.fingerprint)&&commit.priorHashes&&typeof commit.priorHashes==="object"&&!Array.isArray(commit.priorHashes)
+    ?{parentId:commit.parentId,fingerprint:commit.fingerprint,priorHashes:Object.fromEntries(Object.entries(commit.priorHashes).filter(([path,hash])=>Boolean(path)&&(hash===null||typeof hash==="string"&&/^[a-f0-9]{64}$/i.test(hash)))),...(commit.priorEntries?{priorEntries:validEntries(commit.priorEntries)}:{})}:null;
   settings.retiredPaths=stored?.retiredPaths&&typeof stored.retiredPaths==="object"&&!Array.isArray(stored.retiredPaths)
     ?Object.fromEntries(Object.entries(stored.retiredPaths).filter(([path,value])=>Boolean(path)&&Boolean(value)&&typeof value==="object"&&typeof value.hash==="string"&&/^[a-f0-9]{64}$/i.test(value.hash)&&typeof value.snapshotId==="string"&&Boolean(value.snapshotId)&&typeof value.retiredAt==="number"&&Number.isFinite(value.retiredAt)&&value.retiredAt>0)):{};
   settings.folderCreateTimes=stored?.folderCreateTimes&&typeof stored.folderCreateTimes==="object"&&!Array.isArray(stored.folderCreateTimes)

@@ -2,7 +2,7 @@ import { webcrypto } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { DataAdapter } from "obsidian";
 import type { Snapshot } from "@gib-sync/protocol";
-import { cooperativeYield, FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
+import { commitFingerprint, cooperativeYield, FileChangedDuringReadError, LOW_MEMORY_DOWNLOAD_BYTES, SyncEngine } from "./engine";
 import { ApiError,ApiTransportError } from "./api";
 import { recoverSync } from "./sync-recovery";
 import type { GibSyncApi } from "./api";
@@ -50,10 +50,118 @@ class MemoryApi {
 
 function settings(): GibSyncSettings {
   const key = new Uint8Array(32); key.fill(7);
-  return {...DEFAULT_SETTINGS,serverUrl:"https://sync.test",vaultId:"vault",vaultName:"Test",vaultKey:toBase64Url(key),deviceId:"device",deviceName:"Desktop",deviceToken:"token"};
+  return {...structuredClone(DEFAULT_SETTINGS),serverUrl:"https://sync.test",vaultId:"vault",vaultName:"Test",vaultKey:toBase64Url(key),deviceId:"device",deviceName:"Desktop",deviceToken:"token"};
 }
 
 describe("SyncEngine", () => {
+  it("recovers an established device's lost commit response and unjournaled newer edits after restart",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(prefix:string)=>new TextEncoder().encode(Array.from({length:32},(_,i)=>`${prefix}${i}`).join(" ")+"\n");
+    adapter.files.set("note.md",encode("base"));let persisted=structuredClone(config);
+    const save=async()=>{persisted=structuredClone(config);};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,save,()=>{});
+    await engine.sync();const baseId=config.lastSnapshotId;
+    adapter.files.set("note.md",encode("first"));config.pendingPaths=["note.md"];config.fullScanRequired=true;
+    const commit=api.commit.bind(api);api.commit=async body=>{await commit(body);throw new ApiTransportError(new Error("Accepted response was lost"));};
+    await expect(engine.sync()).rejects.toBeInstanceOf(ApiTransportError);
+    expect(persisted.lastSnapshotId).toBe(baseId);expect(persisted.pendingCommit?.parentId).toBe(baseId);
+    const restarted=structuredClone(persisted);restarted.pendingPaths=[];restarted.pendingPathTimes={};restarted.fullScanRequired=false;
+    adapter.files.set("note.md",encode("latest"));api.commit=commit;
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>restarted,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(api.commits).toBe(3);expect(api.head!.entries).toHaveLength(1);
+    expect(adapter.files.get("note.md")).toEqual(encode("latest"));expect(restarted.pendingCommit).toBeNull();expect(restarted.lastSnapshotId).toBe(api.head!.id);
+  });
+  it("does not send a commit before its durable receipt can be saved",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("draft"));
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{if(config.pendingCommit)throw new Error("Storage unavailable");},()=>{});
+    await expect(engine.sync()).rejects.toThrow("Storage unavailable");expect(api.commits).toBe(0);expect(adapter.writeCalls).toEqual([]);
+  });
+  it("recovers after accepting an upload when the following settings save fails",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("accepted\n"));let persisted=structuredClone(config),fail=true;
+    const save=async()=>{if(fail&&config.pendingApplySnapshotId)throw new Error("Interrupted journal save");persisted=structuredClone(config);};
+    await expect(new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,save,()=>{}).sync()).rejects.toThrow("Interrupted journal save");
+    expect(api.commits).toBe(1);expect(persisted.lastSnapshotId).toBeNull();expect(persisted.pendingCommit).not.toBeNull();fail=false;
+    const restarted=structuredClone(persisted);const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>restarted,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(api.commits).toBe(1);expect(restarted.lastSnapshotId).toBe(api.head!.id);expect(restarted.pendingCommit).toBeNull();
+  });
+  it("blocks unresolved receipt history without touching files or discarding its journal",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("local\n"));
+    config.pendingCommit={parentId:"missing-parent",fingerprint:"a".repeat(64),priorHashes:{}};
+    api.head={id:"new-head",vaultId:"vault",parentId:"missing-ancestor",deviceId:"other",deviceName:"Other",createdAt:new Date().toISOString(),message:"Sync",entries:[]};
+    await expect(new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync()).rejects.toThrow("history could not be verified");expect(api.commits).toBe(0);expect(adapter.writeCalls).toEqual([]);expect(config.pendingCommit).not.toBeNull();
+  });
+  it("verifies an exact interrupted receipt through another device's later snapshot",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(s:string)=>new TextEncoder().encode(s);
+    adapter.files.set("note.md",encode("base\n"));const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});await engine.sync();
+    adapter.files.set("note.md",encode("accepted local\n"));config.fullScanRequired=true;
+    const commit=api.commit.bind(api);api.commit=async body=>{await commit(body);throw new ApiTransportError(new Error("Lost reply"));};await expect(engine.sync()).rejects.toBeInstanceOf(ApiTransportError);
+    const accepted=api.head!,remoteBytes=encode("other device note\n"),hash=await hashBytes(remoteBytes);api.blobs.set(hash,await encryptBlob(remoteBytes,config.vaultKey,hash));
+    api.head={...accepted,id:"00000000-0000-4000-8000-000000000999",parentId:accepted.id,deviceId:"other",deviceName:"Other",entries:[...accepted.entries,{path:"other.md",hash,size:remoteBytes.length,mtime:1}]};api.snapshots.set(api.head.id,api.head);api.commit=commit;
+    const result=await engine.sync();expect(result.conflicts).toBe(0);expect(api.commits).toBe(2);expect(adapter.files.get("other.md")).toEqual(remoteBytes);expect(config.pendingCommit).toBeNull();
+  });
+  it("does not mistake identical content from a different registered device for its receipt",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),clear=new TextEncoder().encode("same content\n"),hash=await hashBytes(clear);
+    const head:Snapshot={id:"00000000-0000-4000-8000-000000000989",vaultId:"vault",parentId:null,deviceId:"another-device",deviceName:config.deviceName,createdAt:new Date().toISOString(),message:"Sync",entries:[{path:"note.md",hash,size:clear.length,mtime:1}]};
+    api.head=head;api.snapshots.set(head.id,head);api.blobs.set(hash,await encryptBlob(clear,config.vaultKey,hash));adapter.files.set("note.md",clear);
+    config.pendingCommit={parentId:null,fingerprint:await commitFingerprint(head.entries,[]),priorHashes:{}};
+    const progress:string[]=[];await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},p=>progress.push(p.message)).sync();
+    expect(progress.some(message=>message.includes("Verified this device's accepted upload"))).toBe(false);expect(api.commits).toBe(0);
+  });
+  it("canonicalizes implicit folders and ignores metadata times when verifying receipts",async()=>{
+    const entries=[{path:"Folder/note.md",hash:"a".repeat(64),size:12,mtime:1}];
+    expect(await commitFingerprint(entries,["Folder","Empty"])).toBe(await commitFingerprint([{...entries[0],mtime:999}],["Empty"]));
+    expect(await commitFingerprint(entries,["Empty"])).not.toBe(await commitFingerprint(entries,[]));
+  });
+  it("keeps an edit made during an incoming download and resumes without overwriting it",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(s:string)=>new TextEncoder().encode(s),before=encode("base\n"),remote=encode("remote\n"),latest=encode("typed during download\n");
+    adapter.files.set("note.md",before);const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});await engine.sync();const base=api.head!,hash=await hashBytes(remote);
+    api.head={...base,id:"00000000-0000-4000-8000-000000000988",parentId:base.id,deviceId:"other",entries:[{path:"note.md",hash,size:remote.length,mtime:2}]};api.snapshots.set(api.head.id,api.head);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
+    const get=api.getBlob.bind(api);let edited=false;api.getBlob=async h=>{const blob=await get(h);if(h===hash&&!edited){edited=true;adapter.files.set("note.md",latest);}return blob;};
+    config.fullScanRequired=true;await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);
+    expect(adapter.files.get("note.md")).toEqual(latest);expect(config.pendingApplySnapshotId).toBe(api.head!.id);
+    const result=await engine.sync();expect(result.conflicts).toBe(0);expect(adapter.files.get("note.md")).toEqual(latest);expect(config.pendingApplyPaths).toEqual([]);
+  });
+  it("defers a download after an editor event even before the edited buffer reaches disk",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),before=new TextEncoder().encode("base\n"),remote=new TextEncoder().encode("remote\n");
+    adapter.files.set("note.md",before);let unchanged=true;const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{},undefined,undefined,undefined,false,()=>unchanged);await engine.sync();const base=api.head!,hash=await hashBytes(remote);
+    api.head={...base,id:"00000000-0000-4000-8000-000000000984",parentId:base.id,deviceId:"other",entries:[{path:"note.md",hash,size:remote.length,mtime:2}]};api.snapshots.set(api.head.id,api.head);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
+    const get=api.getBlob.bind(api);api.getBlob=async h=>{unchanged=false;return get(h);};config.fullScanRequired=true;
+    await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);expect(adapter.files.get("note.md")).toEqual(before);expect(adapter.writeCalls).toEqual([]);
+  });
+  it("does not erase events observed while the commit is in flight",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("first\n"));
+    const commit=api.commit.bind(api);api.commit=async body=>{const snapshot=await commit(body);config.pendingPaths=["new.md"];config.pendingPathTimes={"new.md":12345};adapter.files.set("new.md",new TextEncoder().encode("new event\n"));return snapshot;};
+    await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();
+    expect(config.pendingPaths).toContain("new.md");expect(config.pendingPathTimes["new.md"]).toBe(12345);expect(adapter.files.has("new.md")).toBe(true);
+  });
+  it("merges non-overlapping edits made during a download instead of losing the incoming addition",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(s:string)=>new TextEncoder().encode(s),before=encode("First: base\nSecond: base\n"),remote=encode("First: base\nSecond: remote\n"),local=encode("First: local\nSecond: base\n");
+    adapter.files.set("note.md",before);const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});await engine.sync();const base=api.head!,hash=await hashBytes(remote);
+    api.head={...base,id:"00000000-0000-4000-8000-000000000987",parentId:base.id,deviceId:"other",entries:[{path:"note.md",hash,size:remote.length,mtime:2}]};api.snapshots.set(api.head.id,api.head);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));
+    const get=api.getBlob.bind(api);let edited=false;api.getBlob=async h=>{const blob=await get(h);if(h===hash&&!edited){edited=true;adapter.files.set("note.md",local);}return blob;};
+    config.fullScanRequired=true;await expect(engine.sync()).rejects.toBeInstanceOf(FileChangedDuringReadError);
+    const result=await engine.sync();expect(result.conflicts).toBe(0);expect(new TextDecoder().decode(adapter.files.get("note.md"))).toBe("First: local\nSecond: remote\n");expect(config.localReconcileBases).toEqual({});
+  });
+  it("replays an outgoing merged upload against the editor's prior file after suspension",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(s:string)=>new TextEncoder().encode(s),before=encode("First: base\nSecond: base\n"),remote=encode("First: base\nSecond: remote\n"),local=encode("First: local\nSecond: base\n"),later=encode("First: latest\nSecond: base\n");
+    adapter.files.set("note.md",before);let persisted=structuredClone(config);const save=async()=>{persisted=structuredClone(config);};const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,save,()=>{});await engine.sync();const base=api.head!,hash=await hashBytes(remote);
+    api.head={...base,id:"00000000-0000-4000-8000-000000000986",parentId:base.id,deviceId:"other",entries:[{path:"note.md",hash,size:remote.length,mtime:2}]};api.snapshots.set(api.head.id,api.head);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));adapter.files.set("note.md",local);config.pendingPaths=["note.md"];config.fullScanRequired=true;
+    const commit=api.commit.bind(api);api.commit=async body=>{await commit(body);throw new ApiTransportError(new Error("Suspended after accept"));};await expect(engine.sync()).rejects.toBeInstanceOf(ApiTransportError);
+    expect(api.blobs.has(await hashBytes(local))).toBe(true);adapter.files.set("note.md",later);api.commit=commit;
+    const restarted=structuredClone(persisted),result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>restarted,async()=>{},()=>{}).sync();
+    expect(result.conflicts).toBe(0);expect(new TextDecoder().decode(adapter.files.get("note.md"))).toBe("First: latest\nSecond: remote\n");expect(restarted.pendingCommit).toBeNull();expect(restarted.localReconcileBases).toEqual({});
+  });
+  it("preserves two independently created same-path notes during interrupted onboarding",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),remote=new TextEncoder().encode("Remote independent draft\n"),local=new TextEncoder().encode("Local independent draft\n"),hash=await hashBytes(remote);
+    const target:Snapshot={id:"00000000-0000-4000-8000-000000000985",vaultId:"vault",parentId:null,deviceId:"other",deviceName:"Other",createdAt:new Date().toISOString(),message:"Created",entries:[{path:"note.md",hash,size:remote.length,mtime:1}]};
+    api.head=target;api.snapshots.set(target.id,target);api.blobs.set(hash,await encryptBlob(remote,config.vaultKey,hash));adapter.files.set("note.md",local);config.pendingApplySnapshotId=target.id;config.pendingApplyPaths=["note.md"];config.pendingApplyPriorHashes={"note.md":null};
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(1);expect(api.head!.entries).toHaveLength(2);expect([...adapter.files.values()].map(b=>new TextDecoder().decode(b)).join("\n")).toContain("Remote independent draft");
+  });
+  it("replays an accepted deletion against its actual prior hash rather than an older checkpoint",async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),oldBytes=new TextEncoder().encode("old checkpoint\n"),priorBytes=new TextEncoder().encode("last physical file\n"),oldHash=await hashBytes(oldBytes),priorHash=await hashBytes(priorBytes);
+    const base:Snapshot={id:"00000000-0000-4000-8000-000000000982",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Test",createdAt:new Date().toISOString(),message:"Base",entries:[{path:"note.md",hash:oldHash,size:oldBytes.length,mtime:1}]},target:Snapshot={...base,id:"00000000-0000-4000-8000-000000000983",parentId:base.id,entries:[]};
+    api.head=target;api.snapshots.set(base.id,base);api.snapshots.set(target.id,target);config.initialized=true;config.lastSnapshotId=base.id;config.pendingApplySnapshotId=target.id;config.pendingApplyBaseSnapshotId=base.id;config.pendingApplyPaths=["note.md"];config.pendingApplyPriorHashes={"note.md":priorHash};config.pendingApplyPriorEntries={"note.md":{path:"note.md",hash:priorHash,size:priorBytes.length,mtime:1}};adapter.files.set("note.md",priorBytes);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(0);expect(adapter.files.has("note.md")).toBe(false);expect(api.commits).toBe(0);expect(config.lastSnapshotId).toBe(target.id);
+  });
   it("propagates a temporary baseline fetch failure before file mutations",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();adapter.files.set("note.md",new TextEncoder().encode("unchanged\n"));
     const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});
@@ -560,13 +668,13 @@ describe("SyncEngine", () => {
     for(const snapshot of [base,own,other])api.snapshots.set(snapshot.id,snapshot);for(const [hash,bytes] of [[baseHash,baseBytes],[remoteHash,remoteBytes]] as const)api.blobs.set(hash,await encryptBlob(bytes,config.vaultKey,hash));api.head=other;config.lastSnapshotId=base.id;adapter.files.set("note.md",localBytes);
     const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(1);expect(api.head?.entries).toHaveLength(2);expect(api.head?.entries.some((entry)=>entry.path.includes("conflict"))).toBe(true);
   });
-  it("does not self-rebase a full scan containing unjournaled differences",async()=>{
+  it("recovers an observed note independently while keeping conflict protection for unjournaled differences",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings();config.initialized=true;config.fullScanRequired=true;config.pendingPaths=["observed.md"];
     const text=(prefix:string)=>new TextEncoder().encode(Array.from({length:24},(_,index)=>`${prefix}${index}`).join(" ")+"\n"),baseBytes=text("base"),remoteBytes=text("remote"),localBytes=text("local");
     const baseHash=await hashBytes(baseBytes),remoteHash=await hashBytes(remoteBytes),base:Snapshot={id:"00000000-0000-4000-8000-000000000370",vaultId:"vault",parentId:null,deviceId:"device",deviceName:"Desktop",createdAt:new Date().toISOString(),message:"Base",entries:["observed.md","unjournaled.md"].map((path)=>({path,hash:baseHash,size:baseBytes.length,mtime:1}))};
     const ownHead:Snapshot={...base,id:"00000000-0000-4000-8000-000000000371",parentId:base.id,entries:["observed.md","unjournaled.md"].map((path)=>({path,hash:remoteHash,size:remoteBytes.length,mtime:2}))};
     api.snapshots.set(base.id,base);api.snapshots.set(ownHead.id,ownHead);api.head=ownHead;api.blobs.set(baseHash,await encryptBlob(baseBytes,config.vaultKey,baseHash));api.blobs.set(remoteHash,await encryptBlob(remoteBytes,config.vaultKey,remoteHash));config.lastSnapshotId=base.id;adapter.files.set("observed.md",localBytes);adapter.files.set("unjournaled.md",localBytes);
-    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(2);expect(api.head?.entries.filter((entry)=>entry.path.includes("conflict"))).toHaveLength(2);
+    const result=await new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{}).sync();expect(result.conflicts).toBe(1);expect(api.head?.entries.filter((entry)=>entry.path.includes("conflict"))).toHaveLength(1);expect(adapter.files.get("observed.md")).toEqual(localBytes);
   });
   it("converges simultaneous disjoint edits from two devices",async()=>{
     const adapter=new MemoryAdapter();const api=new MemoryApi();const config=settings();config.initialized=true;

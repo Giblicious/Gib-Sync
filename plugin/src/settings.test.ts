@@ -96,6 +96,12 @@ describe("file-change sync filtering",()=>{
 });
 
 describe("settings persistence",()=>{
+  it("loads valid interrupted commit receipts without inventing one for older clients",async()=>{
+    const intent={parentId:null,fingerprint:"a".repeat(64),priorHashes:{"note.md":"b".repeat(64),"new.md":null,"invalid":"oops"}};
+    await expect(loadSettings({loadData:async()=>({pendingCommit:intent})} as unknown as Plugin)).resolves.toMatchObject({pendingCommit:{...intent,priorHashes:{"note.md":"b".repeat(64),"new.md":null}}});
+    await expect(loadSettings({loadData:async()=>({})} as unknown as Plugin)).resolves.toMatchObject({pendingCommit:null});
+    await expect(loadSettings({loadData:async()=>({pendingCommit:{...intent,fingerprint:"invalid"}})} as unknown as Plugin)).resolves.toMatchObject({pendingCommit:null});
+  });
   it("serializes mobile writes so an older checkpoint cannot finish last",async()=>{
     let state={lastSnapshotId:"old"},releaseFirst!:()=>void,markStarted!:()=>void;const writes:string[]=[];
     const firstGate=new Promise<void>((resolve)=>{releaseFirst=resolve;}),firstStarted=new Promise<void>((resolve)=>{markStarted=resolve;});let calls=0;

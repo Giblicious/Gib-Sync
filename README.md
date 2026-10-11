@@ -13,6 +13,12 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Server-enforced mass-change safeguards for both Obsidian devices and direct Seafile/WebDAV edits.
 - Optional Obsidian bookmark synchronization, enabled by default without requiring full `.obsidian` configuration sync.
 
+## Interrupted-sync recovery
+
+Before requesting a commit, the plugin saves a write-ahead receipt containing the proposed content fingerprint, its parent snapshot, and the actual pre-application file hashes. After a lost response or app suspension, it verifies that exact proposal against authenticated snapshot ancestry before advancing the local checkpoint. Device display names alone never establish ownership. Recovery only scans the local vault again after an interrupted operation; normal unchanged checks remain lightweight.
+
+An unrelated unrecorded file change no longer disables same-device recovery for a separately observed note. Incoming writes and deletions recheck the local file and editor-event revision before application. Edits made during a download are replayed against the editor's actual prior content, allowing non-overlapping incoming and local changes to merge. When a merged upload requires it, that prior content is saved as an encrypted recovery blob, not an extra readable note. Genuine independent-device conflicts and uncertain legacy baselines still preserve both versions. These changes do not remove existing conflict copies automatically.
+
 ## Safety center
 
 Gib Sync evaluates every proposed snapshot before it becomes the shared vault head. Suspicious changes are held in quarantine without modifying the accepted snapshot or the readable recovery tree. Connected devices are notified immediately and can inspect every affected path before choosing **Approve once**, device-scoped maintenance for a non-external batch, or **Reject and restore accepted snapshot**. Seafile deletion batches always require one-time approval; neither prior approval nor a maintenance window can approve a later destructive batch.

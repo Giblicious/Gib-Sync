@@ -35,6 +35,7 @@ export default class GibSyncPlugin extends Plugin {
   private mobileLayoutReady=!Platform.isMobile;
   private readonly pathVersions=new Map<string,number>();
   private pathRevision=0;
+  private syncApplicationRevisions:Map<string,number>|null=null;
   private journalSaveTimer:number|null=null;
   private readonly expectedLocalMutations=new Map<string,string|null>();
   private readonly expectedVerificationQueue=new Map<string,string|null>();
@@ -50,7 +51,7 @@ export default class GibSyncPlugin extends Plugin {
     this.api = new GibSyncApi(() => this.settings);
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => {if(progress.remoteChanged||["applying","uploading","committing","mirroring"].includes(progress.phase))this.liveStatus.verified=false;this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total);},undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash),undefined,Platform.isMobile);
+    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => {if(progress.remoteChanged||["applying","uploading","committing","mirroring"].includes(progress.phase))this.liveStatus.verified=false;this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total);},undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash),undefined,Platform.isMobile,(path)=>!this.syncApplicationRevisions||this.syncApplicationRevisions.get(normalizePath(path))===this.pathVersions.get(normalizePath(path)));
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync() });
@@ -293,7 +294,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   async acceptSetup(setup: SetupResponse, deviceName: string) {
     assertSetupServerCompatible(setup);
-    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null });
+    Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},pendingCommit:null,pendingApplyPriorEntries:{},localReconcileBases:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
@@ -381,6 +382,7 @@ export default class GibSyncPlugin extends Plugin {
         if(!await this.checkCompatibility(false,true))throw new SyncCancelledError("Update required");
         if(await this.checkObsidianSyncProtection(true))throw new SyncCancelledError("Obsidian Sync is active");
         this.liveStatus.nextSyncAt=null;
+        this.syncApplicationRevisions=new Map(this.pathVersions);
         const result=await this.engine.sync();
         if((await this.api.headState()).headId!==result.snapshotId)throw new ApiError("The server changed before final verification",409,null);
         return result;
@@ -431,6 +433,7 @@ export default class GibSyncPlugin extends Plugin {
         else{this.report("error",`Sync couldn’t finish: ${message}`,"error");this.notify("sync-error",`Gib Sync couldn’t finish: ${message}`,8000,60_000);}
       }
     } finally {
+      this.syncApplicationRevisions=null;
       this.scheduleExpectedVerification();
       if(this.stopped||this.settings.paused||this.safetyHold||this.compatibilityBlocked||this.nativeSyncBlocked){this.liveStatus.nextSyncAt=null;this.emitStatus();}
       else if(changedDuringRead){this.fileChangePending=false;this.queueSync(2000,"File changed during sync; retrying");}

@@ -56,10 +56,10 @@ describe("Gib Sync API", () => {
   it("blocks incompatible clients while preserving update guidance and status access",async()=>{
     const {config,store,storage}=fixture();config.GIBSYNC_MIN_CLIENT_VERSION="0.8.19";config.GIBSYNC_RECOMMENDED_CLIENT_VERSION="0.8.20";const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Old desktop")})).json(),legacy={authorization:`Bearer ${setup.deviceToken}`},current={...legacy,"x-gib-sync-client-version":"0.8.19","x-gib-sync-protocol":"7"};
-    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.59",protocolVersion:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","folder-retirement-directive-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1","vault-retirement-v1"])});
+    expect((await app.inject({method:"GET",url:"/healthz"})).json()).toMatchObject({serverVersion:"0.8.60",protocolVersion:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","folder-retirement-directive-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1","vault-retirement-v1"])});
     const blocked=await app.inject({method:"GET",url:"/v1/head",headers:legacy});expect(blocked.statusCode).toBe(426);expect(blocked.json().message).toContain("Update Gib Sync through BRAT");
     const visible=await app.inject({method:"GET",url:"/v1/status",headers:legacy});expect(visible.statusCode).toBe(200);expect(visible.json().compatibility).toMatchObject({compatible:false,minimumVersion:"0.8.19"});
-    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.59",serverProtocol:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","folder-retirement-directive-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1","vault-retirement-v1"])});
+    expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:current})).json()).toMatchObject({compatible:true,updateAvailable:true,serverVersion:"0.8.60",serverProtocol:7,serverCapabilities:expect.arrayContaining(["readable-generation-v1","external-delete-proof-v1","folder-manifest-v1","folder-manifest-migration-v2","folder-provenance-repair-v1","folder-retirement-directive-v1","snapshot-integrity-v1","atomic-head-commit-v1","server-containment-v1","vault-retirement-v1"])});
     expect((await app.inject({method:"GET",url:"/v1/head",headers:current})).statusCode).toBe(200);
     const status=(await app.inject({method:"GET",url:"/v1/status",headers:current})).json();expect(status.devices.find((device:any)=>device.current)).toMatchObject({clientVersion:"0.8.19",clientProtocol:7,compatibility:"update-available"});await app.close();
   });
@@ -244,8 +244,20 @@ describe("Gib Sync API", () => {
     const legacyDerived=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(legacyDerived.folders).toBeUndefined();
     const trusted=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:legacyDerived.id,message:"Trusted folder baseline",entries:legacyDerived.entries,folders:["Trusted empty"]}})).json();
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:trusted.id}})).statusCode).toBe(200);expect(storage.dirs.has(`read:${setup.vaultId}:Stale legacy shell`)).toBe(false);expect(storage.dirs.has(`read:${setup.vaultId}:Trusted empty`)).toBe(true);
-    storage.dirs.add(`read:${setup.vaultId}:Remote empty`);let folderImport:any;for(let attempt=0;attempt<10;attempt++){folderImport=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();if(folderImport.snapshotId)break;await new Promise((resolve)=>setTimeout(resolve,100));}expect(folderImport).toMatchObject({snapshotId:expect.any(String),changedFolders:1});
-    expect((await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head.folders).toEqual(["Remote empty","Trusted empty"]);await app.close();
+    storage.dirs.add(`read:${setup.vaultId}:Remote empty`);
+    try{
+      // The background scanner may accept the change before the explicit scan
+      // returns. Verify the committed result, not which request won the race.
+      let importedHead:any;
+      for(let attempt=0;attempt<10;attempt++){
+        await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});
+        importedHead=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;
+        if(importedHead.folders?.includes("Remote empty"))break;
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      expect(importedHead).toMatchObject({parentId:trusted.id,deviceId:`seafile:${setup.vaultId}`,folders:["Remote empty","Trusted empty"]});
+      expect(importedHead.message).toContain("1 folders");
+    }finally{await app.close();}
   });
   it("three-way merges simultaneous Obsidian and Seafile text edits",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);

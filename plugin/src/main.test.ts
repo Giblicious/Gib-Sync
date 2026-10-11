@@ -23,6 +23,11 @@ beforeEach(()=>{vi.useFakeTimers();vi.stubGlobal("window",globalThis);vi.mocked(
 afterEach(()=>{vi.useRealTimers();vi.unstubAllGlobals();vi.restoreAllMocks();});
 
 describe("plugin synchronization lifecycle",()=>{
+  it("retains a newer observed path revision and timestamp after a full sync",async()=>{
+    const {plugin,sync}=fixture();(plugin as any).pathVersions.set("note.md",1);(plugin as any).pathRevision=1;plugin.settings.pendingPaths=["note.md"];plugin.settings.pendingPathTimes={"note.md":100};
+    sync.mockImplementation(async()=>{plugin.scheduleFileChangeSync("note.md");return {...result,processedPaths:["note.md"],fullScan:true};});
+    await expect(plugin.runSync()).resolves.toBe(true);expect(plugin.settings.pendingPaths).toEqual(["note.md"]);expect(plugin.settings.pendingPathTimes["note.md"]).toBeGreaterThan(100);expect(plugin.liveStatus.verified).toBe(false);
+  });
   it("joins overlapping requests before async preflight finishes",async()=>{
     const {plugin,sync}=fixture();let ready!:()=>void;
     (plugin as any).checkCompatibility=vi.fn(()=>new Promise<boolean>(resolve=>{ready=()=>resolve(true);}));
