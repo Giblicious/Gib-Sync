@@ -1,5 +1,21 @@
 import type { LiveSyncStatus } from "./settings";
 import type { IndicatorState } from "./status";
+import type { ServerStatus } from "@gib-sync/protocol";
+
+export interface SyncFact { label:string;value:string;detail:string;tone:"neutral"|"success"|"active"|"warning"; }
+
+/** Accepted history, readable storage and device acknowledgements are separate facts. */
+export function buildSyncFacts(live:LiveSyncStatus,server:ServerStatus|null,localSnapshotId:string|null):SyncFact[]{
+  const pending=live.pendingChanges??0,headId=server?.head?.id??null,current=Boolean(headId&&headId===localSnapshotId&&live.verified&&!pending);
+  const other=server?.devices.filter((device)=>!device.current&&!device.revokedAt)??[];
+  const caughtUp=headId?other.filter((device)=>device.acknowledgedSnapshotId===headId).length:0;
+  return [
+    {label:"This device",value:pending?`${pending} change${pending===1?"":"s"} waiting`:current?"Up to date":live.verified?"Last check passed":"Checking",detail:pending?"Local changes have not finished syncing yet.":current?"This device confirmed the latest accepted server version.":"A successful sync verifies what this device has received.",tone:pending?"active":current?"success":"neutral"},
+    {label:"Accepted server copy",value:pending?"Waiting for this device":headId?headId===localSnapshotId?"Received":"Updates available":"Not verified",detail:"Accepted versions are stored in server history before other devices download them.",tone:pending||headId&&headId!==localSnapshotId?"active":headId?"success":"neutral"},
+    {label:"Other devices",value:!server?"Checking":!other.length?"No other active devices":!headId?"Not verified":caughtUp===other.length?`${caughtUp} caught up`:`${caughtUp} of ${other.length} confirmed`,detail:!other.length?"Add another device with manual setup or a temporary code.":"A device is confirmed only after it acknowledges this accepted version; offline devices catch up when opened.",tone:caughtUp===other.length&&other.length>0?"success":"neutral"},
+    {label:"Readable Seafile copy",value:!server?"Checking":server.externalError||server.projection?.lastError?"Retrying safely":server.mirrorCurrent?"Current":"Catching up",detail:"This readable copy is separate from accepted sync history. Other devices can sync while Seafile catches up.",tone:server?.externalError||server?.projection?.lastError?"warning":server?.mirrorCurrent?"success":server?"active":"neutral"}
+  ];
+}
 
 export type QuickStatusAction="setup"|"resolve"|"review"|"resume"|"settings"|"sync";
 

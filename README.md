@@ -15,6 +15,12 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## Interrupted-sync recovery
 
+Version 0.8.61 adds staged local application, durable server projection jobs,
+recorded move identity, explicit device acknowledgments, and verified automatic
+database backups. Existing accounts, settings, vault keys, and immutable history
+migrate automatically. See [architecture and migration](docs/architecture-and-migration.md)
+for the safety invariants, rollout procedure, and mobile/backend limitations.
+
 Before requesting a commit, the plugin saves a write-ahead receipt containing the proposed content fingerprint, its parent snapshot, and the actual pre-application file hashes. After a lost response or app suspension, it verifies that exact proposal against authenticated snapshot ancestry before advancing the local checkpoint. Device display names alone never establish ownership. Recovery only scans the local vault again after an interrupted operation; normal unchanged checks remain lightweight.
 
 An unrelated unrecorded file change no longer disables same-device recovery for a separately observed note. Incoming writes and deletions recheck the local file and editor-event revision before application. Edits made during a download are replayed against the editor's actual prior content, allowing non-overlapping incoming and local changes to merge. When a merged upload requires it, that prior content is saved as an encrypted recovery blob, not an extra readable note. Genuine independent-device conflicts and uncertain legacy baselines still preserve both versions. These changes do not remove existing conflict copies automatically.
@@ -46,6 +52,7 @@ Selected Seafile library and folder
 └── .gib-sync/
     ├── blobs/                  # encrypted synchronization history
     ├── snapshots/              # immutable manifests
+    ├── mutation-fences/        # durable projection visibility proofs
     └── readable-generation.gib # signed completed-mirror marker
 ```
 
@@ -61,7 +68,7 @@ Simultaneous edits use a lossless three-way policy:
 - Automatic three-way merging is bounded for mobile stability. Oversized, unusually complex, or failed text comparisons preserve both complete versions with linked warnings instead of stopping synchronization.
 - If a mobile settings write finishes out of order and its saved checkpoint temporarily lags, Gib Sync recognizes an uninterrupted chain of that same device's own snapshots and rebases only explicitly journaled local changes. Cross-device ancestry or unjournaled full-scan differences still use the normal lossless conflict policy.
 
-When a newly paired device already contains a vault, Gib Sync compares content hashes before writing anything. If at least 90% of the included files match the server exactly, it treats the vaults as copies: it downloads and verifies the current server head, keeps files unique to either side, and preserves both versions of every differing same-path file before publishing the union. Lower-overlap vaults remain blocked as likely mismatches.
+When a newly paired device already contains a vault, the default onboarding choice compares content hashes before writing anything. If at least 90% of the included files match the server exactly, it treats the vaults as copies: it downloads and verifies the current server head, keeps files unique to either side, and preserves both versions of every differing same-path file before publishing the union. Lower-overlap vaults remain blocked as likely mismatches. An explicit **Use the server copy** choice instead downloads the accepted vault while retaining displaced local originals in the device's recovery area; it does not publish those originals over the shared vault.
 
 The mirror is crash-recoverable: the server records each successfully written readable file and writes a signed completed-generation marker only after every expected path is visible and obsolete paths are gone. An interrupted operation resumes from the files that actually exist, even if the canonical vault advances again before completion. A missing readable file counts as a deletion only when it belonged to that committed generation and remains absent across repeated observations; partial-generation absence is never imported as deletion.
 
@@ -92,6 +99,14 @@ The live activity panel identifies each three-way merge path, version sizes, cho
 Gib Sync continuously checks whether the Obsidian Sync core plugin is enabled. If it is, Gib Sync stops its timers and incoming watch and refuses new sync runs until Obsidian Sync is disabled. This mutual-exclusion safeguard prevents two synchronization engines from concurrently changing the same vault. `.obsidian/core-plugins.json` is always device-local so configuration sync cannot re-enable Obsidian Sync elsewhere.
 
 ## Deployment
+
+The server requires a patched Node.js SQLite runtime: SQLite 3.51.3 or later,
+or official backports 3.50.7 / 3.44.6. Earlier versions have a rare
+[WAL-reset corruption bug](https://www.sqlite.org/wal.html#the_wal_reset_bug).
+Docker images and release workflows check the actual embedded SQLite version.
+For a manual server install, run `node scripts/verify-server-runtime.mjs`
+before opening the live database; upgrade Node.js if this check fails.
+This server-only requirement does not change Obsidian or BRAT installation.
 
 1. Copy `.env.example` to `.env` and replace every secret.
 2. Set `PUBLIC_URL` to the TLS endpoint proxying port `8787`.

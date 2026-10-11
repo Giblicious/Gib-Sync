@@ -1,5 +1,8 @@
 .gib-sync-quick-code { margin: 1.25rem 0; padding: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px; background: var(--background-secondary); color: var(--text-normal); font-family: var(--font-monospace); font-size: clamp(1.8rem, 10vw, 3rem); font-weight: 700; letter-spacing: .12em; line-height: 1.2; text-align: center; user-select: all; }
 .gib-sync-history { max-height: 60vh; overflow: auto; }
+.gib-sync-recovery-row { padding: .65rem 0; border-bottom: 1px solid var(--background-modifier-border); overflow-wrap: anywhere; }
+.gib-sync-recovery-row > summary { min-height: 44px; cursor: pointer; }
+.gib-sync-recovery-preview pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; font-size: var(--font-ui-small); }
 .gib-sync-history-row { display: grid; grid-template-columns: 1fr auto; gap: .75rem; padding: .75rem 0; border-bottom: 1px solid var(--background-modifier-border); }
 .gib-sync-muted { color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .gib-sync-danger { color: var(--text-error); }
@@ -20,7 +23,9 @@
 .gib-sync-status-grid > div { min-width: 0; min-height: 88px; padding: .75rem 1rem; background: var(--background-secondary); }
 .gib-sync-status-grid span { display: block; color: var(--text-muted); font-size: var(--font-ui-smaller); margin-bottom: .2rem; }
 .gib-sync-status-grid strong { display: -webkit-box; height: 3.6em; overflow: hidden; overflow-wrap: anywhere; font-size: var(--font-ui-small); line-height: 1.2; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
-.gib-sync-status-summary { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.gib-sync-status-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.gib-sync-version-line { padding: .6rem 1rem; }
+.gib-sync-status-summary strong { height: auto; min-height: 1.2em; -webkit-line-clamp: 2; }
 .gib-sync-status-summary > div { min-height: 74px; }
 .gib-sync-status-grid > div.is-warning strong { color: var(--color-orange); }
 .gib-sync-status-grid > div.is-error strong { color: var(--text-error); }
@@ -76,7 +81,10 @@
 .gib-sync-status-short-text { line-height: 1; }
 .gib-sync-indicator:not(.gib-sync-mobile-sidebar-indicator) { position: relative; align-items: center; justify-content: center; cursor: pointer; }
 .gib-sync-mobile-sidebar-indicator.is-warning { color: var(--color-orange); }
-.gib-sync-mobile-top-indicator { display: inline-flex; appearance: none; flex: 0 0 30px; width: 30px; height: 30px; min-width: 0; min-height: 0; margin: 0; padding: 9px; border: 0; background: transparent; box-shadow: none; line-height: 1; vertical-align: middle; }
+.gib-sync-mobile-top-indicator { display: inline-flex; appearance: none; flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; min-height: 44px; margin: 0; padding: 15px; border: 0; background: transparent; box-shadow: none; line-height: 1; vertical-align: middle; }
+.gib-sync-ribbon-fallback { min-width: 44px; min-height: 44px; }
+.gib-sync-ribbon-fallback[data-gib-sync-state="synced"] { color: var(--color-green); }
+.gib-sync-ribbon-fallback[data-gib-sync-state="error"] { color: var(--color-red); }
 .gib-sync-indicator-dot { width: 10px; height: 10px; border: 2px solid var(--text-muted); border-radius: 50%; background: transparent; box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-muted) 12%, transparent); }
 .gib-sync-indicator.is-success .gib-sync-indicator-dot { border-color: var(--color-green); background: var(--color-green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-green) 15%, transparent); }
 .gib-sync-indicator.is-active .gib-sync-indicator-dot { border-color: var(--interactive-accent); background: var(--interactive-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--interactive-accent) 15%, transparent); }
@@ -105,7 +113,7 @@
 .gib-sync-status-overview-description { color: var(--text-normal); line-height: 1.35; overflow-wrap: anywhere; }
 .gib-sync-status-overview-meta { display: block; margin-top: .35rem; color: var(--text-muted); }
 .gib-sync-status-modal .gib-sync-progress { margin-top: .5rem; border-radius: 999px; }
-.gib-sync-status-overview-actions { display: flex; gap: .5rem; margin-top: .75rem; }
+.gib-sync-status-overview-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
 .gib-sync-status-overview-actions button { flex: 1 1 0; min-height: 36px; }
 
 /* Settings follow the compact navigation and console language used across Gib plugins. */
@@ -157,6 +165,10 @@ body.is-mobile .gib-sync-status-modal {
 }
 body.is-mobile .gib-sync-status-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
 body.is-mobile .gib-sync-status-overview-actions button { min-height: 44px; }
+body.is-mobile .gib-sync-modal-content button,
+body.is-mobile .gib-sync-settings button,
+body.is-mobile .gib-sync-settings-tabs button { min-height: 44px; }
+body.is-mobile .gib-sync-mobile-sidebar-indicator { min-width: 44px; min-height: 44px; }
 
 @media (max-width: 600px) {
   .gib-sync-status-modal {
@@ -198,7 +210,7 @@ body.is-mobile .gib-sync-status-overview-actions button { min-height: 44px; }
     white-space: normal;
   }
   .gib-sync-settings-tabs { gap: 2px; }
-  .gib-sync-settings-tabs button { min-height: 30px; padding: 0 7px; white-space: nowrap; }
+  .gib-sync-settings-tabs button { min-height: 44px; padding: 0 7px; white-space: nowrap; }
   .gib-sync-settings .gib-sync-status-summary { grid-template-columns: minmax(0,1fr); }
   .gib-sync-console-toolbar { flex-wrap: wrap; }
   .gib-sync-console-toolbar span { flex-basis: 100%; margin-left: 0; }

@@ -1,3 +1,5 @@
+import {sha256} from "@noble/hashes/sha2.js";
+import {bytesToHex} from "@noble/hashes/utils.js";
 const encoder = new TextEncoder();
 
 export function toBase64Url(bytes: Uint8Array): string {
@@ -20,6 +22,16 @@ export function normalizeQuickCode(value:string):string {
 }
 
 export async function hashBytes(bytes: Uint8Array): Promise<string> {
+  // WebCrypto is fast for small notes. Large inputs otherwise create a second
+  // full-size native buffer; incremental hashing avoids that copy and yields.
+  if(bytes.byteLength>1024*1024){
+    const hash=sha256.create();let yieldedAt=performance.now();
+    for(let offset=0;offset<bytes.byteLength;offset+=64*1024){
+      hash.update(bytes.subarray(offset,offset+64*1024));
+      if(performance.now()-yieldedAt>=8){await new Promise<void>(resolve=>setTimeout(resolve,0));yieldedAt=performance.now();}
+    }
+    return bytesToHex(hash.digest());
+  }
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }

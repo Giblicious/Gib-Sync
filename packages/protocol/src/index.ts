@@ -20,6 +20,18 @@ export interface ManifestEntry {
   hash: string;
   size: number;
   mtime: number;
+  /** Stable identity assigned by the server; optional for protocol-7 clients. */
+  fileId?: string;
+  /** Authorship of this file's content, not the most recent vault commit. */
+  revision?: FileRevision;
+}
+
+export interface FileRevision {
+  id: string;
+  parentId: string | null;
+  deviceId: string;
+  deviceName: string;
+  modifiedAt: number;
 }
 
 export interface FolderRepairDirective {
@@ -45,6 +57,14 @@ export interface Snapshot {
   folders?: string[];
   /** Server-authored cleanup guidance retained across descendant snapshots. */
   folderRepair?: FolderRepairDirective;
+}
+
+/** Authenticated metadata delta. Applying it never acknowledges a device. */
+export interface SnapshotDelta {
+  baseId:string;
+  snapshot:Omit<Snapshot,"entries">;
+  changed:ManifestEntry[];
+  removed:string[];
 }
 
 export interface SetupResponse {
@@ -127,6 +147,7 @@ export interface ServerStatus {
   healthAlerts: HealthAlert[];
   devices: DeviceInfo[];
   compatibility: ClientCompatibility;
+  projection?: {state:"idle"|"queued"|"running"|"retrying";attempts:number;lastError:string|null};
 }
 
 export interface ServerContainmentStatus {
@@ -142,6 +163,8 @@ export interface MirrorPlanRequest {
 }
 
 export interface MirrorPlanResponse {
+  /** New servers own durable projection; old servers retain client uploads. */
+  serverManaged?: boolean;
   uploadPaths: string[];
   deletePaths: string[];
   alreadyCurrent: boolean;
@@ -265,7 +288,12 @@ export interface DeviceInfo {
   clientVersion: string | null;
   clientProtocol: number | null;
   compatibility: "compatible"|"update-available"|"incompatible";
+  acknowledgedSnapshotId?: string | null;
+  acknowledgedAt?: string | null;
 }
+
+export { mergeJsonValues } from "./json-merge.js";
+export { mergeText, type MergeKind, type MergeResult } from "./text-merge.js";
 
 export interface HealthAlert {
   code: string;
@@ -287,14 +315,27 @@ const movedPrefix=(previousPath:string,path:string):{previous:string;next:string
 };
 
 /** Detects stable path moves, including edited files inside a folder move. */
-export function detectMoves(previous:ManifestEntry[],next:ManifestEntry[]):DetectedMove[]{
+export function detectMoves(previous:ManifestEntry[],next:ManifestEntry[],mode:"identity"|"assessment"="assessment"):DetectedMove[]{
   const before=new Map(previous.map((entry)=>[entry.path,entry])),after=new Map(next.map((entry)=>[entry.path,entry]));
   const removed=[...before.values()].filter((entry)=>!after.has(entry.path)),created=[...after.values()].filter((entry)=>!before.has(entry.path));
   const removedByHash=new Map<string,ManifestEntry[]>(),createdByHash=new Map<string,ManifestEntry[]>();
   for(const entry of removed){const group=removedByHash.get(entry.hash)??[];group.push(entry);removedByHash.set(entry.hash,group);}
   for(const entry of created){const group=createdByHash.get(entry.hash)??[];group.push(entry);createdByHash.set(entry.hash,group);}
   const result=new Map<string,string>(),usedCreated=new Set<string>();
-  for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1)continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
+  const identityBefore=new Map<string,ManifestEntry[]>(),identityAfter=new Map<string,ManifestEntry[]>();
+  for(const entry of previous)if(entry.fileId){const group=identityBefore.get(entry.fileId)??[];group.push(entry);identityBefore.set(entry.fileId,group);}
+  for(const entry of next)if(entry.fileId){const group=identityAfter.get(entry.fileId)??[];group.push(entry);identityAfter.set(entry.fileId,group);}
+  for(const source of removed){
+    if(!source.fileId||identityBefore.get(source.fileId)?.length!==1)continue;
+    const destinations=identityAfter.get(source.fileId)??[],destination=destinations[0];
+    if(destinations.length!==1||!destination||before.has(destination.path)||!created.some(item=>item.path===destination.path))continue;
+    result.set(source.path,destination.path);usedCreated.add(destination.path);
+  }
+  for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1||result.has(sources[0].path)||usedCreated.has(destinations[0].path))continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
+  // Structural resemblance is useful when assessing a deletion batch, but is
+  // not proof that two edited files share an ancestor. Merge planning must use
+  // identity mode so similarly named notes cannot inherit each other's base.
+  if(mode==="identity")return [...result].map(([previousPath,path])=>({previousPath,path})).sort((a,b)=>a.previousPath.localeCompare(b.previousPath));
 
   // Exact matches reveal a folder-prefix move. A batch whose bytes all changed
   // can still reveal the same relocation through unique filenames and similar

@@ -1,6 +1,6 @@
 {
   "name": "@gib-sync/protocol",
-  "version": "0.8.60",
+  "version": "0.8.61",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dependencies": { "diff": "^8.0.2" },
   "devDependencies": {
     "typescript": "^5.9.2"
   }

@@ -14,13 +14,20 @@ export function canonicalManifest(entries:ManifestEntry[],folders?:string[]):Can
     if(exact.has(entry.path))throw new Error(`Duplicate file path: ${entry.path}`);exact.add(entry.path);
     const key=identity(entry.path),other=portable.get(key);if(other&&other!==entry.path)throw new Error(`File paths differ only by case or Unicode normalization: ${other} and ${entry.path}`);portable.set(key,entry.path);
   }
-  for(const entry of ordered)for(const parent of ancestors(entry.path))if(exact.has(parent))throw new Error(`A file path is also used as a parent folder: ${parent}`);
+  const allFolders=new Map<string,string>();
+  const addFolder=(path:string)=>{
+    const key=identity(path),file=portable.get(key),other=allFolders.get(key);
+    if(file)throw new Error(`A file path is also used as a folder: ${file} and ${path}`);
+    if(other&&other!==path)throw new Error(`Folder paths differ only by case or Unicode normalization: ${other} and ${path}`);
+    allFolders.set(key,path);
+  };
+  for(const entry of ordered)for(const parent of ancestors(entry.path))addFolder(parent);
   if(folders===undefined)return {entries:ordered,folders:undefined};
   const implicit=new Set(ordered.flatMap((entry)=>ancestors(entry.path))),folderExact=new Set<string>(),folderPortable=new Map<string,string>();
   for(const raw of folders){
     const path=safeRelativePath(raw);if(implicit.has(path))continue;
     const key=identity(path),other=folderPortable.get(key);if(other&&other!==path)throw new Error(`Folder paths differ only by case or Unicode normalization: ${other} and ${path}`);
-    for(const parent of [path,...ancestors(path)])if(exact.has(parent))throw new Error(`A file path conflicts with a folder path: ${parent}`);
+    for(const parent of [path,...ancestors(path)])addFolder(parent);
     folderPortable.set(key,path);folderExact.add(path);
   }
   return {entries:ordered,folders:[...folderExact].sort()};

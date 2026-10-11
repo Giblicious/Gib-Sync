@@ -7,6 +7,20 @@ const config:Config={HOST:"127.0.0.1",PORT:8787,PUBLIC_URL:"https://sync.example
 afterEach(()=>vi.unstubAllGlobals());
 
 describe("Seafile directories",()=>{
+  it("reads bounded immutable sidecar revisions from the actual internal root",async()=>{
+    const commitId="b".repeat(40),bytes=Buffer.from("encrypted mutation fence");let queriedPath="",queriedCommit="";vi.stubGlobal("fetch",vi.fn(async(input:string|URL|Request)=>{const url=new URL(typeof input==="string"||input instanceof URL?input:input.url);if(url.pathname.endsWith("/file/revision/")){queriedPath=url.searchParams.get("p")!;queriedCommit=url.searchParams.get("commit_id")!;return Response.json("https://download.example.test/fence");}return new Response(bytes);}));const storage=new SeafileStorage(config),id="11111111-1111-4111-8111-111111111111",row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/Notes",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/Notes",mirror_head_id:null};expect(await storage.getSidecarRevision(row,"mutation-fences/test.gbs",commitId)).toEqual(Uint8Array.from(bytes));expect(queriedPath).toBe("/Notes/.gib-sync/mutation-fences/test.gbs");expect(queriedCommit).toBe(commitId);
+  });
+  it("parses the official repository history ISO time field",async()=>{
+    const time="2026-10-11T12:34:56+00:00",commitId="a".repeat(40);vi.stubGlobal("fetch",vi.fn(async()=>Response.json({data:[{commit_id:commitId,time}],more:false})));const storage=new SeafileStorage(config),id="11111111-1111-4111-8111-111111111111",row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/",mirror_head_id:null};expect(await storage.repoHistory(row)).toEqual([{commitId,size:0,mtime:Date.parse(time)}]);
+  });
+  it("rejects oversized download headers and oversized actual streamed bytes",async()=>{
+    const storage=new SeafileStorage(config),id="11111111-1111-4111-8111-111111111111",row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/",mirror_head_id:null};let declared=true;
+    vi.stubGlobal("fetch",vi.fn(async(input:string|URL|Request)=>{const url=new URL(typeof input==="string"||input instanceof URL?input:input.url);return url.pathname.endsWith("/file/")?Response.json("https://download.example.test/file"):new Response(new Uint8Array(config.MAX_BLOB_BYTES+1),{headers:declared?{"content-length":String(config.MAX_BLOB_BYTES+1)}:{}});}));
+    await expect(storage.getReadable(row,"large.bin")).rejects.toThrow("permitted byte limit");declared=false;await expect(storage.getReadable(row,"large.bin")).rejects.toThrow("declared byte limit");
+  });
+  it("fails before mutation if immutable backend history is disabled",async()=>{
+    vi.stubGlobal("fetch",vi.fn(async()=>Response.json({keep_days:0})));const storage=new SeafileStorage(config),id="11111111-1111-4111-8111-111111111111",row:VaultStorageRow={id,storage_url:config.SEAFILE_URL,storage_username:config.SEAFILE_USERNAME,storage_repo_id:"repo",storage_repo_name:"Notes",storage_base_path:"/",storage_token:storage.sealToken(id,"token"),storage_layout:"standard",mirror_base_path:"/",mirror_head_id:null};await expect(storage.assertHistoryAvailable(row)).rejects.toThrow("disabled");
+  });
   it("creates each directory once and reuses it",async()=>{
     const directories=new Set<string>();let creates=0;
     vi.stubGlobal("fetch",vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{

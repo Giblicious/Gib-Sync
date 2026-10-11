@@ -3,9 +3,24 @@ import type { Plugin } from "obsidian";
 import { createSerializedSettingsWriter,DEFAULT_SETTINGS,isGibSyncConflictPath,loadSettings,shouldSyncChangedPath } from "./settings";
 
 describe("file-change sync filtering",()=>{
+  it("never treats rooted paths or traversal as vault files",()=>{for(const path of ["../note.md","folder/../../note.md","/outside.md","C:/outside.md","folder//note.md","folder/./note.md","bad\0name"])expect(shouldSyncChangedPath(path,DEFAULT_SETTINGS)).toBe(false);expect(shouldSyncChangedPath("folder/note.md",DEFAULT_SETTINGS)).toBe(true);});
   it("recognizes only timestamped Gib Sync conflict-copy names",()=>{
     expect(isGibSyncConflictPath("Notes/Entry (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md")).toBe(true);
     expect(isGibSyncConflictPath("Notes/my conflict notes.md")).toBe(false);
+  });
+  it("honors custom config folders without ever syncing its own credentials",()=>{
+    const settings={...DEFAULT_SETTINGS,configDir:"App Config",syncPlugins:true,syncObsidianConfig:true,exclusions:[]};
+    expect(shouldSyncChangedPath("App Config/plugins/gib-sync/data.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath("App Config/plugins/gib-sync/main.js",settings)).toBe(false);
+    expect(shouldSyncChangedPath("App Config/workspace-mobile.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath("App Config/plugins/other/data.json",settings)).toBe(true);
+    expect(shouldSyncChangedPath("App Config/bookmarks.json",settings)).toBe(true);
+    expect(shouldSyncChangedPath(".obsidian/plugins/gib-sync/data.json",settings)).toBe(false);
+    expect(shouldSyncChangedPath("App Config/plugins/other/cache/index.json",settings)).toBe(false);
+  });
+  it("preserves exclusions and all user preferences during automatic journal migration",async()=>{
+    const stored={serverUrl:"https://example.test",syncPlugins:true,paused:true,desktopStatusText:false,exclusions:["Private"],vaultKey:"test-key",deviceToken:"test-token",configDir:"Custom"};
+    await expect(loadSettings({loadData:async()=>stored} as unknown as Plugin)).resolves.toMatchObject({...stored,pendingApplyOperations:{},pendingMoves:[],observedFolderSnapshotId:null});
   });
   it("syncs ordinary vault files and normalizes Windows separators",()=>{
     expect(shouldSyncChangedPath("Notes/today.md",DEFAULT_SETTINGS)).toBe(true);
@@ -96,6 +111,17 @@ describe("file-change sync filtering",()=>{
 });
 
 describe("settings persistence",()=>{
+  it("rejects traversal in replay and rename intents",async()=>{const stored={pendingPaths:["../outside.md","good.md"],pendingApplyPaths:["../outside.md","good.md"],pendingMoves:[{from:"good.md",to:"../outside.md",at:1}],pendingApplyPriorHashes:{"../outside.md":"a".repeat(64)},localReconcileBases:{"../outside.md":null}};await expect(loadSettings({loadData:async()=>stored} as unknown as Plugin)).resolves.toMatchObject({pendingPaths:["good.md"],pendingApplyPaths:["good.md"],pendingMoves:[],pendingApplyPriorHashes:{},localReconcileBases:{}});});
+  it("rejects apply journal paths outside the internal staging directory",async()=>{
+    const operation={targetHash:"a".repeat(64),priorHash:null,stagePath:".gib-sync/apply/"+"a".repeat(64)+".stage",backupPath:".gib-sync/apply/"+"a".repeat(64)+".backup",phase:"staged"};
+    const stored={pendingApplyOperations:{"good.md":operation,"unsafe.md":{...operation,backupPath:"Notes/user.md"}}};
+    await expect(loadSettings({loadData:async()=>stored} as unknown as Plugin)).resolves.toMatchObject({pendingApplyOperations:{"good.md":operation}});
+    const loaded=await loadSettings({loadData:async()=>stored} as unknown as Plugin);expect(loaded.pendingApplyOperations["unsafe.md"]).toBeUndefined();
+  });
+  it("preserves causal metadata in interrupted replay bases",async()=>{
+    const entry={path:"note.md",hash:"a".repeat(64),size:4,mtime:1,fileId:"file-id",revision:{id:"revision-id",parentId:null,deviceId:"device",deviceName:"Phone",modifiedAt:123}};
+    await expect(loadSettings({loadData:async()=>({pendingApplyPriorEntries:{"note.md":entry},localReconcileBases:{"note.md":entry}})} as unknown as Plugin)).resolves.toMatchObject({pendingApplyPriorEntries:{"note.md":entry},localReconcileBases:{"note.md":entry}});
+  });
   it("loads valid interrupted commit receipts without inventing one for older clients",async()=>{
     const intent={parentId:null,fingerprint:"a".repeat(64),priorHashes:{"note.md":"b".repeat(64),"new.md":null,"invalid":"oops"}};
     await expect(loadSettings({loadData:async()=>({pendingCommit:intent})} as unknown as Plugin)).resolves.toMatchObject({pendingCommit:{...intent,priorHashes:{"note.md":"b".repeat(64),"new.md":null}}});

@@ -9,6 +9,7 @@ export class Store {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(dataDir, "gib-sync.db"));
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    this.db.exec("BEGIN IMMEDIATE");try{
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS vaults(id TEXT PRIMARY KEY, name TEXT NOT NULL, wrapped_key TEXT NOT NULL, head_id TEXT, created_at TEXT NOT NULL,
         storage_url TEXT, storage_username TEXT, storage_repo_id TEXT, storage_repo_name TEXT, storage_base_path TEXT, storage_token TEXT, storage_layout TEXT,
@@ -33,6 +34,22 @@ export class Store {
         reason TEXT NOT NULL, enabled_at TEXT NOT NULL, disabled_at TEXT);
       CREATE TABLE IF NOT EXISTS server_containment_events(id TEXT PRIMARY KEY, action TEXT NOT NULL, allowed_vault_id TEXT,
         reason TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS mirror_jobs(vault_id TEXT PRIMARY KEY REFERENCES vaults(id),due_at INTEGER NOT NULL,revision INTEGER NOT NULL,
+        lease_owner TEXT,lease_until INTEGER,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT);
+      CREATE TABLE IF NOT EXISTS request_budgets(scope TEXT NOT NULL,subject TEXT NOT NULL,window_start INTEGER NOT NULL,attempts INTEGER NOT NULL,
+        PRIMARY KEY(scope,subject));
+      CREATE TABLE IF NOT EXISTS external_revisions(vault_id TEXT NOT NULL REFERENCES vaults(id),path TEXT NOT NULL,revision_id TEXT NOT NULL,
+        hash TEXT NOT NULL,size INTEGER NOT NULL,observed_at TEXT NOT NULL,source TEXT NOT NULL,mtime INTEGER NOT NULL DEFAULT 0,causal_order TEXT NOT NULL DEFAULT '',imported_at TEXT,PRIMARY KEY(vault_id,path,revision_id));
+      CREATE TABLE IF NOT EXISTS mirror_mutations(id TEXT PRIMARY KEY,vault_id TEXT NOT NULL REFERENCES vaults(id),path TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,expected_hash TEXT,target_hash TEXT,history_baseline TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'file');
+      CREATE TABLE IF NOT EXISTS external_folder_revisions(vault_id TEXT NOT NULL REFERENCES vaults(id),path TEXT NOT NULL,revision_id TEXT NOT NULL,
+        causal_order TEXT NOT NULL,imported_at TEXT,PRIMARY KEY(vault_id,path,revision_id));
+      CREATE TABLE IF NOT EXISTS content_uploads(id TEXT PRIMARY KEY,vault_id TEXT NOT NULL REFERENCES vaults(id),device_id TEXT NOT NULL REFERENCES devices(id),
+        hash TEXT NOT NULL,size INTEGER NOT NULL,offset INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'receiving',created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,lease_owner TEXT,lease_until INTEGER);
+      CREATE UNIQUE INDEX IF NOT EXISTS content_upload_identity ON content_uploads(vault_id,device_id,hash,size);
+      CREATE TABLE IF NOT EXISTS content_upload_chunks(session_id TEXT NOT NULL REFERENCES content_uploads(id),chunk_index INTEGER NOT NULL,
+        offset INTEGER NOT NULL,size INTEGER NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(session_id,chunk_index));
     `);
     const columns = new Set(this.all<{name:string}>("PRAGMA table_info(vaults)").map((row) => row.name));
     for (const [name, type] of Object.entries({storage_url:"TEXT",storage_username:"TEXT",storage_repo_id:"TEXT",storage_repo_name:"TEXT",storage_base_path:"TEXT",storage_token:"TEXT",storage_layout:"TEXT",mirror_base_path:"TEXT",mirror_head_id:"TEXT",mirror_generation_id:"TEXT",retired_at:"TEXT",retired_reason:"TEXT"})) {
@@ -52,6 +69,7 @@ export class Store {
     if(!currentVaultColumns.has("external_scan_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_scan_at TEXT");
     if(!currentVaultColumns.has("external_import_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_import_at TEXT");
     if(!currentVaultColumns.has("external_error"))this.db.exec("ALTER TABLE vaults ADD COLUMN external_error TEXT");
+    if(!currentVaultColumns.has("mirror_repo_commit"))this.db.exec("ALTER TABLE vaults ADD COLUMN mirror_repo_commit TEXT");
     if(!currentVaultColumns.has("safeguard_policy"))this.db.exec("ALTER TABLE vaults ADD COLUMN safeguard_policy TEXT");
     if(!currentVaultColumns.has("write_locked_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_at TEXT");
     if(!currentVaultColumns.has("write_locked_by"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_by TEXT");
@@ -63,6 +81,12 @@ export class Store {
     if(!deviceColumns.has("clock_skew_ms"))this.db.exec("ALTER TABLE devices ADD COLUMN clock_skew_ms INTEGER NOT NULL DEFAULT 0");
     if(!deviceColumns.has("client_version"))this.db.exec("ALTER TABLE devices ADD COLUMN client_version TEXT");
     if(!deviceColumns.has("client_protocol"))this.db.exec("ALTER TABLE devices ADD COLUMN client_protocol INTEGER");
+    if(!deviceColumns.has("acknowledged_at"))this.db.exec("ALTER TABLE devices ADD COLUMN acknowledged_at TEXT");
+    const revisionColumns=new Set(this.all<{name:string}>("PRAGMA table_info(external_revisions)").map((row)=>row.name));
+    for(const [name,type] of Object.entries({mtime:"INTEGER NOT NULL DEFAULT 0",causal_order:"TEXT NOT NULL DEFAULT ''"}))if(!revisionColumns.has(name))this.db.exec(`ALTER TABLE external_revisions ADD COLUMN ${name} ${type}`);
+    const mutationColumns=new Set(this.all<{name:string}>("PRAGMA table_info(mirror_mutations)").map((row)=>row.name));
+    if(!mutationColumns.has("kind"))this.db.exec("ALTER TABLE mirror_mutations ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'");
+    this.db.exec("COMMIT");}catch(error){try{this.db.exec("ROLLBACK");}catch{}this.db.close();throw error;}
   }
   one<T>(sql: string, ...params: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...params) as T | undefined; }
   all<T>(sql: string, ...params: SQLInputValue[]): T[] { return this.db.prepare(sql).all(...params) as T[]; }

@@ -10,7 +10,7 @@ import { Notice } from "obsidian";
 const result:SyncResult={uploaded:0,mirrored:0,downloaded:0,deleted:0,prunedFolders:0,pendingRetiredFolders:0,resolved:0,conflicts:0,snapshotId:"accepted",processedPaths:[],fullScan:false};
 function fixture(){
   const plugin=new GibSyncPlugin({} as never,{} as never);
-  plugin.settings={...structuredClone(DEFAULT_SETTINGS),deviceToken:"test",vaultIdentity:"vault",autoSync:false,syncOnFileChange:false,instantReceive:false};
+  plugin.settings={...structuredClone(DEFAULT_SETTINGS),deviceToken:"test",vaultIdentity:"vault",autoSync:false,syncOnFileChange:false,instantReceive:false,fullScanRequired:false};
   plugin.liveStatus=initialLiveStatus(true);
   plugin.saveSettings=vi.fn(async()=>{});plugin.currentVaultIdentity=()=>"vault";
   plugin.checkObsidianSyncProtection=vi.fn(async()=>false);plugin.refreshServerStatus=vi.fn(async()=>{});
@@ -27,6 +27,9 @@ describe("plugin synchronization lifecycle",()=>{
     const {plugin,sync}=fixture();(plugin as any).pathVersions.set("note.md",1);(plugin as any).pathRevision=1;plugin.settings.pendingPaths=["note.md"];plugin.settings.pendingPathTimes={"note.md":100};
     sync.mockImplementation(async()=>{plugin.scheduleFileChangeSync("note.md");return {...result,processedPaths:["note.md"],fullScan:true};});
     await expect(plugin.runSync()).resolves.toBe(true);expect(plugin.settings.pendingPaths).toEqual(["note.md"]);expect(plugin.settings.pendingPathTimes["note.md"]).toBeGreaterThan(100);expect(plugin.liveStatus.verified).toBe(false);
+  });
+  it("retains a newer folder reconciliation request made during an older full sync",async()=>{
+    const {plugin,sync}=fixture();plugin.settings.fullScanRequired=false;sync.mockImplementation(async()=>{plugin.requireFullScan();plugin.settings.fullScanRequired=false;return {...result,fullScan:true};});await expect(plugin.runSync()).resolves.toBe(true);expect(plugin.settings.fullScanRequired).toBe(true);expect(plugin.liveStatus.verified).toBe(false);
   });
   it("joins overlapping requests before async preflight finishes",async()=>{
     const {plugin,sync}=fixture();let ready!:()=>void;
@@ -74,5 +77,49 @@ describe("plugin synchronization lifecycle",()=>{
     const run=plugin.runSync();await vi.advanceTimersByTimeAsync(0);plugin.settings.paused=true;
     await vi.advanceTimersByTimeAsync(2000);await expect(run).resolves.toBe(false);
     expect(sync).toHaveBeenCalledTimes(1);expect(plugin.liveStatus.phase).toBe("blocked");expect(Notice).not.toHaveBeenCalled();
+  });
+  it("does not begin reconciliation if paused while preflight is awaiting",async()=>{
+    const {plugin,sync}=fixture();let ready!:()=>void;(plugin as any).checkCompatibility=vi.fn(()=>new Promise<boolean>(resolve=>{ready=()=>resolve(true);}));plugin.engine.cancel=vi.fn();
+    const run=plugin.runSync();await Promise.resolve();await plugin.setPaused(true);ready();await expect(run).resolves.toBe(false);
+    expect(plugin.engine.cancel).toHaveBeenCalledTimes(1);expect(sync).not.toHaveBeenCalled();expect(plugin.api.headState).not.toHaveBeenCalled();expect(Notice).not.toHaveBeenCalled();
+  });
+  it("does not mark an interrupted engine result verified after pause then resume",async()=>{
+    const {plugin,sync}=fixture();let finished!:(value:SyncResult)=>void;sync.mockImplementation(()=>new Promise<SyncResult>(resolve=>{finished=resolve;}));plugin.engine.cancel=vi.fn();
+    const run=plugin.runSync();await vi.advanceTimersByTimeAsync(0);await plugin.setPaused(true);await plugin.setPaused(false);finished(result);await expect(run).resolves.toBe(false);
+    expect(plugin.api.headState).not.toHaveBeenCalled();expect(plugin.api.markDeviceReady).not.toHaveBeenCalled();expect(plugin.liveStatus.lastSuccessAt).toBeNull();expect(Notice).not.toHaveBeenCalled();
+  });
+  it("stops after unload during the final server verification",async()=>{
+    const {plugin}=fixture();let finish!:(value:{headId:string|null})=>void;plugin.api.headState=vi.fn(()=>new Promise<{headId:string|null}>(resolve=>{finish=resolve;}));plugin.engine.cancel=vi.fn();
+    vi.stubGlobal("document",{querySelectorAll:()=>[]});const run=plugin.runSync();await vi.advanceTimersByTimeAsync(0);plugin.onunload();finish({headId:"accepted"});await expect(run).resolves.toBe(false);
+    expect(plugin.api.markDeviceReady).not.toHaveBeenCalled();expect(plugin.liveStatus.lastSuccessAt).toBeNull();expect(plugin.engine.cancel).toHaveBeenCalledTimes(1);expect(Notice).not.toHaveBeenCalled();
+  });
+  it("does not reject held changes or start restore while sync owns the device",async()=>{
+    const {plugin}=fixture();let ready!:()=>void;(plugin as any).checkCompatibility=vi.fn(()=>new Promise<boolean>(resolve=>{ready=()=>resolve(true);}));plugin.api.rejectQuarantine=vi.fn();plugin.engine.restoreAcceptedSnapshot=vi.fn();
+    const run=plugin.runSync();await Promise.resolve();await expect(plugin.rejectAndRestore("held")).rejects.toThrow("current sync finish");expect(plugin.api.rejectQuarantine).not.toHaveBeenCalled();expect(plugin.engine.restoreAcceptedSnapshot).not.toHaveBeenCalled();ready();await run;
+  });
+  it("reserves recovery before its first await so a timer cannot start sync beside it",async()=>{
+    const {plugin,sync}=fixture();let restored!:(value:{downloaded:number;deleted:number;prunedFolders:number})=>void;plugin.api.rejectQuarantine=vi.fn(async()=>({ok:true}));plugin.engine.restoreAcceptedSnapshot=vi.fn(()=>new Promise<{downloaded:number;deleted:number;prunedFolders:number}>(resolve=>{restored=resolve;}));
+    const repair=plugin.rejectAndRestore("held"),joined=plugin.runSync();await vi.advanceTimersByTimeAsync(0);expect(sync).not.toHaveBeenCalled();expect(plugin.liveStatus.running).toBe(true);restored({downloaded:1,deleted:0,prunedFolders:0});await repair;await joined;expect(plugin.liveStatus.running).toBe(false);expect(plugin.liveStatus.verified).toBe(false);
+  });
+  it("keeps explicit chained file moves as one identity-preserving intent",()=>{
+    const {plugin}=fixture();(plugin as any).recordRename("A.md","B.md");(plugin as any).recordRename("B.md","Folder/C.md");expect(plugin.settings.pendingMoves).toEqual([{from:"A.md",to:"Folder/C.md",at:Date.now()}]);
+  });
+  it("journals folder moves without inferring them from changed note content",()=>{
+    const {plugin}=fixture();(plugin as any).recordRename("Old folder","New folder");expect(plugin.settings.pendingMoves).toEqual([{from:"Old folder",to:"New folder",at:Date.now()}]);
+  });
+  it("does not treat sync-owned writes or ignored files as intentional recreation",()=>{
+    const {plugin}=fixture();(plugin as any).expectedLocalMutations.set("Remote.md","hash");(plugin as any).recordFileCreation("Remote.md");(plugin as any).recordFileCreation(".obsidian/plugins/gib-sync/data.json");(plugin as any).recordFileCreation("New.md");expect(plugin.settings.fileCreationTimes).toEqual({"New.md":Date.now()});
+  });
+  it("cannot restart timers after unload",()=>{
+    const {plugin}=fixture();vi.stubGlobal("document",{querySelectorAll:()=>[]});plugin.onunload();plugin.settings.autoSync=true;plugin.configureTimer();plugin.configureWatch();(plugin as any).queueSync(1000,"Late background callback");expect(vi.getTimerCount()).toBe(0);
+  });
+  it("keeps the ribbon fallback when an optional native drawer API throws",()=>{
+    const {plugin}=fixture();(plugin as any).app={workspace:{rightSplit:{addHeaderButton:()=>{throw new Error("Unsupported native drawer");}}}};vi.stubGlobal("document",{querySelectorAll:()=>[]});expect(()=>(plugin as any).mountNativeMobileSidebarIndicator()).not.toThrow();expect((plugin as any).mobileSidebarEl).toBeNull();
+  });
+  it("cancels an indicator long-press callback on unload",async()=>{
+    const {plugin}=fixture();vi.stubGlobal("document",{querySelectorAll:()=>[]});const late=vi.fn(),timer=window.setTimeout(late,650);(plugin as any).mobileLongPressCancel=()=>window.clearTimeout(timer);plugin.onunload();await vi.advanceTimersByTimeAsync(650);expect(late).not.toHaveBeenCalled();expect(Notice).not.toHaveBeenCalled();
+  });
+  it("does not journal a late expected-mutation verification after unload",async()=>{
+    const {plugin}=fixture();let finish!:(value:null)=>void;(plugin as any).app={vault:{adapter:{stat:vi.fn(()=>new Promise<null>(resolve=>{finish=resolve;}))}}};(plugin as any).expectedLocalMutations.set("Note.md","expected-hash");vi.stubGlobal("document",{querySelectorAll:()=>[]});const verifying=(plugin as any).verifyExpectedMutation("Note.md","expected-hash");plugin.onunload();finish(null);await verifying;expect(plugin.settings.pendingPaths).toEqual([]);expect(plugin.settings.pendingPathTimes).toEqual({});plugin.scheduleFileChangeSync("Late.md");plugin.requireFullScan();expect(plugin.settings.pendingPaths).toEqual([]);expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -1,10 +1,12 @@
 FROM node:24-bookworm-slim AS build
 WORKDIR /app
+COPY scripts/verify-server-runtime.mjs scripts/verify-server-runtime.mjs
+RUN node scripts/verify-server-runtime.mjs
 COPY package*.json tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/package.json
 COPY apps/server/package.json apps/server/package.json
 COPY plugin/package.json plugin/package.json
-RUN npm install
+RUN npm ci
 COPY packages/protocol packages/protocol
 COPY apps/server apps/server
 RUN npm run build -w @gib-sync/protocol && npm run build -w @gib-sync/server && npm prune --omit=dev
@@ -16,6 +18,8 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/packages/protocol ./packages/protocol
 COPY --from=build /app/apps/server ./apps/server
+COPY --from=build /app/scripts/verify-server-runtime.mjs ./scripts/verify-server-runtime.mjs
+RUN node scripts/verify-server-runtime.mjs
 USER node
 EXPOSE 8787
 CMD ["node", "--enable-source-maps", "apps/server/dist/index.js"]

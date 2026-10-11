@@ -10,7 +10,11 @@ describe("snapshot manifest invariants",()=>{
     [[entry("../escape.md")],[]],
     [[entry("A"),entry("A/note.md")],[]],
     [[entry("Note.md"),entry("note.md")],[]],
+    [[entry("Foo"),entry("foo/bar.md")],[]],
+    [[entry("Folder/a.md"),entry("folder/b.md")],[]],
+    [[entry("Caf\u00e9"),entry("Cafe\u0301/bar.md")],[]],
     [[entry("file")],["file/child"]],
+    [[entry("File")],["file/child"]],
     [[entry("note.md")],["Folder","folder"]]
   ])("rejects non-portable or contradictory topology",(entries,folders)=>expect(()=>canonicalManifest(entries,folders)).toThrow());
 });

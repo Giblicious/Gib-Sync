@@ -10,22 +10,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: npm }
-      - run: npm ci && npm run build
+        with: { node-version: 24, check-latest: true, cache: npm }
+      - run: node --test scripts/verify-server-runtime.test.mjs
+      - run: node scripts/verify-server-runtime.mjs
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+        env: { LOG_LEVEL: silent }
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+      - run: node scripts/verify-release.mjs "${GITHUB_REF_NAME}"
       - run: cd plugin && zip ../gib-sync-${GITHUB_REF_NAME}.zip main.js manifest.json styles.css versions.json
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          tags: |
+            ghcr.io/giblicious/gib-sync:${{ github.ref_name }}
+            ghcr.io/giblicious/gib-sync:latest
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             plugin/main.js
             plugin/manifest.json
             plugin/styles.css
+            plugin/versions.json
             gib-sync-${{ github.ref_name }}.zip
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/giblicious/gib-sync:${{ github.ref_name }}
-            ghcr.io/giblicious/gib-sync:latest

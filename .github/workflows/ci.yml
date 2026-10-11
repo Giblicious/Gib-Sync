@@ -9,12 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: npm }
+        with: { node-version: 24, check-latest: true, cache: npm }
+      - run: node --test scripts/verify-server-runtime.test.mjs
+      - run: node scripts/verify-server-runtime.mjs
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
         env: { LOG_LEVEL: silent }
       - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
   container:
     runs-on: ubuntu-latest
     needs: verify
@@ -27,5 +30,6 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          pull: true
           push: '${{ github.event_name == ''push'' && github.ref == ''refs/heads/main'' }}'
           tags: ghcr.io/giblicious/gib-sync:latest
