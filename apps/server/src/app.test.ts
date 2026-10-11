@@ -340,7 +340,10 @@ describe("Gib Sync API", () => {
       expect(importedHead.message).toContain("1 folders");
     }finally{await app.close();}
   });
-  it("three-way merges simultaneous Obsidian and Seafile text edits",async()=>{
+  it.each(["explicit", "automatic"] as const)("three-way merges simultaneous Obsidian and Seafile text edits (%s scan wins)",async(winner)=>{
+    // The real startup scanner fires at 250ms. Control its schedule rather
+    // than assume the explicit HTTP request finishes first on every platform.
+    vi.useFakeTimers({toFake:["setTimeout","clearTimeout","setInterval","clearInterval"]});
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
     const base=Buffer.from("a\nb\nc\n"),baseHash=sha256(base);
@@ -352,10 +355,25 @@ describe("Gib Sync API", () => {
     await app.inject({method:"PUT",url:`/v1/blobs/${obsidianHash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(obsidian,key,obsidianHash)});
     const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Obsidian",entries:[{path:"note.md",hash:obsidianHash,size:obsidian.length,mtime:2}]}})).json();
     const seafile=Buffer.from("a\nb\nC\n");storage.files.set(`read:${credentials.vaultId}:note.md`,seafile);
-    const imported=(await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json();expect(imported).toMatchObject({snapshotId:expect.any(String),conflicts:0});
-    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.parentId).toBe(second.id);
+    const merged=Buffer.from("A\nb\nC\n"),mergedHash=sha256(merged);
+    let automaticHead:any;
+    if(winner==="automatic"){
+      await vi.advanceTimersByTimeAsync(250);
+      automaticHead=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;
+      expect(automaticHead).toMatchObject({parentId:second.id,deviceId:`seafile:${credentials.vaultId}`,entries:[{path:"note.md",hash:mergedHash,size:merged.length}]});
+    }
+    const response=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});expect(response.statusCode).toBe(200);const imported=response.json();
+    expect(imported).toMatchObject(winner==="explicit"?{snapshotId:expect.any(String),changedFiles:1,deletedFiles:0,conflicts:0}:{snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0});
+    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;
+    expect(head).toMatchObject({id:winner==="explicit"?imported.snapshotId:automaticHead.id,parentId:second.id,deviceId:`seafile:${credentials.vaultId}`,entries:[{path:"note.md",hash:mergedHash,size:merged.length,fileId:first.entries[0].fileId}]});
+    expect(head.entries).toHaveLength(1);expect(store.one<{count:number}>("SELECT COUNT(*) count FROM snapshots WHERE vault_id=?",credentials.vaultId)?.count).toBe(3);
     const entry=head.entries[0],encrypted=storage.files.get(`${credentials.vaultId}:blobs/${entry.hash.slice(0,2)}/${entry.hash}.gbs`)!;
-    expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,entry.hash)).toString()).toBe("A\nb\nC\n");
+    expect(Buffer.from(decryptVaultBlob(encrypted,credentials.vaultKey,entry.hash))).toEqual(merged);
+    expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:head.id}})).statusCode).toBe(200);
+    expect(storage.files.get(`read:${credentials.vaultId}:note.md`)).toEqual(merged);
+    expect(store.one("SELECT head_id,mirror_head_id,mirror_generation_id FROM vaults WHERE id=?",credentials.vaultId)).toMatchObject({head_id:head.id,mirror_head_id:head.id,mirror_generation_id:head.id});
+    expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json()).toMatchObject({snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0});
+    expect(store.one<{count:number}>("SELECT COUNT(*) count FROM snapshots WHERE vault_id=?",credentials.vaultId)?.count).toBe(3);
     await app.close();
   });
   it("bifurcates large Obsidian and Seafile rewrites with reciprocal warning links",async()=>{

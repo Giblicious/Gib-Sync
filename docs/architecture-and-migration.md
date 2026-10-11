@@ -1,4 +1,4 @@
-# Durable synchronization foundation (0.8.61)
+# Durable synchronization foundation (0.8.62)
 
 ## Authority and invariants
 

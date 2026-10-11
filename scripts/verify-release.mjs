@@ -11,5 +11,8 @@ assert.equal(json("plugin/versions.json")[version],manifest.minAppVersion);
 if(process.argv[2])assert.equal(process.argv[2],`v${version}`,"Release tag must match all version surfaces");
 assert.ok(readFileSync("plugin/main.js","utf8").includes(version),"Client version must be in built bundle");
 assert.ok(readFileSync("apps/server/src/version.ts","utf8").includes(version),"Server version mismatch");
+assert.ok(readFileSync("plugin/src/api.ts","utf8").includes(`CLIENT_VERSION="${version}"`),"Client API version mismatch");
+assert.ok(readFileSync(".env.example","utf8").includes(`GIBSYNC_RECOMMENDED_CLIENT_VERSION=${version}`),"Example recommended version mismatch");
+assert.ok(readFileSync("docker-compose.yml","utf8").includes(`GIBSYNC_RECOMMENDED_CLIENT_VERSION:-${version}`),"Compose recommended version mismatch");
 assert.ok(readFileSync("plugin/styles.css").length>0);
 console.log(`Verified release contract ${version}`);

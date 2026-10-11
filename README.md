@@ -15,7 +15,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## Interrupted-sync recovery
 
-Version 0.8.61 adds staged local application, durable server projection jobs,
+Version 0.8.62 adds staged local application, durable server projection jobs,
 recorded move identity, explicit device acknowledgments, and verified automatic
 database backups. Existing accounts, settings, vault keys, and immutable history
 migrate automatically. See [architecture and migration](docs/architecture-and-migration.md)

@@ -1,6 +1,6 @@
 {
   "name": "gib-sync-plugin",
-  "version": "0.8.61",
+  "version": "0.8.62",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.4.0",
-    "@gib-sync/protocol": "0.8.61",
+    "@gib-sync/protocol": "0.8.62",
     "diff": "^8.0.2"
   },
   "devDependencies": {

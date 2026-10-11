@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.61
+## 0.8.62
 
 - Add staged, hash-verified local application with durable phase journals and retained original recovery copies.
 - Persist server projection jobs, leases, retry ownership, and external revision recovery across restart.
