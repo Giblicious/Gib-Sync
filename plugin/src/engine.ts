@@ -336,6 +336,14 @@ export class SyncEngine {
       }
       if(this.progress(current,changedPaths.length))this.status({phase:"scanning",message:"Checking changed files",current,total:changedPaths.length});
     }
+    // Shared enablement is intentionally projected differently on each device
+    // (installer, excluded plugins and desktop-only toggles). Its server hash
+    // is not physical inventory, even without an editor/config-change event.
+    // Refresh this one small control file, not the entire vault.
+    if(this.getSettings().syncPlugins&&this.include(this.enablementPath)&&!changedPaths.some(path=>normalizePath(path)===this.enablementPath)){
+      const observed=await this.inspectLocalFile(this.enablementPath,true);
+      if(observed)output.set(this.enablementPath,{...output.get(this.enablementPath),...observed});else output.delete(this.enablementPath);
+    }
     return {files:output,folders,unreadableConflictPaths};
   }
 

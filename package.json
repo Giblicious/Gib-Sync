@@ -1,7 +1,7 @@
 {
   "name": "gib-sync",
   "private": true,
-  "version": "0.8.68",
+  "version": "0.8.69",
   "workspaces": [
     "apps/*",
     "packages/*",

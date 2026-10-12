@@ -91,7 +91,7 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){const path=this.syncPath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.journalIntent(this.vaultEventsReady?"create":"observe",path,"folder");this.settings.folderCreateTimes[path]=Date.now();this.requireFullScan();}else{this.recordFileCreation(file.path);this.scheduleFileChangeSync(file.path);}}));
+    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){const path=this.syncPath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.journalIntent(this.vaultEventsReady?"create":"observe",path,"folder");this.settings.folderCreateTimes[path]=Date.now();this.recordPathTime(path,true);this.requireFullScan();}else{this.recordFileCreation(file.path);this.scheduleFileChangeSync(file.path);}}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("delete", (file) => {this.journalIntent("delete",file.path,file instanceof TFolder?"folder":"file");if(file instanceof TFolder){const path=this.syncPath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
     this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {if(this.stopped||!shouldSyncChangedPath(oldPath,this.settings)&&!shouldSyncChangedPath(file.path,this.settings))return;this.journalIntent("move",file.path,file instanceof TFolder?"folder":"file",oldPath);this.lastVaultRenameAt=Date.now();this.recordRename(oldPath,file.path);if(file instanceof TFolder){this.settings.folderCreateTimes[this.syncPath(file.path)]=Date.now();this.persistJournalSoon();this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
@@ -176,7 +176,7 @@ export default class GibSyncPlugin extends Plugin {
   private attentionCount():number{return this.serverStatus?.safeguards.pendingQuarantines??0;}
   private indicatorHealth(){const alerts=this.serverStatus?.healthAlerts??[],error=alerts.find((item)=>item.level==="error"),warning=alerts.find((item)=>item.level==="warning");return {errors:alerts.filter((item)=>item.level==="error").length,warnings:alerts.filter((item)=>item.level==="warning").length,description:error?.message??warning?.message};}
   indicatorState(){
-    this.liveStatus.pendingChanges=new Set([...this.settings.pendingPaths,...this.settings.pendingApplyPaths,...Object.keys(this.settings.pendingPathTimes)]).size;
+    this.liveStatus.pendingChanges=new Set([...this.settings.pendingPaths,...this.settings.pendingApplyPaths,...Object.keys(this.settings.pendingPathTimes)].filter(path=>shouldSyncChangedPath(path.replace(/\/$/,""),this.settings))).size;
     if(this.compatibilityBlocked)return {key:"blocked" as const,label:"Update required",icon:"download",tone:"warning" as const,animated:false,attentionCount:0,description:this.compatibility?.reason??"This Gib Sync version is not compatible with the server"};
     if(this.serverStatus?.containment?.active&&!this.serverStatus.containment.thisVaultAllowed)return {key:"blocked" as const,label:"Server paused",icon:"shield-alert",tone:"warning" as const,animated:false,attentionCount:0,description:"Emergency containment is protecting this vault; no files are being changed"};
     const health=this.indicatorHealth();
@@ -503,7 +503,11 @@ export default class GibSyncPlugin extends Plugin {
         onRetry:(error,attempt,delay)=>{
           const message=error instanceof Error?error.message:String(error);
           retryStarted=true;
-          this.liveStatus.verified=false;this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();
+          // A retry cannot undo a proven unchanged checkpoint. Actual local or
+          // incoming changes already invalidate it; exhausted retries do too.
+          this.liveStatus.verified=Boolean(this.liveStatus.verified&&this.liveStatus.lastSuccessAt);
+          if(error instanceof ApiError&&error.status===409)this.liveStatus.verified=false;
+          this.liveStatus.nextSyncAt=new Date(Date.now()+delay).toISOString();
           this.report("retrying",`Connection or server interrupted sync; retrying automatically (${attempt}/3) in ${delay/1000}s. Details: ${message}`,"info");
         },
         wait:(delay)=>new Promise<void>((resolve)=>window.setTimeout(resolve,delay))
@@ -619,6 +623,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   requireFullScan(){
     if(this.stopped)return;
+    this.liveStatus.verified=false;
     this.fullScanRevision++;
     this.settings.fullScanRequired=true;this.persistJournalSoon();
     if(!this.settings.deviceToken||!this.settings.syncOnFileChange)return;
@@ -658,7 +663,7 @@ export default class GibSyncPlugin extends Plugin {
       try{
         const result=await this.api.watch(this.settings.lastSnapshotId);
         if(generation!==this.watchGeneration)return;
-        const reconnected=failures>0;failures=0;
+        const reconnected=failures>0;failures=0;this.liveStatus.incomingReconnecting=false;
         if(reconnected&&!this.liveStatus.running&&!this.safetyHold)this.queueSync(750,"Connection restored; verifying this device","automatic");
         if(result.attention){
           this.safetyHold=true;
@@ -678,7 +683,14 @@ export default class GibSyncPlugin extends Plugin {
         if(error instanceof ApiError&&error.status===426){await this.checkCompatibility();return;}
         if(error instanceof ApiError&&error.status===423&&(error.responseBody as {containment?:unknown}|null)?.containment){this.safetyHold=true;await this.refreshServerStatus();await new Promise<void>((resolve)=>window.setTimeout(resolve,30_000));continue;}
         failures++;
-        if(!this.syncTask&&!this.safetyHold&&!this.compatibilityBlocked){this.liveStatus.verified=false;if(failures===1)this.report("retrying","Reconnecting to incoming updates; periodic checks remain active","info");else if(failures===4)this.report("offline","Incoming updates are unavailable; periodic checks remain active","warning");}
+        if(!this.syncTask&&!this.safetyHold&&!this.compatibilityBlocked){
+          this.liveStatus.incomingReconnecting=true;
+          if(failures===4){this.liveStatus.verified=false;this.report("offline","Incoming updates are unavailable; periodic checks remain active","warning");}
+          else if(failures===1){
+            if(this.liveStatus.verified&&this.liveStatus.lastSuccessAt&&!this.liveStatus.lastError){this.liveStatus.activities.push({at:new Date().toISOString(),phase:"retrying",level:"info",message:"Live updates are reconnecting; the last verified vault checkpoint is unchanged."});if(this.liveStatus.activities.length>100)this.liveStatus.activities.shift();this.emitStatus();}
+            else this.report("retrying","Reconnecting to incoming updates; periodic checks remain active","info");
+          }
+        }
         await new Promise<void>((resolve)=>window.setTimeout(resolve,Math.min(10_000,1000*2**Math.min(failures-1,3))));
       }
     }

@@ -8,7 +8,7 @@ export interface LiveSyncStatus {
   phase:SyncPhase; message:string; running:boolean; current?:number; total?:number;
   startedAt:string|null; completedAt:string|null; lastSuccessAt:string|null; lastErrorAt:string|null; lastError:string;
   lastResult:string; nextSyncAt:string|null; activities:SyncActivity[];
-  verified?:boolean; pendingChanges?:number;
+  verified?:boolean; pendingChanges?:number; incomingReconnecting?:boolean;
 }
 
 export interface RetiredPathState {

@@ -3,6 +3,21 @@ import { initialLiveStatus } from "./settings";
 import { deriveIndicatorState } from "./status";
 
 describe("status indicator state",()=>{
+  it("retains a steady verified check through routine scheduling and a transient incoming reconnect",()=>{
+    const live=initialLiveStatus(true);live.verified=true;live.lastSuccessAt=new Date().toISOString();
+    for(const phase of ["up-to-date","idle","scheduled"] as const){live.phase=phase;expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"synced",icon:"check",tone:"success",animated:false});}
+    live.incomingReconnecting=true;expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"synced",icon:"check",tone:"success",description:expect.stringContaining("Live updates are reconnecting")});
+    live.phase="retrying";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"success"});
+    live.pendingChanges=1;expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"retrying",icon:"cloud-upload",tone:"active"});
+    live.phase="offline";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"offline",tone:"neutral"});
+  });
+  it("keeps unsent edits pending across scheduled, scanning and merging phases without clock/checkmark switching",()=>{
+    const live=initialLiveStatus(true);live.pendingChanges=2;live.verified=true;live.lastSuccessAt=new Date().toISOString();
+    for(const running of [false,true])for(const phase of ["scheduled","checking","reading-remote","scanning","merging"] as const){live.running=running;live.phase=phase;expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"queued",icon:"cloud-upload",tone:"active",animated:false});}
+    live.phase="uploading";live.running=true;expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"syncing",animated:true});
+    live.pendingChanges=0;live.running=false;live.phase="complete";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"synced",icon:"check",tone:"success"});
+  });
+  it("never turns an unverified scheduled check into a clock or verified success",()=>{const live=initialLiveStatus(true);live.phase="scheduled";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"cloud",tone:"neutral",animated:false});});
   it("prioritizes setup, native Sync blocking, and held changes",()=>{
     const live=initialLiveStatus(false);
     expect(deriveIndicatorState(live,false,false).key).toBe("setup");
@@ -15,13 +30,13 @@ describe("status indicator state",()=>{
     live.phase="error";live.lastError="Offline";expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"error",description:"Offline"});
     live.phase="up-to-date";live.verified=true;live.lastSuccessAt=new Date().toISOString();expect(deriveIndicatorState(live,true,false).key).toBe("synced");
   });
-  it("always pulses a check while checking, using green only for verified devices without pending changes",()=>{
+  it("uses a green checking check only for verified devices, never flashing a check over queued edits",()=>{
     const live=initialLiveStatus(true);live.running=true;live.phase="scanning";
     expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"neutral",animated:true});
     live.lastSuccessAt=new Date().toISOString();live.verified=true;
     expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"success",animated:true});
     live.pendingChanges=1;
-    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"checking",icon:"check",tone:"neutral",animated:true});
+    expect(deriveIndicatorState(live,true,false)).toMatchObject({key:"queued",icon:"cloud-upload",tone:"active",animated:false});
     live.running=false;live.phase="up-to-date";
     expect(deriveIndicatorState(live,true,false).key).toBe("queued");
   });

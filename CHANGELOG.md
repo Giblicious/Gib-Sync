@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.69 candidate
+
+- Fix the device-agnostic incremental retry loop after per-device plugin enablement is projected: refresh the one small local enablement file rather than treating its shared snapshot hash as physical bytes. New notes can publish without repeatedly forcing full-vault scans.
+- Keep pending edits visibly pending through preflight and merge checks; replace ambiguous clocks with a sending indicator, keep verified routine checks on the subtle green check, and preserve the last proven checkpoint through a transient incoming-watch reconnect.
+- Continue exposing real divergence, exhausted/repeated connection failures, package holds and safeguards. Folder creation and sync-scope changes invalidate the old check; excluded paths are not counted as unsent vault changes.
+- Add automated desktop/mobile, custom-config-root, repeated incremental receipt/restart, and controller/status regression coverage. These checks do not substitute for final iOS-native acceptance.
+
+This candidate is distributed only through Gib-Sync-Canary; production and user vault installations are not changed by publication.
+
 ## 0.8.68 candidate
 
 - Keep Gib Sync and BRAT as device-local operational dependencies; never synchronize their files, replace their enabled state from another device, or suspend them during package work.

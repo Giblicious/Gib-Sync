@@ -1,4 +1,4 @@
-# Durable synchronization v2 (0.8.68 candidate)
+# Durable synchronization v2 (0.8.69 candidate)
 
 ## Authority and identities
 
