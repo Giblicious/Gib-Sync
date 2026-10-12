@@ -23,16 +23,23 @@ export class ProjectionJournal {
     const history=await this.storage.repoHistory(row);
     if(!history.length)throw new Error("Seafile immutable repository history is empty; readable mutation deferred");
     const visible=await this.storage.statReadable(row,path);
+    let visibleHash:string|null=null;
     if(visible){
       const file=await this.blobs.readable(row,path);
-      try{const hash=file.hash;if(restoreApproved)expected=hash;
+      try{const hash=file.hash;visibleHash=hash;if(restoreApproved)expected=hash;
         await this.preserve(row,path,`observed:${hash}`,file,visible.mtime*1000,expected,target);
         if(hash!==expected&&hash!==target)throw new ReadableChangedError();
       }finally{await file.dispose();}
     }
     const id=randomUUID();
-    this.store.run("INSERT INTO mirror_mutations(id,vault_id,path,snapshot_id,expected_hash,target_hash,history_baseline,state,created_at) VALUES(?,?,?,?,?,?,?,'prepared',?)",id,row.id,path,snapshotId,expected,target,history[0]?.commitId??null,new Date().toISOString());
+    this.store.run("INSERT INTO mirror_mutations(id,vault_id,path,snapshot_id,expected_hash,target_hash,history_baseline,state,created_at,visible_hash) VALUES(?,?,?,?,?,?,?,'prepared',?,?)",id,row.id,path,snapshotId,expected,target,history[0]?.commitId??null,new Date().toISOString(),visibleHash);
     return id;
+  }
+  /** Persist the actual backend acknowledgement, not merely an intended write.
+   * Recovery can preserve uncertain writes without claiming their authorship. */
+  acknowledgeWrite(row:VaultStorageRow,id:string):void{
+    const changed=this.store.run("UPDATE mirror_mutations SET write_acknowledged=1 WHERE id=? AND vault_id=? AND state='prepared'",id,row.id);
+    if(!changed.changes)throw new Error('Projection acknowledgement lost its durable mutation');
   }
   async prepareFolder(row:VaultStorageRow,path:string,snapshotId:string):Promise<string>{
     await this.storage.assertHistoryAvailable(row);
@@ -87,7 +94,7 @@ export class ProjectionJournal {
       let file:StagedFile;try{file=await this.blobs.readable(row,operation.path,revision.commitId);}catch(error){if(error instanceof RevisionMissingError)continue;throw error;}
       try{await this.preserve(row,operation.path,revision.commitId,file,revision.mtime,operation.expected_hash,operation.target_hash,causalOrder,verified);if(file.hash!==operation.expected_hash&&file.hash!==operation.target_hash)changed=true;}finally{await file.dispose();}
     }
-    this.store.run("UPDATE mirror_mutations SET state='captured' WHERE id=?",id);
+    this.store.run("UPDATE mirror_mutations SET state='captured',fence_commit=? WHERE id=?",fenceCommit.commitId,id);
     return changed;
   }
   async recover(row:VaultStorageRow):Promise<void>{for(const operation of this.store.all<{id:string}>("SELECT id FROM mirror_mutations WHERE vault_id=? AND state='prepared' ORDER BY created_at",row.id))await this.finish(row,operation.id);}

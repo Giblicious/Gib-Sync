@@ -198,8 +198,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(!canOperateVault(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
     if(integrityBlockedVaults.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,locked:true};
     if(healthRepairLocks.has(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0};
-    const activeMirror=fresh?mirrorJobs.get(vaultId):undefined;
+    // Background scans must respect the same projection ownership as forced
+    // scans, including when a newer accepted head supersedes the writer.
+    const activeMirror=!fromProjection?mirrorJobs.get(vaultId):undefined;
     if(activeMirror){
+      if(!fresh)return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,mirrorGenerationMismatch:true};
       externalScanRequests.add(vaultId);
       const completed=await Promise.race([activeMirror.then(()=>true),new Promise<boolean>((resolve)=>setTimeout(()=>resolve(false),500))]);
       if(completed){
@@ -238,6 +241,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     let leaseLost=false;const leaseTimer=setInterval(()=>{if(!durableJobs.renew(lease))leaseLost=true;},30_000);leaseTimer.unref();
     const job=projectionTail.then(async()=>{for(let attempt=0;attempt<3;attempt++){
       if(closing||leaseLost||!durableJobs.owns(lease))return;
+      await projectionJournal.recover(storageRow(vaultId));
       let external:ExternalImportResult|null=null;
       if(skipExternalOnce.has(vaultId))skipExternalOnce.delete(vaultId);else external=await ingestExternalChanges(vaultId,false,true);
       if(externalScanRequests.has(vaultId)){
@@ -264,6 +268,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
           mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});
           if(typeof storage.putReadableFile==="function")await storage.putReadableFile(row,entry.path,clear.path);
           else{if(clear.size>2*1024*1024)throw new Error("Storage adapter cannot safely project this large file");await storage.putReadable(row,entry.path,await readFile(clear.path));}
+          projectionJournal.acknowledgeWrite(row,operation);
           const raced=await projectionJournal.finish(row,operation);
           if(!mayContinue()){superseded=true;break;}
           store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at,storage_id=NULL,storage_mtime=NULL",vaultId,entry.path,entry.hash,clear.size,new Date().toISOString());if(raced)throw new ReadableChangedError();

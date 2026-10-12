@@ -19,6 +19,8 @@ import {isReservedSyncPath} from "./reserved-paths.js";
 import {getSnapshotView} from './snapshot-evidence.js';
 import {alignExternalNamespace,type NamespaceCollision} from './external-namespace.js';
 import {externalCreationProofs} from './external-provenance.js';
+import {projectedCreationEntries} from './projection-provenance.js';
+import {conflictCopyPath} from '@gib-sync/protocol';
 
 type MirrorEntry={path:string;hash:string;size:number;updated_at:string;storage_id:string|null;storage_mtime:number|null};
 export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;changedFolders?:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;contained?:boolean;}
@@ -61,14 +63,7 @@ export class ExternalImporter{
   private mergeable(...entries:Array<{size:number}|undefined>):boolean{return entries.every(entry=>!entry||entry.size<=SERVER_INLINE_BYTES);}
 
   private conflictPath(path:string,deviceName:string,mtime:number,occupied:Set<string>):string{
-    const index=path.lastIndexOf("."),slash=path.lastIndexOf("/");
-    const device=deviceName.replace(/[\\/:*?"<>|\[\]#]/g,"-").replace(/\s+/g," ").trim().slice(0,40)||"Unknown device";
-    const date=new Date(Number.isFinite(mtime)&&mtime>0?mtime:Date.now());
-    const stamp=(Number.isNaN(date.getTime())?new Date():date).toISOString().replace("T"," ").replace(/\.\d{3}Z$/," UTC").replace(/:/g,"-");
-    const stem=index>slash?path.slice(0,index):path,extension=index>slash?path.slice(index):"";
-    let candidate=`${stem} (conflict - ${device} - ${stamp})${extension}`,sequence=2;
-    while(occupied.has(candidate))candidate=`${stem} (conflict - ${device} - ${stamp} - ${sequence++})${extension}`;
-    return candidate;
+    return conflictCopyPath(path,deviceName,mtime,occupied);
   }
 
   private wikiLink(path:string):string{
@@ -172,7 +167,9 @@ export class ExternalImporter{
       return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,mirrorGenerationMismatch:!generationCurrent||vault.head_id!==vault.mirror_head_id};
     }
 
+    const projected=projectedCreationEntries(this.store,vaultId,creations);
     const mergeBase=(path:string):MirrorEntry|undefined=>{
+      const partial=projected.get(path);if(partial)return {path,hash:partial.hash,size:partial.size,updated_at:scannedAt,storage_id:null,storage_mtime:partial.mtime/1000};
       if(mirrorCurrent)return mirrored.get(path);
       const completed=completedEntries.get(path);
       return completed?{path:completed.path,hash:completed.hash,size:completed.size,updated_at:generationSnapshot?.createdAt??"",storage_id:null,storage_mtime:completed.mtime/1000}:undefined;
@@ -200,7 +197,7 @@ export class ExternalImporter{
     const deletedPaths=new Set(missingAll.map((entry)=>entry.path)),externalMoves=detectMoves([...mirrored.values()].map((entry)=>({path:entry.path,hash:entry.hash,size:entry.size,mtime:(entry.storage_mtime??0)*1000})),[...nextReadable.values()],"identity")
       .filter((move)=>deletedPaths.has(move.previousPath)&&downloaded.has(move.path)&&completedEntries.get(move.previousPath)?.hash===mirrored.get(move.previousPath)?.hash);
     const externalSources=new Map<string,string>();
-    const externalFile=(path:string,item:(typeof downloaded extends Map<string,infer T>?T:never),source=externalSources.get(item.metadata.path)??item.metadata.path):ManifestEntry=>{const original=completedEntries.get(source),creation=creations.get(item.metadata.path),fresh=creation&&(creation.recreated||!original);return {path,hash:item.hash,size:item.metadata.size,mtime:item.metadata.mtime*1000,...fresh?{fileId:stableUuid(`${vaultId}:seafile-file-create:${creation.commitId}:${creation.originPath}`)}:original?.fileId?{fileId:original.fileId,revision:original.revision}:{}};};
+    const externalFile=(path:string,item:(typeof downloaded extends Map<string,infer T>?T:never),source=externalSources.get(item.metadata.path)??item.metadata.path):ManifestEntry=>{const original=projected.get(item.metadata.path)??completedEntries.get(source),creation=creations.get(item.metadata.path),fresh=creation&&(creation.recreated||!original);return {path,hash:item.hash,size:item.metadata.size,mtime:item.metadata.mtime*1000,...fresh?{fileId:stableUuid(`${vaultId}:seafile-file-create:${creation.commitId}:${creation.originPath}`)}:original?.fileId?{fileId:original.fileId,revision:original.revision}:{}};};
     if(repoBaseline&&missingAll.length&&downloaded.size){
       const renames=await this.storage.readableRenames(row,repoBaseline),destinations=new Map<string,string>();
       for(const source of mirrored.keys()){let destination=source;for(const rename of renames){if(destination===rename.previousPath)destination=rename.path;else if(destination.startsWith(`${rename.previousPath}/`))destination=`${rename.path}${destination.slice(rename.previousPath.length)}`;}if(destination!==source)destinations.set(source,destination);}
@@ -222,7 +219,7 @@ export class ExternalImporter{
       if(confirmed)deleted.push(missing);else deferredDeletions++;
     }
     for(const move of externalMoves)externalSources.set(move.path,move.previousPath);
-    const rawBase=new Map<string,ManifestEntry>();for(const path of new Set([...mirrored.keys(),...downloaded.keys(),...final.keys()])){const baseline=mergeBase(path);if(baseline)rawBase.set(path,{...completedEntries.get(path),path,hash:baseline.hash,size:baseline.size,mtime:0});}
+    const rawBase=new Map<string,ManifestEntry>();for(const path of new Set([...mirrored.keys(),...downloaded.keys(),...final.keys()])){const baseline=mergeBase(path);if(baseline)rawBase.set(path,{...(projected.get(path)??completedEntries.get(path)),path,hash:baseline.hash,size:baseline.size,mtime:0});}
     const rawIncoming=new Map(rawBase);for(const missing of deleted)rawIncoming.delete(missing.path);for(const [path,item] of downloaded)rawIncoming.set(path,externalFile(path,item));
     const namespace=alignExternalNamespace({baseFolders,acceptedFolders:localFolders,externalFolders:remoteFolderEntries,base:[...rawBase.values()],accepted:[...final.values()],external:[...rawIncoming.values()]});final.clear();for(const [path,entry] of namespace.accepted)final.set(path,entry);for(const path of final.keys())occupied.add(path);const finalById=new Map([...final.values()].filter(entry=>entry.fileId).map(entry=>[entry.fileId!,entry]));
     const handledDownloads=new Set<string>(),handledDeletes=new Set<string>(),newBytes=new Map<string,Uint8Array>();let changedFiles=0,deletedFiles=0,conflicts=0;

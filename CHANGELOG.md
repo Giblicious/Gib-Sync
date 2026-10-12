@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.72 candidate
+
+- Preserve the original file identity when a newer accepted head interrupts a partial readable projection. Require path/commit-scoped immutable capture, a backend write acknowledgement, an authenticated fence, and the exact accepted file identity; matching bytes or timing alone are insufficient.
+- Record the pre-write visible hash separately so genuinely independent same-byte creations are not mistaken for server output. Explicit delete/recreate and unrelated commits remain distinct generations.
+- Prevent background imports from racing the active projection writer, and recover durable unfinished captures before importing subsequent readable changes.
+- Share portable, Unicode-safe conflict-copy naming between device and server, bounding generated filenames while preserving complete originals and deterministic collision handling.
+- Add an executable superseded-head/forced-scan race, preserving restart and negative identity-proof regressions. These fixes address a failure caught in the isolated physical Android stress test; they do not certify production readiness.
+
+This candidate remains isolated in Gib-Sync-Canary. Current-user publication and production deployment remain blocked pending physical and server acceptance.
+
 ## 0.8.71 candidate
 
 - Move live-console follow scrolling after a paint boundary instead of forcing a synchronous layout immediately after log-row mutations. User scrolling wins over a queued follow operation.

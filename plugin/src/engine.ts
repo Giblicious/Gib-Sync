@@ -10,6 +10,7 @@ import { AdapterFileChangedError, hashAdapterFile,streamAdapterFile } from "./fi
 import {uploadAdapterFile} from "./outbound-stream";
 import {sha256} from "@noble/hashes/sha2.js";
 import {bytesToHex} from "@noble/hashes/utils.js";
+import {conflictCopyPath} from '@gib-sync/protocol';
 import {VaultInventory} from "./vault-inventory";
 import {IntentJournal,indexedIntentCreates,type IntentKind,type VaultIntent} from "./intent-journal";
 import {OperationJournal,type PreparedBatch} from "./operation-journal";
@@ -600,14 +601,7 @@ export class SyncEngine {
 
   private text(path: string): boolean { return TEXT_EXTENSIONS.has(path.split(".").pop()?.toLowerCase() ?? ""); }
   private conflictPath(path: string, deviceName: string, mtime: number, occupied: Set<string>): string {
-    const index = path.lastIndexOf("."), slash = path.lastIndexOf("/");
-    const device = deviceName.replace(/[\\/:*?"<>|\[\]#]/g, "-").replace(/\s+/g, " ").trim().slice(0, 40) || "Unknown device";
-    const date = new Date(Number.isFinite(mtime) && mtime > 0 ? mtime : Date.now());
-    const stamp = (Number.isNaN(date.getTime()) ? new Date() : date).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC").replace(/:/g, "-");
-    const stem = index > slash ? path.slice(0, index) : path, extension = index > slash ? path.slice(index) : "";
-    let candidate = `${stem} (conflict - ${device} - ${stamp})${extension}`, sequence = 2;
-    while (occupied.has(candidate)) candidate = `${stem} (conflict - ${device} - ${stamp} - ${sequence++})${extension}`;
-    return candidate;
+    return conflictCopyPath(path,deviceName,mtime,occupied);
   }
   private wikiLink(path:string):string {
     const target=path.toLowerCase().endsWith(".md")?path.slice(0,-3):path;

@@ -23,6 +23,11 @@ class MemoryStorage {
   private recordRepo(row:any){const prefix=`read:${row.id}:`,sidecarPrefix=`${row.id}:mutation-fences/`,files=new Map([...this.files].filter(([path])=>path.startsWith(prefix)).map(([path,bytes])=>[path.slice(prefix.length),bytes.slice()])),sidecars=new Map([...this.files].filter(([path])=>path.startsWith(sidecarPrefix)).map(([path,bytes])=>[path.slice(`${row.id}:`.length),bytes.slice()])),folders=[...this.dirs].filter((path)=>path.startsWith(prefix)).map((path)=>path.slice(prefix.length)),signature=sha256(Buffer.from(JSON.stringify({files:[...files].map(([path,bytes])=>[path,sha256(bytes)]),sidecars:[...sidecars].map(([path,bytes])=>[path,sha256(bytes)]),folders})));const records=this.repositoryHistory.get(row.id)??[];if(records[0]?.signature!==signature){records.unshift({commitId:sha256(`${row.id}:${records.length}:${signature}`).slice(0,40),files,sidecars,folders,signature,mtime:Date.now()});this.repositoryHistory.set(row.id,records);}}
   async repoHistory(row:any,until?:string|null){this.recordRepo(row);const records=this.repositoryHistory.get(row.id)!;if(until&&!records.some((item)=>item.commitId===until))throw new Error("history gap");return records.slice(0,until?records.findIndex((item)=>item.commitId===until):1).map((item)=>({commitId:item.commitId,size:0,mtime:item.mtime}));}
   async readableRenames(row:any,baseline:string){await this.repoHistory(row,baseline);return this.explicitRenames;}
+  async readableEvents(row:any,baseline:string){
+    await this.repoHistory(row,baseline);const records=this.repositoryHistory.get(row.id)!,end=records.findIndex(r=>r.commitId===baseline),events:Array<{commitId:string;mtime:number;operation:'created'|'deleted'|'modified';path:string;directory:boolean}>=[];
+    for(let i=end-1;i>=0;i--){const current=records[i],prior=records[i+1];for(const path of new Set([...current.files.keys(),...prior.files.keys()])){const a=prior.files.get(path),b=current.files.get(path);if(a&&b&&sha256(a)===sha256(b))continue;events.push({commitId:current.commitId,mtime:current.mtime,operation:!a?'created':!b?'deleted':'modified',path,directory:false});}for(const path of new Set([...current.folders,...prior.folders])){const a=prior.folders.includes(path),b=current.folders.includes(path);if(a!==b)events.push({commitId:current.commitId,mtime:current.mtime,operation:b?'created':'deleted',path,directory:true});}}
+    return events;
+  }
   async assertHistoryAvailable(){}
   async authenticate(url:string,username:string) { return {url:url.replace(/\/$/,""),username:username.toLowerCase(),token:`token:${username}`}; }
   async libraries() { return [{id:"library-1",name:"Notes"}]; }
@@ -608,7 +613,27 @@ describe("Gib Sync API", () => {
     await app.inject({method:"PUT",url:"/v1/mirror/file?path=original.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":first.id,"x-gib-sync-hash":originalHash},payload:original});await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:first.id}});
     const second=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:first.id,message:"Add note",entries:[...first.entries,{path:"new.md",hash:createdHash,size:created.length,mtime:2}]}})).json();await app.inject({method:"PUT",url:"/v1/mirror/file?path=new.md",headers:{...auth,"content-type":"application/octet-stream","x-gib-sync-snapshot":second.id,"x-gib-sync-hash":createdHash},payload:created});storage.files.set(`read:${setup.vaultId}:new.md`,external);
     expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).statusCode).toBe(200);
-    const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.id).not.toBe(second.id);expect(head.entries.find((entry:any)=>entry.path==="new.md")?.hash).toBe(sha256(external));expect(head.entries.filter((entry:any)=>entry.path.includes("conflict -"))).toHaveLength(0);await app.close();
+    await vi.waitFor(async()=>{const head=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(head.id).not.toBe(second.id);expect(head.entries.find((entry:any)=>entry.path==="new.md")?.hash).toBe(sha256(external));expect(head.entries.filter((entry:any)=>entry.path.includes("conflict -"))).toHaveLength(0);},{timeout:7000,interval:50});await app.close();
+  });
+  it('keeps one file identity when a forced scan and a newer accepted head interrupt projection',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
+    const setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Desktop')})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},key=Buffer.from(setup.vaultKey,'base64url'),clear=Buffer.alloc(8192,19),hash=sha256(clear);
+    expect((await app.inject({method:'PUT',url:`/v1/blobs/${hash}`,headers:{...auth,'content-type':'application/octet-stream'},payload:encryptedFixture(clear,key,hash)})).statusCode).toBe(201);
+    const first=(await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:null,message:'Initial',entries:[{path:'old.bin',hash,size:clear.length,mtime:1}],folders:[]}})).json();
+    expect((await app.inject({method:'POST',url:'/v1/mirror/complete',headers:auth,payload:{snapshotId:first.id}})).statusCode).toBe(200);
+    storage.blockReadableWrites=true;
+    const second=(await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:first.id,message:'New upload',entries:[...first.entries,{path:'upload.bin',hash,size:clear.length,mtime:2}],folders:[]}})).json();
+    const writer=app.inject({method:'PUT',url:'/v1/mirror/file?path=upload.bin',headers:{...auth,'content-type':'application/octet-stream','x-gib-sync-snapshot':second.id,'x-gib-sync-hash':hash},payload:clear});
+    const writing=Promise.resolve(writer);
+    await vi.waitFor(()=>expect(store.one("SELECT 1 FROM mirror_mutations WHERE vault_id=? AND path='upload.bin' AND state='prepared'",setup.vaultId)).toBeDefined());
+    const thirdResponse=await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:second.id,message:'Another change on the same device',entries:second.entries,folders:['Empty']}});expect(thirdResponse.statusCode).toBe(201);const third=thirdResponse.json();
+    const scan=Promise.resolve(app.inject({method:'POST',url:'/v1/external/scan',headers:auth,payload:{}}));
+    await new Promise(resolve=>setTimeout(resolve,10));storage.unblockReadableWrites();
+    expect((await writing).statusCode).toBe(409);expect((await scan).statusCode).toBe(200);
+    await vi.waitFor(async()=>expect((await app.inject({method:'GET',url:'/v1/status',headers:auth})).json().mirrorCurrent).toBe(true),{timeout:7000,interval:50});
+    for(let i=0;i<3;i++){const result=(await app.inject({method:'POST',url:'/v1/external/scan',headers:auth,payload:{}})).json();expect(result.conflicts).toBe(0);const head=(await app.inject({method:'GET',url:'/v1/state',headers:auth})).json().head;expect(head.id).toBe(third.id);expect(head.entries).toHaveLength(2);expect(head.entries.find((e:any)=>e.path==='upload.bin').fileId).toBe(second.entries.find((e:any)=>e.path==='upload.bin').fileId);}
+    expect(store.one("SELECT 1 FROM mirror_mutations WHERE vault_id=? AND path='upload.bin' AND write_acknowledged=1 AND fence_commit IS NOT NULL AND state='captured'",setup.vaultId)).toBeDefined();
+    await app.close();
   });
   it("resumes a partial mirror into a newer large generation without inventing deletions",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);

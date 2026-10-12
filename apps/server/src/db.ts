@@ -119,6 +119,8 @@ export class Store {
     for(const [name,type] of Object.entries({mtime:"INTEGER NOT NULL DEFAULT 0",causal_order:"TEXT NOT NULL DEFAULT ''"}))if(!revisionColumns.has(name))this.db.exec(`ALTER TABLE external_revisions ADD COLUMN ${name} ${type}`);
     const mutationColumns=new Set(this.all<{name:string}>("PRAGMA table_info(mirror_mutations)").map((row)=>row.name));
     if(!mutationColumns.has("kind"))this.db.exec("ALTER TABLE mirror_mutations ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'");
+    for(const [name,type] of Object.entries({visible_hash:'TEXT',write_acknowledged:'INTEGER NOT NULL DEFAULT 0',fence_commit:'TEXT'}))if(!mutationColumns.has(name))this.db.exec(`ALTER TABLE mirror_mutations ADD COLUMN ${name} ${type}`);
+    this.db.exec('CREATE INDEX IF NOT EXISTS mirror_mutation_path ON mirror_mutations(vault_id,path,state)');
     if(!this.all<{name:string}>("PRAGMA table_info(sync_entities)").some(column=>column.name==="mutation_ordinal"))this.db.exec("ALTER TABLE sync_entities ADD COLUMN mutation_ordinal INTEGER NOT NULL DEFAULT 0");
     if(!this.all<{name:string}>("PRAGMA table_info(sync_rollouts)").some(column=>column.name==="canary_start_sequence"))this.db.exec("ALTER TABLE sync_rollouts ADD COLUMN canary_start_sequence INTEGER NOT NULL DEFAULT 0");
     bootstrapSyncState(this);catchUpSyncState(this);
