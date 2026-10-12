@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.63 candidate
+## 0.8.64 candidate
 
 - Complete the shared operation authority, stable file/folder generations, causal moves/recreation and exact crash-retry receipts, including compatible snapshot clients.
 - Persist a yielding content inventory and editor intents; preempt background audits and verify timestamp-preserving changes without repeated full hashing.
@@ -12,6 +12,10 @@
 - Separate BRAT candidate distribution from production updates and publish exactly the tested asset/image bytes through owned workflows.
 
 This candidate does not update existing BRAT installations or production. Physical acceptance and stable publication remain separate release gates.
+
+## 0.8.63 candidate (not published)
+
+- The candidate workflow stopped at a test fixture with inconsistent real/fake clocks; no release assets or image were published. The source tag is retained unchanged. The next candidate uses a coherent fake clock and retains the same content/identity assertions.
 
 ## 0.8.62
 

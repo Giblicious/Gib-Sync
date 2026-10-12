@@ -37,7 +37,7 @@ Missing access or an unperformed check is reported, never marked passed.
 
 ## Automated candidate evidence
 
-The integrated candidate passes 284 server tests and 441 client tests, workspace
+The integrated candidate passes 286 server tests and 441 client tests, workspace
 type checking, production builds and dependency audit (no vulnerabilities).
 Native Windows directory-switch/settings races and finite plugin-lifecycle waits
 are covered; simulated lifecycle results are not physical iPhone evidence.

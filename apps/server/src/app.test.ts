@@ -345,7 +345,9 @@ describe("Gib Sync API", () => {
   it.each(["explicit", "automatic"] as const)("three-way merges simultaneous Obsidian and Seafile text edits (%s scan wins)",async(winner)=>{
     // The real startup scanner fires at 250ms. Control its schedule rather
     // than assume the explicit HTTP request finishes first on every platform.
-    vi.useFakeTimers({toFake:["setTimeout","clearTimeout","setInterval","clearInterval"]});
+    // Durable SQLite due_at uses Date.now. Faking timers alone lets a wake-up
+    // run before that real-clock deadline, so the guarded lease cannot start.
+    vi.useFakeTimers({toFake:["Date","setTimeout","clearTimeout","setInterval","clearInterval"]});
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
     const base=Buffer.from("a\nb\nc\n"),baseHash=sha256(base);
