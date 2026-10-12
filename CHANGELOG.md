@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.70 candidate
+
+- Reduce measured mobile Diagnostics-console hitches: retain unchanged row objects and cached timestamp formatting, group repeated messages in latest-occurrence order, and avoid unnecessary DOM rewrites, row reordering, and scroll-layout work.
+- Preserve warning/error distinctions and the full detailed export. The live view remains bounded, handles coalesced timestamps and cleared logs correctly, and uses text-only rendering.
+- Add regression coverage for unchanged status ticks, repeat aggregation, chronology, retention, and malformed timing/count inputs. Candidate publication does not certify physical responsiveness or server migration; those require independent isolated validation of these exact bytes.
+
+This candidate is distributed only through Gib-Sync-Canary. Stable releases, the production image, and existing users remain unchanged.
+
 ## 0.8.69 candidate
 
 - Fix the device-agnostic incremental retry loop after per-device plugin enablement is projected: refresh the one small local enablement file rather than treating its shared snapshot hash as physical bytes. New notes can publish without repeatedly forcing full-vault scans.
