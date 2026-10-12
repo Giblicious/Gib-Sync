@@ -1,4 +1,4 @@
-# Durable synchronization v2 (0.8.64 candidate)
+# Durable synchronization v2 (0.8.65 candidate)
 
 ## Authority and identities
 
@@ -97,6 +97,12 @@ generations are captured before and after mutation, including historical content
 around folder deletion. Preserved bytes are verified, not assumed from a registry
 row. Seafile lacks HTTP file-write CAS, so immutable repository history is
 required. Missing/disabled history or retention/traversal gaps defer projection.
+Historical absence requires a valid exact commit and complete typed ancestor
+listings; a failed download or unavailable directory is never absence proof.
+Validated historical trees mint storage-scoped file proofs for their original
+entries, avoiding repeated large-directory traversal while retaining exact commit,
+path, object identity and downloaded-size checks. Recovery reuses authenticated
+operation fences instead of adding another repository commit on every retry.
 Proven commit events distinguish delete/recreate even with identical bytes; the
 event vocabulary follows Seafile's
 [official commit-diff API](https://github.com/haiwen/seahub/blob/master/seahub/api2/endpoints/repo_commit.py).

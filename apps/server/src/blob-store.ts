@@ -2,7 +2,7 @@ import {readFile} from "node:fs/promises";
 import {createReadStream} from "node:fs";
 import type {Config} from "./config.js";
 import type {Store} from "./db.js";
-import {StorageMissingError,type SeafileStorage,type VaultStorageRow} from "./seafile.js";
+import {StorageMissingError,type SeafileStorage,type VaultStorageRow,type ReadableStorageEntry} from "./seafile.js";
 import {openJson} from "./security.js";
 import {BlobIntegrityError,PrivateStaging,SERVER_INLINE_BYTES,decryptBlobFile,encryptBlobFile,type StagedFile} from "./security-stream.js";
 export const recoverableBlobFailure=(error:unknown)=>error instanceof BlobIntegrityError||error instanceof StorageMissingError;
@@ -18,8 +18,8 @@ export class VerifiedBlobStore{
   }
   private key(vaultId:string):string{const row=this.store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",vaultId);if(!row)throw new Error("Unknown vault");return openJson<string>(row.wrapped_key,this.config.GIBSYNC_SERVER_SECRET,vaultId);}
   private async smallFallback(bytes:Uint8Array,maximum:number):Promise<StagedFile>{if(bytes.length>SERVER_INLINE_BYTES+29||bytes.length>maximum)throw new Error("Storage adapter must provide bounded file streaming for this content");return this.staging.fromChunks((async function*(){yield bytes;})(),maximum);}
-  async readable(row:VaultStorageRow,path:string,revisionId?:string,signal?:AbortSignal):Promise<StagedFile>{
-    if(revisionId&&typeof this.storage.getReadableRevisionToFile==="function")return this.storage.getReadableRevisionToFile(row,path,revisionId,this.staging,signal);
+  async readable(row:VaultStorageRow,path:string,revisionId?:string,signal?:AbortSignal,evidence?:ReadableStorageEntry):Promise<StagedFile>{
+    if(revisionId&&typeof this.storage.getReadableRevisionToFile==="function")return this.storage.getReadableRevisionToFile(row,path,revisionId,this.staging,signal,evidence);
     if(!revisionId&&typeof this.storage.getReadableToFile==="function")return this.storage.getReadableToFile(row,path,this.staging,signal);
     const metadata=!revisionId&&typeof this.storage.statReadable==="function"?await this.storage.statReadable(row,path):null;if(metadata&&metadata.size>SERVER_INLINE_BYTES)throw new Error("Storage adapter cannot safely stream this file");
     return this.smallFallback(revisionId?await this.storage.getReadableRevision(row,path,revisionId):await this.storage.getReadable(row,path),this.config.MAX_BLOB_BYTES);

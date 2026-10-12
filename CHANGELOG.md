@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.64 candidate
+## 0.8.65 candidate
 
 - Complete the shared operation authority, stable file/folder generations, causal moves/recreation and exact crash-retry receipts, including compatible snapshot clients.
 - Persist a yielding content inventory and editor intents; preempt background audits and verify timestamp-preserving changes without repeated full hashing.
@@ -10,8 +10,13 @@
 - Require trusted-device approval for new quick-code claims; existing paired clients remain compatible.
 - Preserve immutable history and accepted writes during automatic migration, rollback and re-upgrade; gate production v2 activation on signed isolated canary and real iPhone evidence.
 - Separate BRAT candidate distribution from production updates and publish exactly the tested asset/image bytes through owned workflows.
+- Prove historical file absence from complete immutable Seafile directory evidence instead of treating backend download errors as missing content; reuse authenticated recovery fences and bounded historical-tree proofs to avoid retry amplification and quadratic large-folder capture.
 
 This candidate does not update existing BRAT installations or production. Physical acceptance and stable publication remain separate release gates.
+
+## 0.8.64 candidate (canary only; not accepted for production)
+
+- Source CI, exact asset verification and isolated deployment passed. Live testing exposed Seafile's 500 response for files absent from valid historical commits and recovery fence retry amplification. Production publication was withheld; the isolated failed fixture and its history were retained.
 
 ## 0.8.63 candidate (not published)
 

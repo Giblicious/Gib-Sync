@@ -2,19 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach,describe,expect,it } from "vitest";
+import { afterEach,describe,expect,it,vi } from "vitest";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { ProjectionJournal,ReadableChangedError } from "./projection-journal.js";
 import { StorageMissingError,RevisionMissingError,type SeafileStorage,type VaultStorageRow } from "./seafile.js";
-import { decryptVaultBlob,sealJson,sha256 } from "./security.js";
+import { decryptVaultBlob,encryptVaultBlob,sealJson,sha256 } from "./security.js";
 
 const roots:string[]=[],stores:Store[]=[];
 afterEach(()=>{for(const store of stores.splice(0))try{store.db.close();}catch{}for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 class ImmutableBackend{
   files=new Map<string,Uint8Array>();folders:string[]=[];blobs=new Map<string,Uint8Array>();
   commits:Array<{commitId:string;mtime:number;files:Map<string,Uint8Array>;folders:string[];sidecars:Map<string,Uint8Array>}>=[];
-  gap=false;
+  gap=false;fenceWrites=0;
   visibleCommit:string|null=null;
   async assertHistoryAvailable(){if(this.gap)throw new Error("history gap");}
   checkpoint(){const commitId=sha256(String(this.commits.length)).slice(0,40);this.commits.unshift({commitId,mtime:this.commits.length+1,files:new Map([...this.files].map(([path,bytes])=>[path,bytes.slice()])),folders:[...this.folders],sidecars:new Map([...this.blobs].map(([path,bytes])=>[path,bytes.slice()]))});}
@@ -24,11 +24,12 @@ class ImmutableBackend{
   async getReadableRevision(_row:any,path:string,id:string){const bytes=this.commits.find((entry)=>entry.commitId===id)?.files.get(path);if(!bytes)throw new RevisionMissingError();return bytes.slice();}
   async getSidecarRevision(_row:any,path:string,id:string){const bytes=this.commits.find((entry)=>entry.commitId===id)?.sidecars.get(path);if(!bytes)throw new RevisionMissingError();return bytes.slice();}
   async readableRevisionTree(_row:any,path:string,id:string){const revision=this.commits.find((entry)=>entry.commitId===id)!;return {files:[...revision.files].filter(([name])=>name.startsWith(`${path}/`)).map(([path,bytes])=>({path,size:bytes.length,id:sha256(bytes),mtime:1})),folders:revision.folders.filter((name)=>name===path||name.startsWith(`${path}/`))};}
-  async put(_row:any,path:string,bytes:Uint8Array){this.blobs.set(path,bytes.slice());if(path.startsWith("mutation-fences/"))this.checkpoint();}
+  async put(_row:any,path:string,bytes:Uint8Array){this.blobs.set(path,bytes.slice());if(path.startsWith("mutation-fences/")){this.fenceWrites++;this.checkpoint();}}
   async get(_row:any,path:string){const bytes=this.blobs.get(path);if(!bytes)throw new StorageMissingError();return bytes.slice();}
 }
 function fixture(){const root=mkdtempSync(join(tmpdir(),"gib-sync-projection-"));roots.push(root);const store=new Store(root);stores.push(store);const id=randomUUID(),key=Buffer.alloc(32,7).toString("base64url"),config={DATA_DIR:root,GIBSYNC_SERVER_SECRET:"server-secret-that-is-at-least-thirty-two-characters",MAX_BLOB_BYTES:1024*1024} as Config,row={id} as VaultStorageRow;store.run("INSERT INTO vaults(id,name,wrapped_key,created_at) VALUES(?,?,?,?)",id,"Disposable",sealJson(key,config.GIBSYNC_SERVER_SECRET,id),new Date().toISOString());const backend=new ImmutableBackend();backend.checkpoint();return {root,store,id,key,config,row,backend,journal:new ProjectionJournal(config,store,backend as unknown as SeafileStorage)};}
 function mirroredFolders(store:Store,vaultId:string,folders:string[]|undefined){const id=randomUUID(),createdAt=new Date().toISOString(),snapshot={id,vaultId,parentId:null,deviceId:"fixture",deviceName:"Fixture",createdAt,message:"Fixture",entries:[],folders};store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,NULL,?,?,?,?,?)",id,vaultId,"fixture","Fixture",createdAt,"Fixture",JSON.stringify(snapshot));store.run("UPDATE vaults SET mirror_generation_id=? WHERE id=?",id,vaultId);}
+async function racedMutation(){const f=fixture(),old=Buffer.from('old'),target=Buffer.from('target'),external=Buffer.from('external before overwrite');f.backend.files.set('note.md',old);f.backend.checkpoint();const operation=await f.journal.prepare(f.row,'note.md',randomUUID(),sha256(old),sha256(target));f.backend.files.set('note.md',external);f.backend.checkpoint();f.backend.files.set('note.md',target);f.backend.checkpoint();return {...f,operation,external};}
 describe("durable immutable projection journal",()=>{
   it("repairs a missing registered historical blob before claiming its only readable copy is preserved",async()=>{const {store,id,row,key,backend,journal}=fixture(),original=Buffer.from("historical content whose registry outlived its object"),hash=sha256(original);backend.files.set("note.md",original);backend.checkpoint();store.run("INSERT INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",id,hash,original.length,new Date().toISOString());const mutation=await journal.prepare(row,"note.md",randomUUID(),hash,null);expect(mutation).toMatch(/^[a-f0-9-]+$/);expect(Buffer.from(decryptVaultBlob(backend.blobs.get(`blobs/${hash.slice(0,2)}/${hash}.gbs`)!,key,hash))).toEqual(original);expect(store.one<{size:number}>("SELECT size FROM blobs WHERE vault_id=? AND hash=?",id,hash)?.size).toBe(original.length);expect(store.one("SELECT 1 FROM external_revisions WHERE vault_id=? AND hash=?",id,hash)).toBeDefined();});
   it("refuses to overwrite a previously unobserved external revision and archives it first",async()=>{const {store,id,row,key,backend,journal}=fixture(),external=Buffer.from("external text");backend.files.set("note.md",external);backend.checkpoint();await expect(journal.prepare(row,"note.md",randomUUID(),sha256("old"),sha256("new"))).rejects.toBeInstanceOf(ReadableChangedError);const archived=store.one<{hash:string;imported_at:null}>("SELECT hash,imported_at FROM external_revisions WHERE vault_id=?",id)!;expect(archived).toMatchObject({hash:sha256(external),imported_at:null});expect(Buffer.from(decryptVaultBlob(backend.blobs.get(`blobs/${archived.hash.slice(0,2)}/${archived.hash}.gbs`)!,key,archived.hash))).toEqual(external);});
@@ -40,4 +41,47 @@ describe("durable immutable projection journal",()=>{
   it("preserves a newly created external empty root folder rather than classifying it as retired",async()=>{const {store,id,row,backend,journal}=fixture();backend.folders=["New empty folder"];backend.checkpoint();await expect(journal.prepareFolder(row,"New empty folder",randomUUID())).rejects.toBeInstanceOf(ReadableChangedError);expect(store.one<{path:string;imported_at:null}>("SELECT path,imported_at FROM external_folder_revisions WHERE vault_id=?",id)).toMatchObject({path:"New empty folder",imported_at:null});expect(backend.folders).toEqual(["New empty folder"]);expect(store.one("SELECT 1 FROM mirror_mutations WHERE vault_id=?",id)).toBeUndefined();});
   it("uses only the prior verified immutable commit to retire known legacy shells",async()=>{const {store,id,row,backend,journal}=fixture();mirroredFolders(store,id,undefined);backend.folders=["Known legacy shell"];backend.checkpoint();store.run("UPDATE vaults SET mirror_repo_commit=? WHERE id=?",backend.commits[0].commitId,id);backend.folders.push("New empty folder");backend.checkpoint();await expect(journal.prepareFolder(row,"Known legacy shell",randomUUID())).resolves.toEqual(expect.any(String));await expect(journal.prepareFolder(row,"New empty folder",randomUUID())).rejects.toBeInstanceOf(ReadableChangedError);expect(store.one<{path:string;imported_at:null}>("SELECT path,imported_at FROM external_folder_revisions WHERE vault_id=?",id)).toMatchObject({path:"New empty folder",imported_at:null});});
   it("waits for an immutable post-mutation fence before closing delayed history and recovers buried edits after restart",async()=>{const {root,store,id,row,backend,config,journal}=fixture(),old=Buffer.from("old"),target=Buffer.from("target");backend.files.set("note.md",old);backend.checkpoint();const baseline=backend.commits[0].commitId,operation=await journal.prepare(row,"note.md",randomUUID(),sha256(old),sha256(target));backend.files.set("note.md",Buffer.from("buried external revision"));backend.checkpoint();backend.files.set("note.md",target);backend.checkpoint();backend.visibleCommit=baseline;expect(await backend.getReadable(row,"note.md")).toEqual(target);await expect(journal.finish(row,operation)).rejects.toThrow("projection fence is not visible");expect(store.one<{state:string}>("SELECT state FROM mirror_mutations WHERE id=?",operation)?.state).toBe("prepared");expect(store.one("SELECT 1 FROM external_revisions WHERE vault_id=? AND imported_at IS NULL",id)).toBeUndefined();store.db.close();const reopened=new Store(root);stores.push(reopened);backend.visibleCommit=null;await new ProjectionJournal(config,reopened,backend as unknown as SeafileStorage).recover(row);expect(reopened.one<{state:string}>("SELECT state FROM mirror_mutations WHERE id=?",operation)?.state).toBe("captured");expect(reopened.one<{hash:string}>("SELECT hash FROM external_revisions WHERE vault_id=? AND imported_at IS NULL",id)?.hash).toBe(sha256("buried external revision"));});
+  it('does not create more history while waiting for an existing immutable fence to become visible',async()=>{
+    const {root,store,id,row,backend,config,journal,operation,external}=await racedMutation(),baseline=store.one<{history_baseline:string}>('SELECT history_baseline FROM mirror_mutations WHERE id=?',operation)!.history_baseline;
+    backend.visibleCommit=baseline;
+    for(let retry=0;retry<3;retry++)await expect(journal.finish(row,operation)).rejects.toThrow('projection fence is not visible');
+    expect(backend.fenceWrites).toBe(1);const commitCount=backend.commits.length;
+    store.db.close();const reopened=new Store(root);stores.push(reopened);backend.visibleCommit=null;
+    await new ProjectionJournal(config,reopened,backend as unknown as SeafileStorage).recover(row);
+    expect(backend.fenceWrites).toBe(1);expect(backend.commits).toHaveLength(commitCount);
+    expect(reopened.one<{hash:string}>('SELECT hash FROM external_revisions WHERE vault_id=? AND imported_at IS NULL',id)?.hash).toBe(sha256(external));
+    expect(reopened.one<{state:string}>('SELECT state FROM mirror_mutations WHERE id=?',operation)?.state).toBe('captured');
+  });
+  it('reuses an authenticated committed fence after a lost PUT reply and process restart',async()=>{
+    const {root,store,id,row,key,backend,config,journal,operation,external}=await racedMutation(),put=backend.put.bind(backend);let replyLost=false;
+    vi.spyOn(backend,'put').mockImplementation(async(...args)=>{await put(...args);if(args[1].startsWith('mutation-fences/')&&!replyLost){replyLost=true;throw new Error('reply lost after durable PUT');}});
+    await expect(journal.finish(row,operation)).rejects.toThrow('reply lost');expect(backend.fenceWrites).toBe(1);const commitCount=backend.commits.length;
+    store.db.close();const reopened=new Store(root);stores.push(reopened);
+    await new ProjectionJournal(config,reopened,backend as unknown as SeafileStorage).recover(row);
+    expect(backend.fenceWrites).toBe(1);expect(backend.commits).toHaveLength(commitCount);
+    const hash=sha256(external);expect(reopened.one<{state:string}>('SELECT state FROM mirror_mutations WHERE id=?',operation)?.state).toBe('captured');
+    expect(reopened.one<{hash:string}>('SELECT hash FROM external_revisions WHERE vault_id=? AND imported_at IS NULL',id)?.hash).toBe(hash);
+    expect(Buffer.from(decryptVaultBlob(backend.blobs.get(`blobs/${hash.slice(0,2)}/${hash}.gbs`)!,key,hash))).toEqual(external);
+  });
+  it('does not rewrite its fence after immutable capture fails, then preserves the raced original on retry',async()=>{
+    const {store,id,row,key,backend,journal,operation,external}=await racedMutation(),get=backend.getReadableRevision.bind(backend);let fail=true;
+    vi.spyOn(backend,'getReadableRevision').mockImplementation(async(...args)=>{if(fail){fail=false;throw new Error('historical download temporarily unavailable');}return get(...args);});
+    await expect(journal.finish(row,operation)).rejects.toThrow('temporarily unavailable');expect(backend.fenceWrites).toBe(1);const commitCount=backend.commits.length;
+    expect(store.one<{state:string}>('SELECT state FROM mirror_mutations WHERE id=?',operation)?.state).toBe('prepared');
+    expect(await journal.finish(row,operation)).toBe(true);expect(backend.fenceWrites).toBe(1);expect(backend.commits).toHaveLength(commitCount);
+    const hash=sha256(external);expect(Buffer.from(decryptVaultBlob(backend.blobs.get(`blobs/${hash.slice(0,2)}/${hash}.gbs`)!,key,hash))).toEqual(external);
+    expect(store.one<{hash:string}>('SELECT hash FROM external_revisions WHERE vault_id=? AND imported_at IS NULL',id)?.hash).toBe(hash);
+  });
+  it.each(['corrupt','different operation'])('does not replace an existing %s fence',async kind=>{
+    const {store,row,key,backend,journal,operation}=await racedMutation(),wrong=Buffer.from('another operation');
+    backend.blobs.set(`mutation-fences/${operation}.gbs`,kind==='corrupt'?Buffer.from('invalid envelope'):encryptVaultBlob(wrong,key,sha256(wrong)));
+    await expect(journal.finish(row,operation)).rejects.toThrow();expect(backend.fenceWrites).toBe(0);
+    expect(store.one<{state:string}>('SELECT state FROM mirror_mutations WHERE id=?',operation)?.state).toBe('prepared');
+  });
+  it('never treats a transient current-fence failure as permission to create or replace it',async()=>{
+    const {store,row,backend,journal,operation}=await racedMutation(),get=backend.get.bind(backend);
+    vi.spyOn(backend,'get').mockImplementation(async(...args)=>{if(args[1].startsWith('mutation-fences/'))throw new Error('backend unavailable (500)');return get(...args);});
+    await expect(journal.finish(row,operation)).rejects.toThrow('backend unavailable');expect(backend.fenceWrites).toBe(0);
+    expect(store.one<{state:string}>('SELECT state FROM mirror_mutations WHERE id=?',operation)?.state).toBe('prepared');
+  });
 });

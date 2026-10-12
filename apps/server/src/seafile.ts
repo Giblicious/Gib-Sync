@@ -10,6 +10,7 @@ type Repo = { id?: string; repo_id?: string; name: string };
 type SeafileDirEntry={type:string;parent_dir:string;id:string;name:string;mtime:number;size?:number};
 export interface ReadableStorageEntry{path:string;id:string;mtime:number;size:number;}
 export interface ReadableStorageTree{files:ReadableStorageEntry[];folders:string[];}
+interface HistoricalEntryProof{vaultId:string;server:string;repositoryId:string;mirrorRoot:string;commitId:string;absolutePath:string;path:string;id:string;mtime:number;size:number;}
 export interface ReadableRevision{commitId:string;size:number;mtime:number;}
 export interface ReadableEvent{commitId:string;mtime:number;operation:"created"|"modified"|"deleted"|"renamed";path:string;previousPath?:string;directory?:boolean;}
 export class RevisionMissingError extends Error{constructor(){super("File does not exist in this immutable Seafile revision");this.name="RevisionMissingError";}}
@@ -56,6 +57,12 @@ export class SeafileStorage {
   private readonly knownDirectories = new Set<string>();
   private readonly shutdown=new AbortController();
   constructor(private readonly config: Config) {}
+  private readonly revisionDirectories=new Map<string,Map<string,{type:'file'|'dir';id:string;size:number}>>();
+  private revisionDirectoryEntries=0;
+  // Only original entries minted by this storage instance carry authority.
+  // Weak keys release proofs with their bounded (<=200k entry) captured tree;
+  // caller-owned JSON/clones cannot manufacture or widen this capability.
+  readonly #revisionEntryProofs=new WeakMap<ReadableStorageEntry,HistoricalEntryProof>();
   close():void{this.shutdown.abort(new DOMException("Server is shutting down","AbortError"));}
 
   validateUrl(value: string): string {
@@ -79,6 +86,41 @@ export class SeafileStorage {
     catch(error){await reader.cancel().catch(()=>{});throw error;}finally{reader.releaseLock();}
     if(exact){if(size!==exact.length)throw new Error("Seafile content stream ended before its declared size");return exact;}
     const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}return bytes;
+  }
+  private async entryAtRevision(row:VaultStorageRow,path:string,commitId:string,kind:'file'|'dir',signal?:AbortSignal):Promise<{id:string;size:number}>{
+    if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error('Invalid immutable revision');
+    const credentials=this.credentials(row),commit=await this.request(credentials,`/api/v2.1/repos/${row.storage_repo_id}/commits/${commitId}/`,{signal});
+    if(!commit.ok){await commit.body?.cancel();throw new Error(`Seafile immutable commit proof failed (${commit.status})`);}
+    const proof=JSON.parse(new TextDecoder().decode(await this.readBounded(commit,64*1024*1024))) as {commit_info?:unknown;commit_diffs?:unknown};
+    if(!proof.commit_info||typeof proof.commit_info!=='object'||Array.isArray(proof.commit_info)||!Array.isArray(proof.commit_diffs))throw new Error('Seafile returned invalid immutable commit proof');
+    const parts=path.split('/').filter(Boolean);if(!path.startsWith('/')||!parts.length||parts.some(part=>part==='.'||part==='..'||part.includes('\\')))throw new Error('Invalid historical absolute path');
+    let parent='/';
+    for(let index=0;index<parts.length;index++){
+      const entries=await this.directoryAtRevision(row,parent,commitId,signal),entry=entries.get(parts[index]!);if(!entry)throw new RevisionMissingError();
+      if(index===parts.length-1){if(entry.type!==kind)throw new RevisionMissingError();return {id:entry.id,size:entry.size};}
+      if(entry.type!=='dir')throw new RevisionMissingError();parent=`${parent==='/'?'':parent}/${parts[index]}`;
+    }throw new Error('Historical entry proof is incomplete');
+  }
+  private fileAtRevision(row:VaultStorageRow,path:string,commitId:string,signal?:AbortSignal):Promise<{id:string;size:number}>{return this.entryAtRevision(row,path,commitId,'file',signal);}
+  private historicalEntryProof(row:VaultStorageRow,path:string,commitId:string,entry:ReadableStorageEntry):{id:string;size:number}{
+    const proof=this.#revisionEntryProofs.get(entry);
+    if(!proof||proof.vaultId!==row.id||proof.server!==row.storage_url||proof.repositoryId!==row.storage_repo_id||proof.mirrorRoot!==row.mirror_base_path||proof.commitId!==commitId||proof.absolutePath!==path||proof.path!==entry.path||proof.id!==entry.id||proof.mtime!==entry.mtime||proof.size!==entry.size)throw new Error('Historical entry proof is not an original matching immutable-tree capability');
+    return {id:proof.id,size:proof.size};
+  }
+  /** Every traversed directory is root or was explicitly listed as a directory.
+   * A 404 here is unavailable proof, never permission to skip historical data. */
+  private async directoryAtRevision(row:VaultStorageRow,parent:string,commitId:string,signal?:AbortSignal):Promise<Map<string,{type:'file'|'dir';id:string;size:number}>>{
+    const key=`${row.id}|${row.storage_url}|${row.storage_repo_id}|${commitId}|${parent}`,cached=this.revisionDirectories.get(key);if(cached){this.revisionDirectories.delete(key);this.revisionDirectories.set(key,cached);return cached;}
+    const response=await this.request(this.credentials(row),`/api/v2.1/repos/${row.storage_repo_id}/commits/${commitId}/dir/?path=${encodeURIComponent(parent)}`,{signal});
+    if(!response.ok){await response.body?.cancel();throw new Error(`Seafile proven historical directory is unavailable (${response.status})`);}
+    const body=JSON.parse(new TextDecoder().decode(await this.readBounded(response,64*1024*1024))) as {dirent_list?:unknown};
+    if(!body||Object.keys(body).some(key=>key!=='dirent_list')||!Array.isArray(body.dirent_list)||body.dirent_list.length>200_000)throw new Error('Seafile historical directory completeness cannot be verified');
+    const entries=new Map<string,{type:'file'|'dir';id:string;size:number}>();
+    for(const value of body.dirent_list){const entry=value as {type?:unknown;name?:unknown;obj_id?:unknown;size?:unknown;parent_dir?:unknown};if(!entry||!['file','dir'].includes(String(entry.type))||typeof entry.name!=='string'||!entry.name||entry.name==='.'||entry.name==='..'||/[\\/]/.test(entry.name)||entries.has(entry.name)||typeof entry.obj_id!=='string'||!/^[a-f0-9]{40}$/i.test(entry.obj_id)||typeof entry.parent_dir!=='string'||normalizeBasePath(entry.parent_dir)!==parent||entry.type==='file'&&(!Number.isSafeInteger(entry.size)||Number(entry.size)<0))throw new Error('Seafile returned invalid historical directory evidence');entries.set(entry.name,{type:entry.type as 'file'|'dir',id:entry.obj_id,size:entry.type==='file'?Number(entry.size):0});}
+    // Bound both cache cardinality and retained metadata. Large complete
+    // directories remain supported without retaining an unbounded cache.
+    if(entries.size<=20_000){while(this.revisionDirectories.size>=128||this.revisionDirectoryEntries+entries.size>20_000){const oldest=this.revisionDirectories.keys().next().value;if(oldest===undefined)break;this.revisionDirectoryEntries-=this.revisionDirectories.get(oldest)!.size;this.revisionDirectories.delete(oldest);}this.revisionDirectories.set(key,entries);this.revisionDirectoryEntries+=entries.size;}
+    return entries;
   }
 
   async authenticate(urlValue: string, usernameValue: string, password: string): Promise<StorageCredentials> {
@@ -216,15 +258,18 @@ export class SeafileStorage {
     const safe=safeRelativePath(relativePath);await this.putAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,localPath,signal);
   }
 
-  private async downloadAtFile(row:VaultStorageRow,path:string,staging:PrivateStaging,maximumBytes:number,signal?:AbortSignal,revision?:string):Promise<StagedFile>{
+  private async downloadAtFile(row:VaultStorageRow,path:string,staging:PrivateStaging,maximumBytes:number,signal?:AbortSignal,revision?:string,evidence?:ReadableStorageEntry):Promise<StagedFile>{
     const credentials=this.credentials(row),budget=Math.max(120_000,Math.min(2*60*60_000,Math.ceil(maximumBytes/(256*1024))*2000+60_000)),transferSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(budget)]):AbortSignal.timeout(budget);
+    const historical=revision?(evidence?this.historicalEntryProof(row,path,revision,evidence):await this.fileAtRevision(row,path,revision,transferSignal)):null;
+    if(historical&&historical.size>maximumBytes)throw new Error('Historical content exceeds its permitted byte limit');
     const endpoint=revision?`/api2/repos/${row.storage_repo_id}/file/revision/?p=${encodeURIComponent(path)}&commit_id=${encodeURIComponent(revision)}`:`/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`;
     const link=await this.request(credentials,endpoint,{signal:transferSignal});
-    if(revision&&link.status===404)throw new RevisionMissingError();
-    if(link.status===404)throw new StorageMissingError();
-    if(!link.ok)throw new Error(`Seafile content link failed (${link.status})`);
-    const response=await this.request(credentials,await link.json() as string,{signal:transferSignal});
-    if(revision&&response.status===404)throw new RevisionMissingError();
+    if(revision&&!link.ok){await link.body?.cancel();throw new Error(`Seafile proven historical content link failed (${link.status})`);}
+    if(link.status===404){await link.body?.cancel();throw new StorageMissingError();}
+    if(!link.ok){await link.body?.cancel();throw new Error(`Seafile content link failed (${link.status})`);}
+    if(historical&&link.headers.has('oid')&&link.headers.get('oid')!==historical.id){await link.body?.cancel();throw new Error('Seafile historical content identity differs from its immutable proof');}
+    const response=await this.request(credentials,JSON.parse(new TextDecoder().decode(await this.readBounded(link,4096))) as string,{signal:transferSignal});
+    if(revision&&!response.ok){await response.body?.cancel();throw new Error(`Seafile proven historical content stream failed (${response.status})`);}
     if(response.status===404){await response.body?.cancel();throw new StorageMissingError();}
     if(!response.ok||!response.body){await response.body?.cancel();throw new Error(`Seafile content stream failed (${response.status})`);}
     const header=response.headers.get("content-length"),declared=header===null?null:Number(header);
@@ -232,13 +277,13 @@ export class SeafileStorage {
     const reader=response.body.getReader();
     async function* chunks(){let complete=false;try{for(;;){transferSignal.throwIfAborted();const item=await reader.read();if(item.done){complete=true;break;}yield item.value;}}finally{if(!complete)await reader.cancel().catch(()=>{});reader.releaseLock();}}
     let file:StagedFile;try{file=await staging.fromChunks(chunks(),maximumBytes,transferSignal);}catch(error){if(response.body.locked){await reader.cancel().catch(()=>{});reader.releaseLock();}else await response.body.cancel().catch(()=>{});throw error;}
-    if(declared!==null&&file.size!==declared){await file.dispose();throw new Error("Seafile content stream ended before its declared size");}
+    if(declared!==null&&file.size!==declared||historical&&file.size!==historical.size){await file.dispose();throw new Error("Seafile content stream differs from its declared or proven historical size");}
     return file;
   }
 
-  getToFile(row:VaultStorageRow,relativePath:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{return this.downloadAtFile(row,`${this.root(row)}/${safeRelativePath(relativePath)}`,staging,this.config.MAX_BLOB_BYTES+1024,signal);}
+  getToFile(row:VaultStorageRow,relativePath:string,staging:PrivateStaging,signal?:AbortSignal,maximumBytes=this.config.MAX_BLOB_BYTES+1024):Promise<StagedFile>{return this.downloadAtFile(row,`${this.root(row)}/${safeRelativePath(relativePath)}`,staging,Math.min(maximumBytes,this.config.MAX_BLOB_BYTES+1024),signal);}
   getReadableToFile(row:VaultStorageRow,relativePath:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{const safe=safeRelativePath(relativePath);return this.downloadAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,staging,this.config.MAX_BLOB_BYTES,signal);}
-  getReadableRevisionToFile(row:VaultStorageRow,relativePath:string,commitId:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid immutable revision");const safe=safeRelativePath(relativePath);return this.downloadAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,staging,this.config.MAX_BLOB_BYTES,signal,commitId);}
+  getReadableRevisionToFile(row:VaultStorageRow,relativePath:string,commitId:string,staging:PrivateStaging,signal?:AbortSignal,evidence?:ReadableStorageEntry):Promise<StagedFile>{if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid immutable revision");const safe=safeRelativePath(relativePath);return this.downloadAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,staging,this.config.MAX_BLOB_BYTES,signal,commitId,evidence);}
 
   async ensureReadableFolder(row:VaultStorageRow,relativePath:string):Promise<void>{
     const safe=safeRelativePath(relativePath);await this.ensureDirectory(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`);
@@ -319,13 +364,11 @@ export class SeafileStorage {
   }
   async readableRevisionTree(row:VaultStorageRow,relativePath:string,commitId:string):Promise<ReadableStorageTree>{
     const root=`${this.readableRoot(row)}/${safeRelativePath(relativePath)}`||`/${relativePath}`,pending=[root],files:ReadableStorageEntry[]=[],folders:string[]=[],readablePrefix=`${this.readableRoot(row)}/`;
+    try{await this.entryAtRevision(row,root,commitId,'dir');}catch(error){if(error instanceof RevisionMissingError)return {files,folders};throw error;}
     while(pending.length){
-      const parent=pending.shift()!,response=await this.request(this.credentials(row),`/api/v2.1/repos/${row.storage_repo_id}/commits/${commitId}/dir/?path=${encodeURIComponent(parent)}`);
-      if(response.status===404)continue;if(!response.ok)throw new Error(`Seafile historical directory listing failed (${response.status}); folder mutation remains unverified`);
-      const body=await response.json() as {dirent_list?:Array<{type:string;name:string;obj_id:string;size:number;mtime?:number}>};
-      if(!Array.isArray(body.dirent_list))throw new Error("Seafile returned an invalid historical directory listing");
+      const parent=pending.pop()!,entries=await this.directoryAtRevision(row,parent,commitId);
       if(parent===root)folders.push(safeRelativePath(relativePath));
-      for(const entry of body.dirent_list){const full=`${parent.replace(/\/+$/,"")}/${entry.name}`,path=safeRelativePath(full.slice(readablePrefix.length));if(entry.type==="dir"){folders.push(path);pending.push(full);}else if(entry.type==="file")files.push({path,id:entry.obj_id,size:entry.size,mtime:entry.mtime??0});}
+      for(const [name,entry] of entries){const full=`${parent.replace(/\/+$/,"")}/${name}`,path=safeRelativePath(full.slice(readablePrefix.length));if(entry.type==="dir"){folders.push(path);pending.push(full);}else {const file={path,id:entry.id,size:entry.size,mtime:0};this.#revisionEntryProofs.set(file,{vaultId:row.id,server:row.storage_url,repositoryId:row.storage_repo_id,mirrorRoot:row.mirror_base_path,commitId,absolutePath:full,...file});files.push(file);}}
       if(files.length+folders.length>200_000)throw new Error("Historical folder traversal exceeded its safety budget");
     }
     return {files,folders};
@@ -367,23 +410,27 @@ export class SeafileStorage {
   async getReadableRevision(row:VaultStorageRow,relativePath:string,commitId:string):Promise<Uint8Array>{
     if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid Seafile revision identifier");
     const safe=safeRelativePath(relativePath),path=`${this.readableRoot(row)}/${safe}`||`/${safe}`,credentials=this.credentials(row);
+    const historical=await this.fileAtRevision(row,path,commitId);
+    if(historical.size>this.config.MAX_BLOB_BYTES)throw new Error('Seafile historical content exceeds its permitted byte limit');
     const link=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/file/revision/?p=${encodeURIComponent(path)}&commit_id=${commitId}`);
-    if(link.status===404)throw new RevisionMissingError();
-    if(!link.ok)throw new Error(`Seafile revision link failed (${link.status})`);
-    const response=await this.request(credentials,await link.json() as string);
-    if(!response.ok)throw new Error(`Seafile revision download failed (${response.status})`);
-    return this.readBounded(response,this.config.MAX_BLOB_BYTES);
+    if(!link.ok){await link.body?.cancel();throw new Error(`Seafile revision link failed (${link.status})`);}
+    if(link.headers.has('oid')&&link.headers.get('oid')!==historical.id){await link.body?.cancel();throw new Error('Seafile historical content identity differs from its immutable proof');}
+    const response=await this.request(credentials,JSON.parse(new TextDecoder().decode(await this.readBounded(link,4096))) as string);
+    if(!response.ok){await response.body?.cancel();throw new Error(`Seafile revision download failed (${response.status})`);}
+    const bytes=await this.readBounded(response,this.config.MAX_BLOB_BYTES);if(bytes.byteLength!==historical.size)throw new Error('Seafile historical bytes differ from their immutable size proof');return bytes;
   }
 
   async getSidecarRevision(row:VaultStorageRow,relativePath:string,commitId:string):Promise<Uint8Array>{
     if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid Seafile revision identifier");
     const path=`${this.root(row)}/${safeRelativePath(relativePath)}`,credentials=this.credentials(row);
+    const historical=await this.fileAtRevision(row,path,commitId);
+    if(historical.size>4096)throw new Error('Seafile immutable sidecar exceeds its permitted size');
     const link=await this.request(credentials,`/api2/repos/${row.storage_repo_id}/file/revision/?p=${encodeURIComponent(path)}&commit_id=${commitId}`);
-    if(link.status===404)throw new RevisionMissingError();
-    if(!link.ok)throw new Error(`Seafile sidecar revision link failed (${link.status})`);
-    const response=await this.request(credentials,await link.json() as string);
-    if(!response.ok)throw new Error(`Seafile sidecar revision download failed (${response.status})`);
-    return this.readBounded(response,4096);
+    if(!link.ok){await link.body?.cancel();throw new Error(`Seafile sidecar revision link failed (${link.status})`);}
+    if(link.headers.has('oid')&&link.headers.get('oid')!==historical.id){await link.body?.cancel();throw new Error('Seafile historical sidecar identity differs from its immutable proof');}
+    const response=await this.request(credentials,JSON.parse(new TextDecoder().decode(await this.readBounded(link,4096))) as string);
+    if(!response.ok){await response.body?.cancel();throw new Error(`Seafile sidecar revision download failed (${response.status})`);}
+    const bytes=await this.readBounded(response,4096);if(bytes.byteLength!==historical.size)throw new Error('Seafile sidecar bytes differ from their immutable size proof');return bytes;
   }
 
   async listReadableTree(row:VaultStorageRow):Promise<ReadableStorageTree>{

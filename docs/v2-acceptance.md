@@ -37,10 +37,12 @@ Missing access or an unperformed check is reported, never marked passed.
 
 ## Automated candidate evidence
 
-The integrated candidate passes 286 server tests and 441 client tests, workspace
+The integrated candidate passes 363 server tests and 441 client tests, workspace
 type checking, production builds and dependency audit (no vulnerabilities).
 Native Windows directory-switch/settings races and finite plugin-lifecycle waits
 are covered; simulated lifecycle results are not physical iPhone evidence.
+Historical Seafile absence proofs, authenticated retry fences and a 20,001-file
+linear capture regression are covered, including forged/mutated proof rejection.
 A rehearsal on a private verified production backup preserves the original
 snapshots and protected records, with integrity verified using patched SQLite
 3.53.3. Public source inspection found no personal server endpoints or paths.

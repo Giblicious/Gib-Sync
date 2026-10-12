@@ -5,6 +5,8 @@ import { RevisionMissingError,type SeafileStorage,type VaultStorageRow } from ".
 import { decryptVaultBlob,encryptVaultBlob,openJson,sha256 } from "./security.js";
 import {VerifiedBlobStore,recoverableBlobFailure} from "./blob-store.js";
 import type {StagedFile} from "./security-stream.js";
+import {readFile} from 'node:fs/promises';
+import {StorageMissingError} from './seafile.js';
 
 export class ReadableChangedError extends Error {constructor(){super("Readable content changed during projection; importing the preserved revision before retry");this.name="ReadableChangedError";}}
 /** An external backend without CAS requires durable revision capture, not a fake lock. */
@@ -46,7 +48,7 @@ export class ProjectionJournal {
     // the current pre-delete baseline cannot authorize deleting a new folder.
     if(generation&&!Array.isArray(generation.folders)&&vault?.mirror_repo_commit){const prior=await this.storage.readableRevisionTree(row,path,vault.mirror_repo_commit);for(const folder of prior.folders)addFolder(folder);for(const entry of prior.files){const parent=entry.path.split("/").slice(0,-1).join("/");if(parent)addFolder(parent);}}
     let changed=false;const now=new Date().toISOString(),causalOrder=`${now}:000000`,verified=new Set<string>();
-    for(const entry of tree.files){const expected=this.store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",row.id,entry.path)?.hash??null;if(entry.size>this.config.MAX_BLOB_BYTES)throw new Error("Historical folder file exceeds the configured size limit");const file=await this.blobs.readable(row,entry.path,history[0].commitId);try{await this.preserve(row,entry.path,history[0].commitId,file,history[0].mtime,expected,null,causalOrder,verified);if(file.hash!==expected)changed=true;}finally{await file.dispose();}}
+    for(const entry of tree.files){const expected=this.store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",row.id,entry.path)?.hash??null;if(entry.size>this.config.MAX_BLOB_BYTES)throw new Error("Historical folder file exceeds the configured size limit");const file=await this.blobs.readable(row,entry.path,history[0].commitId,undefined,entry);try{await this.preserve(row,entry.path,history[0].commitId,file,history[0].mtime,expected,null,causalOrder,verified);if(file.hash!==expected)changed=true;}finally{await file.dispose();}}
     for(const folder of tree.folders)if(!knownFolders.has(folder)){this.store.run("INSERT OR IGNORE INTO external_folder_revisions(vault_id,path,revision_id,causal_order) VALUES(?,?,?,?)",row.id,folder,history[0].commitId,causalOrder);changed=true;}
     if(changed)throw new ReadableChangedError();
     const id=randomUUID();this.store.run("INSERT INTO mirror_mutations(id,vault_id,path,snapshot_id,history_baseline,state,created_at,kind) VALUES(?,?,?,?,?,'prepared',?,'folder')",id,row.id,path,snapshotId,history[0].commitId,new Date().toISOString());return id;
@@ -60,7 +62,13 @@ export class ProjectionJournal {
     // history, and any later projection creates its own new operation UUID.
     const fence=Buffer.from(`gib-sync-mutation-fence-v1:${id}`),fenceHash=sha256(fence),fencePath=`mutation-fences/${id}.gbs`,wrapped=this.store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",row.id)!;
     const key=openJson<string>(wrapped.wrapped_key,this.config.GIBSYNC_SERVER_SECRET,row.id);
-    await this.storage.put(row,fencePath,encryptVaultBlob(fence,key,fenceHash));
+    let currentFence:Uint8Array|null=null;
+    try{
+      if(typeof this.storage.getToFile==='function'){const file=await this.storage.getToFile(row,fencePath,this.blobs.staging,undefined,4096);try{if(file.size>4096)throw new Error('Projection fence exceeds its permitted size');currentFence=await readFile(file.path);}finally{await file.dispose();}}
+      else {currentFence=await this.storage.get(row,fencePath);if(currentFence.byteLength>4096)throw new Error('Projection fence exceeds its permitted size');}
+    }catch(error){if(!(error instanceof StorageMissingError))throw error;}
+    if(currentFence){if(!Buffer.from(decryptVaultBlob(currentFence,key,fenceHash)).equals(fence))throw new Error('Existing projection fence failed authentication');}
+    else await this.storage.put(row,fencePath,encryptVaultBlob(fence,key,fenceHash));
     const fenceCommit=(await this.storage.repoHistory(row))[0];if(!fenceCommit)throw new Error("Seafile immutable projection fence is not visible yet; mutation remains prepared");
     let archivedFence:Uint8Array;try{archivedFence=await this.storage.getSidecarRevision(row,fencePath,fenceCommit.commitId);}catch(error){if(error instanceof RevisionMissingError)throw new Error("Seafile immutable projection fence is not visible yet; mutation remains prepared");throw error;}
     if(!Buffer.from(decryptVaultBlob(archivedFence,key,fenceHash)).equals(fence))throw new Error("Seafile immutable projection fence failed integrity verification");
@@ -72,7 +80,7 @@ export class ProjectionJournal {
       if(operation.kind==="folder"){
         const tree=await this.storage.readableRevisionTree(row,operation.path,revision.commitId);
         for(const path of tree.folders){this.store.run("INSERT OR IGNORE INTO external_folder_revisions(vault_id,path,revision_id,causal_order) VALUES(?,?,?,?)",row.id,path,revision.commitId,causalOrder);changed=true;}
-        for(const entry of tree.files){if(entry.size>this.config.MAX_BLOB_BYTES)throw new Error("Historical folder file exceeds the configured size limit");const file=await this.blobs.readable(row,entry.path,revision.commitId);try{await this.preserve(row,entry.path,revision.commitId,file,revision.mtime,null,null,causalOrder,verified);changed=true;}finally{await file.dispose();}}
+        for(const entry of tree.files){if(entry.size>this.config.MAX_BLOB_BYTES)throw new Error("Historical folder file exceeds the configured size limit");const file=await this.blobs.readable(row,entry.path,revision.commitId,undefined,entry);try{await this.preserve(row,entry.path,revision.commitId,file,revision.mtime,null,null,causalOrder,verified);changed=true;}finally{await file.dispose();}}
         continue;
       }
       if(revision.size>this.config.MAX_BLOB_BYTES)throw new Error("Seafile revision exceeds the configured content limit");
