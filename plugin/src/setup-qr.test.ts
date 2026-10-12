@@ -1,10 +1,13 @@
 import {describe,expect,it} from "vitest";
 import jsQR from "jsqr";
-import {normalizeSetupServer,parseSetupInvite,parseSetupInviteUrl,renderSetupQr,setupInviteUrl,setupQrMatrix} from "./setup-qr";
+import {normalizeSetupServer,parseSetupInvite,parseSetupInviteUrl,renderSetupQr,setupInviteUrl,setupQrInviteUrl,setupQrMatrix} from "./setup-qr";
 
 const now=1_800_000_000_000,expires=now+60_000,server="https://sync.example.test/disposable-prefix";
 const params={action:"gib-sync-setup",server,code:"01234",expires:String(expires)};
 describe("temporary QR setup invitations",()=>{
+  it("allows a high-entropy QR for ten minutes without extending numeric invitations",()=>{const token="a".repeat(43),expiry=now+600_000,url=setupQrInviteUrl(server,token,expiry,now);expect(parseSetupInviteUrl(url,now)).toEqual({server,token,expiresAt:expiry});expect(parseSetupInviteUrl(url,now-1000)).toEqual({server,token,expiresAt:expiry});expect(parseSetupInvite({server,token,expires:String(expiry)},now+599_999)).toEqual({server,token,expiresAt:expiry});expect(()=>parseSetupInviteUrl(url,expiry)).toThrow();expect(()=>setupInviteUrl(server,"12345",expiry,now)).toThrow();expect(()=>setupQrInviteUrl(server,token,expiry+120_001,now)).toThrow();});
+  it.each(["short","a".repeat(42),"a".repeat(44),"!".repeat(43)])("rejects a malformed QR token %s",token=>expect(()=>parseSetupInvite({server,token,expires:String(now+600_000)},now)).toThrow());
+  it("rejects mixed, duplicate and inherited QR tokens",()=>{const token="a".repeat(43),expiry=now+600_000;expect(()=>parseSetupInvite({...params,token},now)).toThrow();expect(()=>parseSetupInvite(Object.assign(Object.create({token}),{server,expires:String(expiry)}),now)).toThrow();expect(()=>parseSetupInvite(Object.assign(Object.create({code:token}),{server,token:null,expires:String(expiry)}),now)).toThrow();for(const query of [`token=${token}&token=${token}`,`token=${token}&code=12345`])expect(()=>parseSetupInviteUrl(`${server}/setup?${query}&expires=${expiry}`,now)).toThrow();});
   it("preserves leading zeroes and proxy prefixes without encoding credentials",()=>{
     expect(parseSetupInvite(params,now)).toEqual({server,code:"01234",expiresAt:expires});
     const url=setupInviteUrl(server+"/","01234",expires,now);expect(url).toBe(`${server}/setup?code=01234&expires=${expires}`);

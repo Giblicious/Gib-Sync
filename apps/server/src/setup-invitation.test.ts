@@ -1,12 +1,13 @@
 import Fastify from 'fastify';
 import {createHash} from 'node:crypto';
 import {describe,expect,it} from 'vitest';
-import {invitationSetupUrl,registerSetupInvitation,renderSetupInvitation} from './setup-invitation.js';
+import {invitationSetupUrl,qrInvitationSetupUrl,registerSetupInvitation,renderSetupInvitation} from './setup-invitation.js';
 
 const now=1_790_000_000_000,expires=now+60_000,server='https://sync.example.test/private-validation/prefix///';
 const valid=`/setup?code=00123&expires=${expires}`;
 const anchor=(html:string)=>html.match(/<a href="([^"]+)">/)?.[1]?.replaceAll('&amp;','&');
 describe('HTTPS Obsidian setup invitation',()=>{
+  it('supports a ten-minute token invitation while retaining short-code bounds',()=>{const token='a'.repeat(43),expiry=now+600_000,url=qrInvitationSetupUrl(server,token,new Date(expiry).toISOString())!;expect(url).toContain(`token=${token}&expires=${expiry}`);const action=new URL(anchor(renderSetupInvitation(server,new URL(url).pathname+new URL(url).search,now))!);expect(action.searchParams.get('token')).toBe(token);expect(action.searchParams.has('code')).toBe(false);expect(anchor(renderSetupInvitation(server,`/setup?token=${token}&expires=${expiry}`,expiry))).toBeUndefined();expect(anchor(renderSetupInvitation(server,`/setup?token=${token}&expires=${expiry+1}`,now))).toBeUndefined();expect(anchor(renderSetupInvitation(server,`/setup?token=${token}&code=12345&expires=${expiry}`,now))).toBeUndefined();expect(anchor(renderSetupInvitation(server,`/setup?token=${token}&token=${token}&expires=${expiry}`,now))).toBeUndefined();});
   it('preserves the configured proxy prefix and exact pairing expiry without secrets',()=>{
     expect(invitationSetupUrl(server,'00123',new Date(expires).toISOString())).toBe(`https://sync.example.test/private-validation/prefix/setup?code=00123&expires=${expires}`);
     const target=new URL(anchor(renderSetupInvitation(server,valid,now))!);

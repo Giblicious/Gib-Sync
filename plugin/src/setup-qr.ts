@@ -20,7 +20,7 @@
 import QRCode from "qrcode";
 
 export const SETUP_PROTOCOL_ACTION="gib-sync-setup";
-export interface SetupInvite {server:string;code:string;expiresAt:number;}
+export interface SetupInvite {server:string;code?:string;token?:string;expiresAt:number;}
 const failure=():never=>{throw new Error("This setup QR is invalid or expired. Ask the connected device for a fresh QR.");};
 
 /** Only public HTTPS or explicit loopback development endpoints are eligible.
@@ -33,35 +33,40 @@ export function normalizeSetupServer(value:string):string{
   return `${url.origin}${url.pathname.replace(/\/+$/,"")}`;
 }
 
-function invite(server:unknown,code:unknown,expires:unknown,now:number):SetupInvite{
-  if(typeof server!=="string"||typeof code!=="string"||!/^\d{5}$/.test(code)||typeof expires!=="string"||!/^\d{13}$/.test(expires)||!Number.isFinite(now))return failure();
-  const expiresAt=Number(expires);if(!Number.isSafeInteger(expiresAt)||expiresAt<=now||expiresAt>now+120_000)return failure();
-  return {server:normalizeSetupServer(server),code,expiresAt};
+function invite(server:unknown,value:unknown,expires:unknown,now:number,kind:"code"|"token"="code"):SetupInvite{
+  if(typeof server!=="string"||typeof value!=="string"||!(kind==="code"?/^\d{5}$/:/^[-_A-Za-z0-9]{43}$/).test(value)||typeof expires!=="string"||!/^\d{13}$/.test(expires)||!Number.isFinite(now))return failure();
+  // Bounded clock tolerance only; redemption is still limited to ten minutes by the server.
+  const expiresAt=Number(expires);if(!Number.isSafeInteger(expiresAt)||expiresAt<=now||expiresAt>now+(kind==="token"?720_000:120_000))return failure();
+  return {server:normalizeSetupServer(server),[kind]:value,expiresAt};
 }
 
 /** Obsidian decodes protocol parameters once. No network or settings mutation
  * occurs here; the receiver must review its vault/server and press Connect. */
 export function parseSetupInvite(params:Record<string,unknown>,now=Date.now()):SetupInvite{
-  if(!params||typeof params!=="object"||Array.isArray(params)||["server","code","expires"].some(key=>!Object.hasOwn(params,key))||Object.keys(params).some(key=>!["action","server","code","expires","vault"].includes(key)))return failure();
+  if(!params||typeof params!=="object"||Array.isArray(params)||["server","expires"].some(key=>!Object.hasOwn(params,key))||Object.hasOwn(params,"code")===Object.hasOwn(params,"token")||Object.keys(params).some(key=>!["action","server","code","token","expires","vault"].includes(key)))return failure();
   if(params.action!==undefined&&params.action!==SETUP_PROTOCOL_ACTION||params.vault!==undefined&&typeof params.vault!=="string")return failure();
-  return invite(params.server,params.code,params.expires,now);
+  const kind=Object.hasOwn(params,"token")?"token":"code";return invite(params.server,params[kind],params.expires,now,kind);
 }
 
 export function setupInviteUrl(server:string,code:string,expiresAt:number,now=Date.now()):string{
   const parsed=invite(server,code,String(expiresAt),now);
-  const url=new URL(`${parsed.server}/setup`);url.searchParams.set("code",parsed.code);url.searchParams.set("expires",String(parsed.expiresAt));return url.toString();
+  const url=new URL(`${parsed.server}/setup`);url.searchParams.set("code",parsed.code!);url.searchParams.set("expires",String(parsed.expiresAt));return url.toString();
+}
+export function setupQrInviteUrl(server:string,token:string,expiresAt:number,now=Date.now()):string{
+  const parsed=invite(server,token,String(expiresAt),now,"token");const url=new URL(`${parsed.server}/setup`);url.searchParams.set("token",parsed.token!);url.searchParams.set("expires",String(parsed.expiresAt));return url.toString();
 }
 
-/** The HTTPS QR contains no vault key, password, device token or approval ticket. */
+/** The HTTPS QR carries only an expiring invitation, never an access credential. */
 export function parseSetupInviteUrl(value:string,now=Date.now()):SetupInvite{
   if(typeof value!=="string"||value.length>4096||/[\u0000-\u0020\u007f\\]/.test(value))return failure();
   let url:URL;try{url=new URL(value);}catch{return failure();}
-  if(url.username||url.password||url.hash||!url.pathname.endsWith("/setup")||[...url.searchParams.keys()].some(key=>!["code","expires"].includes(key))||url.searchParams.getAll("code").length!==1||url.searchParams.getAll("expires").length!==1)return failure();
-  return invite(`${url.origin}${url.pathname.slice(0,-"/setup".length)}`,url.searchParams.get("code"),url.searchParams.get("expires"),now);
+  const kind=url.searchParams.has("token")?"token":"code";
+  if(url.username||url.password||url.hash||!url.pathname.endsWith("/setup")||[...url.searchParams.keys()].some(key=>![kind,"expires"].includes(key))||url.searchParams.getAll(kind).length!==1||url.searchParams.getAll("expires").length!==1)return failure();
+  return invite(`${url.origin}${url.pathname.slice(0,-"/setup".length)}`,url.searchParams.get(kind),url.searchParams.get("expires"),now,kind);
 }
 
 export function setupQrMatrix(value:string,now=Date.now()):{size:number;data:Uint8Array}{
-  const parsed=parseSetupInviteUrl(value,now),canonical=setupInviteUrl(parsed.server,parsed.code,parsed.expiresAt,now);
+  const parsed=parseSetupInviteUrl(value,now),canonical=parsed.token?setupQrInviteUrl(parsed.server,parsed.token,parsed.expiresAt,now):setupInviteUrl(parsed.server,parsed.code!,parsed.expiresAt,now);
   const modules=QRCode.create(canonical,{errorCorrectionLevel:"M"}).modules;
   if(modules.size<21||modules.size>177||modules.data.length!==modules.size**2)return failure();
   return {size:modules.size,data:modules.data};

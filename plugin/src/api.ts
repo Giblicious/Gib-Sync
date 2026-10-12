@@ -29,7 +29,7 @@ function errorBody(response:{json:unknown}):any{
   try{return response.json;}catch{return null;}
 }
 
-export const CLIENT_VERSION="0.8.66";
+export const CLIENT_VERSION="0.8.67";
 export interface ContentUploadState{id:string;hash:string;size:number;offset:number;chunkBytes:number;complete:boolean;processing?:boolean;processingId?:string;stage?:"verifying"|"uploading"|"checking"|"waiting";}
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
@@ -111,6 +111,7 @@ export class GibSyncApi {
   mirrorComplete(snapshotId:string){return this.json<MirrorCompleteResponse>("POST","/v1/mirror/complete",{snapshotId},this.settings().deviceToken);}
   async createPairing() { const pairing=await this.json<QuickCodePairing&{requiresConfirmation?:boolean}>("POST", "/v1/pairings", {requireConfirmation:true}, this.settings().deviceToken);if(pairing.requiresConfirmation!==true)throw new Error("The server must be updated before secure quick-code setup is available. Existing synchronization is unaffected.");return pairing; }
   claimQuickCode(server:string,code:string,deviceName:string){return this.json<QuickCodeClaim|PendingDeviceClaim>("POST","/v1/pairings/claim-code",{code,deviceName},undefined,server);}
+  claimQrInvite(server:string,token:string,deviceName:string){return this.json<PendingDeviceClaim>("POST","/v1/pairings/claim-qr",{token,deviceName},undefined,server);}
   pendingDeviceClaims(){return this.json<TrustedDeviceRequest[]>("GET","/v1/pairings/pending",undefined,this.settings().deviceToken);}
   decideDeviceClaim(id:string,approved:boolean){return this.json<{ok:boolean}>("POST",`/v1/pairings/requests/${encodeURIComponent(id)}/decision`,{approved},this.settings().deviceToken);}
   pollDeviceClaim(server:string,ticket:string){return this.json<{status:"pending";expiresAt:string}|{status:"approved";pairingId:string;envelope:string}>("POST","/v1/pairings/poll",{ticket},undefined,server);}

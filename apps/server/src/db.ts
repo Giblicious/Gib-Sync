@@ -88,7 +88,9 @@ export class Store {
     const pairingColumns=new Set(this.all<{name:string}>("PRAGMA table_info(pairings)").map((row)=>row.name));
     if(!pairingColumns.has("quick_code_hash"))this.db.exec("ALTER TABLE pairings ADD COLUMN quick_code_hash TEXT");
     if(!pairingColumns.has("requires_confirmation"))this.db.exec("ALTER TABLE pairings ADD COLUMN requires_confirmation INTEGER NOT NULL DEFAULT 0");
+    if(!pairingColumns.has("qr_expires_at"))this.db.exec("ALTER TABLE pairings ADD COLUMN qr_expires_at TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS pairing_quick_code ON pairings(quick_code_hash)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS pairing_secret ON pairings(secret_hash)");
     this.db.exec("CREATE INDEX IF NOT EXISTS vault_storage_location ON vaults(storage_url,storage_repo_id,storage_base_path)");
     const mirrorColumns=new Set(this.all<{name:string}>("PRAGMA table_info(mirror_entries)").map((row)=>row.name));
     if(!mirrorColumns.has("storage_id"))this.db.exec("ALTER TABLE mirror_entries ADD COLUMN storage_id TEXT");

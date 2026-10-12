@@ -37,7 +37,7 @@ import type {OperationBatch,FolderEntry} from "@gib-sync/protocol";
 import {registerConfigRoots,normalizeAliasEntries,normalizeAliasFolders,aliasCollisionRecords} from "./config-roots.js";
 import {CanaryScope} from "./canary-scope.js";
 import {getSnapshotView} from './snapshot-evidence.js';
-import {invitationHeaders,invitationSetupUrl,registerSetupInvitation} from './setup-invitation.js';
+import {invitationHeaders,invitationSetupUrl,qrInvitationSetupUrl,registerSetupInvitation} from './setup-invitation.js';
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -75,7 +75,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   // Trust only the directly connected proxy. Client-supplied forwarding chains
   // must never provide unlimited independent pairing identities.
-  const app = Fastify({ trustProxy:(address:string,hop:number)=>hop===0&&/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(address.replace(/^::ffff:/,"")),logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 64*1024*1024 });
+  const app = Fastify({ trustProxy:(address:string,hop:number)=>hop===0&&/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(address.replace(/^::ffff:/,"")),logger: { level: process.env.LOG_LEVEL ?? "info",serializers:{req:(request:{method?:string;url?:string})=>({method:request.method,url:request.url?.split("?")[0]})} }, bodyLimit: 64*1024*1024 });
   const durableJobs=new DurableMirrorJobs(store);
   const verifiedBlobs=new VerifiedBlobStore(config,store,storage),requestStages=new WeakMap<FastifyRequest,StagedFile>(),requestControllers=new Set<AbortController>();
   const requestSignal=(request:FastifyRequest,reply:import("fastify").FastifyReply)=>{const controller=new AbortController();requestControllers.add(controller);request.raw.once("aborted",()=>controller.abort());reply.raw.once("close",()=>{if(!reply.raw.writableFinished)controller.abort();requestControllers.delete(controller);});return controller.signal;};
@@ -145,7 +145,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   app.addHook("onRequest",async(request,reply)=>{
     const route=request.routeOptions.url??request.url.split("?")[0];
-    const publicRoute=route==="/healthz"||route==="/setup"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code"||route==="/v1/pairings/poll"||route==="/v1/pairings/cancel-claim";
+    const publicRoute=route==="/healthz"||route==="/setup"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code"||route==="/v1/pairings/claim-qr"||route==="/v1/pairings/poll"||route==="/v1/pairings/cancel-claim";
     if(route==='/setup')invitationHeaders(reply);
     if(request.method==="OPTIONS")return;
     if(publicRoute&&Number(request.headers["content-length"]??0)>64*1024)return reply.code(413).send({error:"Setup request exceeds its permitted size"});
@@ -395,13 +395,13 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const requestOptions=z.object({requireConfirmation:z.boolean().optional()}).parse(request.body??{});
     if(requestOptions.requireConfirmation!==true)throw app.httpErrors.upgradeRequired("Update Gib Sync on the inviting device through BRAT to approve new devices securely. Existing synchronization is unaffected.");
     const requiresConfirmation=true;
-    const expiresAt=new Date(Date.now()+60_000).toISOString();
-    store.run("UPDATE pairings SET quick_code_hash=NULL WHERE consumed_at IS NOT NULL OR expires_at<?",new Date().toISOString());
+    const now=Date.now(),expiresAt=new Date(now+60_000).toISOString(),qrExpiresAt=new Date(now+600_000).toISOString(),qrToken=randomToken();
+    store.run("UPDATE pairings SET quick_code_hash=NULL WHERE consumed_at IS NOT NULL OR expires_at<?",new Date(now).toISOString());
     let code="";let normalized="";
     for(let attempt=0;attempt<8;attempt++){code=quickCode();normalized=normalizeQuickCode(code);if(!store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))break;}
     if(!code||store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))throw new Error("Unable to allocate a quick code");
-    store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at,requires_confirmation) VALUES(?,?,?,?,?,?,?)",pairingId,device.vault_id,sha256(normalized),sha256(normalized),device.id,expiresAt,requiresConfirmation?1:0);
-    return {code,expiresAt,requiresConfirmation,setupUrl:invitationSetupUrl(config.PUBLIC_URL,code,expiresAt)};
+    store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at,qr_expires_at,requires_confirmation) VALUES(?,?,?,?,?,?,?,?)",pairingId,device.vault_id,sha256(qrToken),sha256(normalized),device.id,expiresAt,qrExpiresAt,1);
+    return {code,expiresAt,requiresConfirmation,setupUrl:invitationSetupUrl(config.PUBLIC_URL,code,expiresAt),qrSetupUrl:qrInvitationSetupUrl(config.PUBLIC_URL,qrToken,qrExpiresAt),qrExpiresAt};
   });
 
   app.post("/v1/pairings/claim-code",{bodyLimit:64*1024},async(request,reply)=>{
@@ -409,9 +409,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const body=z.object({code:z.string().min(5).max(12),deviceName:z.string().min(1).max(100)}).parse(request.body);let code:string;
     try{code=normalizeQuickCode(body.code);}catch{return reply.code(410).send({error:"Quick code expired or invalid"});}
     const row=store.one<PairingRow&{requires_confirmation:number}>("SELECT id,vault_id,expires_at,consumed_at,requires_confirmation FROM pairings WHERE quick_code_hash=?",sha256(code));
-    if(!row||row.consumed_at||Date.parse(row.expires_at)<Date.now())return reply.code(410).send({error:"Quick code expired or invalid"});
+    if(!row||row.consumed_at||Date.parse(row.expires_at)<=Date.now())return reply.code(410).send({error:"Quick code expired or invalid"});
     if(!row.requires_confirmation)return reply.code(426).send({error:"This older quick code cannot connect devices securely. Update Gib Sync on the inviting device through BRAT and create a new code. Existing synchronization is unaffected."});
     return reply.code(202).send(trustedPairing.claim(row.id,body.deviceName));
+  });
+  app.post("/v1/pairings/claim-qr",{bodyLimit:4096},async(request,reply)=>{
+    if(!takeRequestBudget(store,"qr-invite",request.ip,10,60_000)||!takeRequestBudget(store,"qr-invite-global","all",100,60_000))return reply.code(429).header("Retry-After","60").send({error:"Too many invitation attempts; try again later"});
+    const parsed=z.object({token:z.string().regex(/^[-_A-Za-z0-9]{43}$/),deviceName:z.string().min(1).max(100)}).strict().safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:"QR invitation is invalid"});const body=parsed.data;
+    const row=store.one<PairingRow&{requires_confirmation:number;qr_expires_at:string|null}>("SELECT id,vault_id,expires_at,qr_expires_at,consumed_at,requires_confirmation FROM pairings WHERE secret_hash=?",sha256(body.token));
+    if(!row||row.consumed_at||!row.requires_confirmation||!row.qr_expires_at||Date.parse(row.qr_expires_at)<=Date.now())return reply.code(410).send({error:"QR invitation expired or invalid"});
+    return reply.code(202).send(trustedPairing.claim(row.id,body.deviceName,"qr"));
   });
   app.get("/v1/pairings/pending",async(request)=>trustedPairing.list(await authenticate(request)));
   app.post("/v1/pairings/requests/:id/decision",{bodyLimit:4096},async(request)=>{const device=await authenticate(request),{id}=z.object({id:z.string().uuid()}).parse(request.params),{approved}=z.object({approved:z.boolean()}).parse(request.body);return trustedPairing.decide(device,id,approved);});

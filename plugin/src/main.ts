@@ -401,8 +401,8 @@ export default class GibSyncPlugin extends Plugin {
     try{const invite=parseSetupInvite(params);this.setupInviteModal?.close();const modal=new QuickCodeEntryModal(this.app,this,invite,()=>{if(this.setupInviteModal===modal)this.setupInviteModal=null;});this.setupInviteModal=modal;modal.open();}
     catch{new Notice("This setup invitation is invalid or expired. Scan a fresh QR or enter a new code manually.");}
   }
-  async claimQuickCode(server:string,value:string,deviceName:string,onboardingMode:"preserve-local"|"server-first"="preserve-local",signal?:AbortSignal){
-    const current=()=>{if(signal?.aborted||this.stopped)throw new Error("Device connection cancelled.");if(this.settings.deviceToken||this.settings.vaultId)throw new Error("This vault is already connected; its connection was not changed.");};current();const setup=await claimQuickCodeSetup(this,server,value,deviceName,signal);current();await this.acceptSetup(setup,deviceName,onboardingMode);
+  async claimQuickCode(server:string,value:string,deviceName:string,onboardingMode:"preserve-local"|"server-first"="preserve-local",signal?:AbortSignal,qrToken?:string){
+    const current=()=>{if(signal?.aborted||this.stopped)throw new Error("Device connection cancelled.");if(this.settings.deviceToken||this.settings.vaultId)throw new Error("This vault is already connected; its connection was not changed.");};current();const setup=await (qrToken?claimQuickCodeSetup(this,server,value,deviceName,signal,qrToken):claimQuickCodeSetup(this,server,value,deviceName,signal));current();await this.acceptSetup(setup,deviceName,onboardingMode);
   }
   private runtimeObsidianSyncState():boolean|null{
     type Entry={enabled?:boolean;instance?:unknown};

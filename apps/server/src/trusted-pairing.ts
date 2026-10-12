@@ -7,10 +7,10 @@ type Claim={id:string;pairing_id:string;vault_id:string;origin_device_id:string;
 function failure(statusCode:number,message:string):never{throw Object.assign(new Error(message),{statusCode});}
 export class TrustedPairing {
   constructor(private readonly store:Store,private readonly secret:string,private readonly setup:(vaultId:string,name:string,deviceId:string,token:string)=>SetupResponse){}
-  claim(pairingId:string,deviceName:string){
+  claim(pairingId:string,deviceName:string,kind:"code"|"qr"="code"){
     const now=new Date().toISOString(),ticket=randomToken(),id=randomUUID(),expiresAt=new Date(Date.now()+5*60_000).toISOString(),confirmationCode=randomInt(100000,1000000).toString();
     this.store.db.exec("BEGIN IMMEDIATE");try{
-      const row=this.store.one<{vault_id:string;created_by_device:string}>("SELECT vault_id,created_by_device FROM pairings WHERE id=? AND requires_confirmation=1 AND consumed_at IS NULL AND expires_at>=?",pairingId,now);
+      const row=this.store.one<{vault_id:string;created_by_device:string}>("SELECT vault_id,created_by_device FROM pairings WHERE id=? AND requires_confirmation=1 AND consumed_at IS NULL AND CASE WHEN ?='qr' THEN qr_expires_at ELSE expires_at END>?",pairingId,kind,now);
       if(!row)failure(410,"Quick code expired or invalid");
       const device=this.store.one<{revoked_at:string|null}>("SELECT revoked_at FROM devices WHERE id=? AND vault_id=?",row.created_by_device,row.vault_id);if(!device||device.revoked_at)failure(410,"The inviting device is no longer trusted");
       if(this.store.run("UPDATE pairings SET consumed_at=? WHERE id=? AND consumed_at IS NULL",now,pairingId).changes!==1)failure(410,"Quick code was already used");

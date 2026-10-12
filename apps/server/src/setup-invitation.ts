@@ -19,6 +19,11 @@ export function invitationSetupUrl(publicUrl:string,code:string,expiresAt:string
   if(!server||!/^\d{5}$/.test(code)||!Number.isSafeInteger(expires)||expires<=0)return undefined;
   return `${server}/setup?code=${code}&expires=${expires}`;
 }
+export function qrInvitationSetupUrl(publicUrl:string,token:string,expiresAt:string):string|undefined{
+  const server=canonicalServer(publicUrl),expires=Date.parse(expiresAt);
+  if(!server||!/^[-_A-Za-z0-9]{43}$/.test(token)||!Number.isSafeInteger(expires)||expires<=0)return undefined;
+  return `${server}/setup?token=${token}&expires=${expires}`;
+}
 export function invitationHeaders(reply:FastifyReply):void{
   reply.header('Cache-Control','no-store').header('Pragma','no-cache').header('Referrer-Policy','no-referrer').header('X-Content-Type-Options','nosniff').header('X-Frame-Options','DENY')
     .header('Content-Security-Policy',`default-src 'none'; style-src 'sha256-${styleHash}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`);
@@ -27,10 +32,11 @@ export function invitationHeaders(reply:FastifyReply):void{
 export function renderSetupInvitation(publicUrl:string,requestUrl:string,now=Date.now()):string{
   const server=canonicalServer(publicUrl);let link:string|null=null;
   if(server&&requestUrl.startsWith('/')&&requestUrl.length<=1024){
-    const query=new URLSearchParams(requestUrl.includes('?')?requestUrl.slice(requestUrl.indexOf('?')+1):''),code=query.get('code'),rawExpires=query.get('expires');
-    if([...query.keys()].every(key=>key==='code'||key==='expires')&&query.getAll('code').length===1&&query.getAll('expires').length===1&&code&&/^\d{5}$/.test(code)&&rawExpires&&/^[1-9]\d{0,15}$/.test(rawExpires)){
+    const query=new URLSearchParams(requestUrl.includes('?')?requestUrl.slice(requestUrl.indexOf('?')+1):''),code=query.get('code'),token=query.get('token'),rawExpires=query.get('expires');
+    const field=token!==null?'token':'code',value=token??code,validShape=field==='token'?/^[-_A-Za-z0-9]{43}$/.test(value??''):/^\d{5}$/.test(value??'');
+    if([...query.keys()].every(key=>key===field||key==='expires')&&query.getAll(field).length===1&&query.getAll('expires').length===1&&validShape&&rawExpires&&/^[1-9]\d{0,15}$/.test(rawExpires)){
       const expires=Number(rawExpires);
-      if(Number.isSafeInteger(expires)&&expires>now&&expires<=now+120_000)link=`obsidian://gib-sync-setup?server=${encodeURIComponent(server)}&code=${code}&expires=${expires}`;
+      if(Number.isSafeInteger(expires)&&expires>now&&expires<=now+(field==='token'?600_000:120_000))link=`obsidian://gib-sync-setup?server=${encodeURIComponent(server)}&${field}=${value}&expires=${expires}`;
     }
   }
   const content=link?`<h1>Connect this device</h1><p>Open the destination vault in Obsidian with Gib Sync installed and enabled. Your other device must approve this connection.</p><a href="${escapeHtml(link)}">Open Gib Sync in Obsidian</a><p>If Obsidian does not open, return to Gib Sync settings and use the short code instead.</p>`:'<h1>Invitation unavailable</h1><p>This setup invitation has expired or is invalid. Generate a fresh invitation in Gib Sync on your connected device.</p>';

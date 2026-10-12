@@ -15,7 +15,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## Durable synchronization and recovery
 
-The 0.8.66 candidate adds an operation ledger, stable file and folder identities,
+The 0.8.67 candidate adds an operation ledger, stable file and folder identities,
 exact retry receipts, a shared reconciliation policy, persistent content inventory,
 file-backed server transfers, recoverable whole-plugin switching and a conflict
 inbox. Existing accounts, settings, vault keys and immutable history migrate
@@ -146,7 +146,7 @@ Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafi
 
 In plugin settings, **Periodic sync** controls timer-based remote checks independently from **Sync when files change**. File-change sync waits two seconds after a vault file is created, saved, renamed, or deleted, coalesces rapid edits into one run, and ignores excluded paths.
 
-Another device can repeat manual setup and select the discovered existing vault. Alternatively, choose **Show quick code** on a connected device and scan its optional QR with the new phone's Camera app. Tap **Open Gib Sync in Obsidian**, review the receiving vault/server and press **Connect**; neither the server address nor code needs typing. The existing five-digit **Enter quick code** option remains available. The invite rotates every 60 seconds and works once; confirm the matching verification number on the already connected device before credentials are released. QR links contain no vault key or device token and do not request camera permissions inside Obsidian. QR handoff requires the updated server; already paired older clients and manual quick codes keep working.
+Another device can repeat manual setup and select the discovered existing vault. Alternatively, choose **Show quick code** on a connected device and scan its optional QR with the new phone's Camera app. Tap **Open Gib Sync in Obsidian**, review the receiving vault/server and press **Connect**; neither the server address nor code needs typing. The QR uses a separate, single-use 256-bit invitation valid for **10 minutes** and stays stable while the optional five-digit **Enter quick code** rolls every **60 seconds**. Either alternative still requires confirming the matching verification number on the already connected device before credentials are released; claiming either consumes that invitation. QR links contain no vault key or device token and do not request camera permissions inside Obsidian. QR handoff requires the updated server and plugin; already paired older clients and manual quick codes keep working. Treat the temporary setup link as private until it expires.
 
 ## Development
 

@@ -1,4 +1,4 @@
-# Durable synchronization v2 (0.8.66 candidate)
+# Durable synchronization v2 (0.8.67 candidate)
 
 ## Authority and identities
 
@@ -129,9 +129,14 @@ the trusted originating device must approve a matching verification number.
 Opaque claim tickets, expiry, single-use delivery and rate budgets apply. Older
 unsafe pairing flows cannot create codes; paired protocol-7 clients keep syncing.
 
-Optional setup QR codes are generated locally and rotate with the same short-lived
-invite. The phone's native Camera opens a no-store HTTPS invitation page, then an
-explicit Obsidian protocol handoff fills only the server and temporary code.
+Optional setup QR codes are generated locally from a separate 256-bit invitation
+valid for ten minutes; the numeric code retains its independent sixty-second
+expiry. A nullable `qr_expires_at` column leaves legacy `expires_at` semantics
+unchanged, including rollback. Only hashes are stored. Both alternatives consume
+the same pairing atomically and still require trusted-device approval. The QR
+remains stable across numeric refreshes and temporary refresh failures, then
+retires at its own expiry. The phone's native Camera opens a no-store HTTPS page,
+then an explicit Obsidian protocol handoff fills the server and private invitation.
 Receiving vault/server review and trusted-device confirmation remain mandatory;
 already-connected vaults cannot be redirected. No vault key, password, device token
 or camera access inside Obsidian's webview is involved. See the official

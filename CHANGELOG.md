@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.67 candidate
+
+- Give QR setup a separate, single-use 256-bit invitation valid for ten minutes, still requiring explicit receiving-vault/server review and trusted-device approval.
+- Keep the optional five-digit typed code at sixty seconds. QR remains stable while that code rolls; expired codes cannot regain validity on rollback, and older clients/servers retain their compatible setup path.
+- Preserve a valid QR across temporary code-refresh failures, retire it at its own exact expiry, and keep invitation query values out of application request logs.
+
+This candidate is distributed only through Gib-Sync-Canary; production and user installations are not changed by publication.
+
 ## 0.8.66 candidate
 
 - Add optional locally generated rolling setup QR codes and a mobile HTTPS-to-Obsidian handoff, so the native Camera app can fill the server address and temporary code without in-WebView camera permissions.

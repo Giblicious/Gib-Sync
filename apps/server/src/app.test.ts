@@ -70,6 +70,26 @@ function encryptedFixture(clear:Buffer,key:Buffer,hash:string):Buffer{const iv=r
 
 describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
+  it('keeps QR valid after numeric expiry, hashes the invitation, requires approval and consumes both alternatives once',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};
+    const before=Date.now(),pairing=(await app.inject({method:'POST',url:'/v1/pairings',headers,payload:{requireConfirmation:true}})).json(),token=new URL(pairing.qrSetupUrl).searchParams.get('token')!;
+    expect(token).toMatch(/^[-_A-Za-z0-9]{43}$/);expect(Date.parse(pairing.qrExpiresAt)-before).toBeGreaterThanOrEqual(600_000);expect(Date.parse(pairing.expiresAt)-before).toBeLessThan(61_000);expect(JSON.stringify(store.all('SELECT * FROM pairings'))).not.toContain(token);expect(store.one('SELECT expires_at,qr_expires_at FROM pairings')).toEqual({expires_at:pairing.expiresAt,qr_expires_at:pairing.qrExpiresAt});
+    const clock=vi.spyOn(Date,'now').mockReturnValue(before+9*60_000);try{
+      expect((await app.inject({method:'POST',url:'/v1/pairings/claim-code',payload:{code:pairing.code,deviceName:'Phone'}})).statusCode).toBe(410);
+      expect((await app.inject({method:'POST',url:'/v1/pairings',headers,payload:{requireConfirmation:true}})).statusCode).toBe(200);
+      expect(store.one('SELECT quick_code_hash FROM pairings WHERE secret_hash=?',sha256(token))).toEqual({quick_code_hash:null});
+      const response=await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token,deviceName:'Phone'}});expect(response.statusCode).toBe(202);const claim=response.json();expect(claim.confirmationCode).toMatch(/^\d{6}$/);expect(claim.envelope).toBeUndefined();expect(store.one<{count:number}>('SELECT COUNT(*) count FROM devices')?.count).toBe(1);
+      expect((await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token,deviceName:'Duplicate'}})).statusCode).toBe(410);expect((await app.inject({method:'POST',url:'/v1/pairings/poll',payload:{ticket:claim.ticket}})).json().status).toBe('pending');
+      expect((await app.inject({method:'POST',url:`/v1/pairings/requests/${claim.claimId}/decision`,headers,payload:{approved:true}})).statusCode).toBe(200);const approved=(await app.inject({method:'POST',url:'/v1/pairings/poll',payload:{ticket:claim.ticket}})).json();expect(openJson<any>(approved.envelope,claim.ticket,`pairing:${approved.pairingId}`)).toMatchObject({vaultId:setup.vaultId});
+    }finally{clock.mockRestore();}
+  });
+  it('expires QR at ten minutes and rejects malformed, foreign and revoked-origin invitations',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};
+    const pairing=(await app.inject({method:'POST',url:'/v1/pairings',headers,payload:{requireConfirmation:true}})).json(),token=new URL(pairing.qrSetupUrl).searchParams.get('token')!;
+    expect((await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token:'12345',deviceName:'Phone'}})).statusCode).toBe(400);expect((await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token:'z'.repeat(43),deviceName:'Phone'}})).statusCode).toBe(410);
+    const clock=vi.spyOn(Date,'now').mockReturnValue(Date.parse(pairing.qrExpiresAt));try{expect((await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token,deviceName:'Phone'}})).statusCode).toBe(410);}finally{clock.mockRestore();}
+    store.run('UPDATE devices SET revoked_at=? WHERE id=?',new Date().toISOString(),setup.deviceId);expect((await app.inject({method:'POST',url:'/v1/pairings/claim-qr',payload:{token,deviceName:'Phone'}})).statusCode).toBe(410);expect(store.one<{count:number}>('SELECT COUNT(*) count FROM trusted_pairing_claims')?.count).toBe(0);
+  });
   it('serves a public prefix-preserving invitation without consuming it or bypassing trusted-device approval',async()=>{
     const {config,store,storage}=fixture();config.PUBLIC_URL='https://sync.example.test/candidate/prefix///';
     const app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};
