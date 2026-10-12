@@ -15,7 +15,7 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 
 ## Durable synchronization and recovery
 
-The 0.8.70 candidate adds an operation ledger, stable file and folder identities,
+The 0.8.71 candidate adds an operation ledger, stable file and folder identities,
 exact retry receipts, a shared reconciliation policy, persistent content inventory,
 file-backed server transfers, recoverable whole-plugin switching and a conflict
 inbox. Existing accounts, settings, vault keys and immutable history migrate

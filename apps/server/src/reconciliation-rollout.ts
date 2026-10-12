@@ -38,9 +38,27 @@ export class ReconciliationRollout {
   observe(vaultId:string,input:ReconciliationInput,source:string,evidence:{validatedIdentities:boolean;provenRemoteCreations?:Array<{path:string;targetId:string}>}={validatedIdentities:false}):{matched:boolean;status:RolloutStatus}{
     const comparable=(entries:ManifestEntry[])=>[...entries].sort((a,b)=>a.path.localeCompare(b.path)).map(({path,hash,size,fileId,revision})=>({path,hash,size,fileId,revisionId:revision?.id}));
     this.status(vaultId);const witness=legacyDecisionKinds(input),causal=causalDecisionKinds(input),candidate=planReconciliation(input).decisions.map(({path,kind})=>({path,kind})),legacyMatched=JSON.stringify(witness)===JSON.stringify(candidate),base=new Map(input.base.map(entry=>[entry.path,entry])),local=new Map(input.local.map(entry=>[entry.path,entry])),remote=new Map(input.remote.map(entry=>[entry.path,entry])),differences=candidate.filter((decision,index)=>decision.kind!==witness[index]?.kind);
-    const justified=differences.every(decision=>{const b=base.get(decision.path),l=local.get(decision.path),r=remote.get(decision.path);if(!evidence.validatedIdentities||!b?.fileId)return false;if(l?.fileId&&l.fileId!==b.fileId&&!input.localCreationIntents?.some(intent=>intent.path===decision.path&&intent.targetId===l.fileId&&intent.baseTargetId===b.fileId)&&!(source==="seafile"&&this.store.one("SELECT 1 FROM sync_operations WHERE vault_id=? AND kind='recreate' AND target_id=? AND json_extract(payload_json,'$.newTargetId')=? AND json_extract(payload_json,'$.path')=?",vaultId,b.fileId,l.fileId,decision.path)))return false;if(r?.fileId&&r.fileId!==b.fileId&&source==="seafile"&&!evidence.provenRemoteCreations?.some(proof=>proof.path===decision.path&&proof.targetId===r.fileId))return false;return Boolean(l?.fileId&&l.fileId!==b.fileId||r?.fileId&&r.fileId!==b.fileId);});
+    const witnessKinds=new Map(witness.map(item=>[item.path,item.kind]));
+    const justified=differences.every(decision=>{
+      const b=base.get(decision.path),l=local.get(decision.path),r=remote.get(decision.path);
+      if(!evidence.validatedIdentities)return false;
+      if(!b){
+        // The old hash-only witness calls equal bytes "equal" even when a
+        // verified external creation has a distinct identity. Do not invent a
+        // base: require the exact accepted local entity and remote create proof.
+        return source==="seafile"&&decision.kind==="independent-create"&&witnessKinds.get(decision.path)==="equal"&&
+          Boolean(l?.fileId&&r?.fileId&&l.fileId!==r.fileId&&l.hash===r.hash&&l.size===r.size&&
+            evidence.provenRemoteCreations?.some(proof=>proof.path===decision.path&&proof.targetId===r.fileId)&&
+            this.store.one("SELECT 1 FROM sync_entities WHERE vault_id=? AND entity_id=? AND entity_kind='file' AND path=? AND hash=? AND size=? AND deleted=0",vaultId,l.fileId,decision.path,l.hash,l.size));
+      }
+      if(!b.fileId)return false;
+      if(l?.fileId&&l.fileId!==b.fileId&&!input.localCreationIntents?.some(intent=>intent.path===decision.path&&intent.targetId===l.fileId&&intent.baseTargetId===b.fileId)&&!(source==="seafile"&&this.store.one("SELECT 1 FROM sync_operations WHERE vault_id=? AND kind='recreate' AND target_id=? AND json_extract(payload_json,'$.newTargetId')=? AND json_extract(payload_json,'$.path')=?",vaultId,b.fileId,l.fileId,decision.path)))return false;
+      if(r?.fileId&&r.fileId!==b.fileId&&source==="seafile"&&!evidence.provenRemoteCreations?.some(proof=>proof.path===decision.path&&proof.targetId===r.fileId))return false;
+      return Boolean(l?.fileId&&l.fileId!==b.fileId||r?.fileId&&r.fileId!==b.fileId);
+    });
     const matched=JSON.stringify(causal)===JSON.stringify(candidate)&&(legacyMatched||justified),fingerprint=createHash("sha256").update(JSON.stringify({input:{base:comparable(input.base),local:comparable(input.local),remote:comparable(input.remote)},witness,causal,candidate})).digest("hex"),now=new Date().toISOString(),candidateHash=createHash('sha256').update(JSON.stringify(candidate)).digest('hex');
-    const added=this.store.run("INSERT OR IGNORE INTO sync_shadow_observations(vault_id,fingerprint,source,matched,created_at,legacy_difference,reason,evidence_json,candidate_hash) VALUES(?,?,?,?,?,?,?,?,?)",vaultId,fingerprint,source,matched?1:0,now,legacyMatched?0:1,legacyMatched?null:matched?"Validated causal recreation differs from the earlier hash-only witness":"Unexplained reconciliation divergence",JSON.stringify({witness,causal,candidate,evidence,localCreationIntents:input.localCreationIntents??[]}),candidateHash);
+    const identityDifferences=differences.map(({path})=>({path,base:base.get(path)??null,local:local.get(path)??null,remote:remote.get(path)??null}));
+    const added=this.store.run("INSERT OR IGNORE INTO sync_shadow_observations(vault_id,fingerprint,source,matched,created_at,legacy_difference,reason,evidence_json,candidate_hash) VALUES(?,?,?,?,?,?,?,?,?)",vaultId,fingerprint,source,matched?1:0,now,legacyMatched?0:1,legacyMatched?null:matched?"Validated causal identity differs from the earlier hash-only witness":"Unexplained reconciliation divergence",JSON.stringify({witness,causal,candidate,evidence,identityDifferences,localCreationIntents:input.localCreationIntents??[]}),candidateHash);
     if(added.changes)this.store.run("UPDATE sync_rollouts SET comparisons=comparisons+1,mismatches=mismatches+?,mode=CASE WHEN ?=0 THEN 'hold' ELSE mode END,last_error=CASE WHEN ?=0 THEN 'New reconciliation differs from its shadow witness; automatic rollout was held' ELSE last_error END,updated_at=? WHERE vault_id=?",matched?0:1,matched?1:0,matched?1:0,now,vaultId);
     return {matched,status:this.status(vaultId)};
   }

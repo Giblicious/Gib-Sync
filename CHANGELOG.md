@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.71 candidate
+
+- Move live-console follow scrolling after a paint boundary instead of forcing a synchronous layout immediately after log-row mutations. User scrolling wins over a queued follow operation.
+- Coalesce scrolling bursts and cancel both queued animation frames when settings close or change tabs; detached consoles are never touched.
+- Add executable paint-boundary, manual-scroll, cancellation, and restart regressions. The unchanged-row and timestamp-cache improvements from 0.8.70 remain.
+- Explain same-content independent external creations only when exact accepted local identity and trusted remote-creation proof both verify. Missing, forged, foreign, or device-only claims still hold rollout. Preserve identity-difference context for independent review without resetting prior observations.
+
+This candidate remains isolated in Gib-Sync-Canary; no stable release or production image promotion is authorized before acceptance.
+
 ## 0.8.70 candidate
 
 - Reduce measured mobile Diagnostics-console hitches: retain unchanged row objects and cached timestamp formatting, group repeated messages in latest-occurrence order, and avoid unnecessary DOM rewrites, row reordering, and scroll-layout work.

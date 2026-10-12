@@ -106,6 +106,14 @@ describe("local recovery browsing",()=>{
 });
 
 describe("stable live UI",()=>{
+  it("does not synchronously read scroll geometry after mutating console rows",()=>{
+    vi.stubGlobal("requestAnimationFrame",vi.fn(()=>1));vi.stubGlobal("cancelAnimationFrame",vi.fn());
+    const plugin=pluginFixture(),tab=new GibSyncSettingTab({}as never,plugin as never),root=new Element();let mutated=false;
+    for(const property of ["scrollTop","scrollHeight","clientHeight"])Object.defineProperty(root,property,{get(){if(mutated)throw new Error("Synchronous post-mutation layout read");return 0;}});
+    const create=root.createDiv;root.createDiv=function(options){mutated=true;return create.call(this,options);};
+    (tab as any).liveRoot=root;plugin.liveStatus.activities=[{phase:"checking",level:"info",message:"Checking",at:new Date().toISOString()}];
+    expect(()=>(tab as any).renderConsole()).not.toThrow();expect(requestAnimationFrame).toHaveBeenCalledTimes(1);tab.hide();expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
+  });
   it("keeps popup controls stable through live updates and exposes pause on mobile and desktop",()=>{
     const plugin=pluginFixture();let changed!:()=>void;plugin.subscribeStatus.mockImplementation((listener:()=>void)=>{changed=listener;return ()=>{};});const modal=new StatusOverviewModal({} as never,plugin as never);modal.onOpen();const content=modal.contentEl as unknown as InstanceType<typeof Element>,actions=content.querySelector(".gib-sync-status-overview-actions")!,controls=[...actions.children];
     expect(controls.map(child=>child.textContent)).toEqual(["Sync now","Pause","Settings"]);plugin.liveStatus.message="Checking";changed();expect(actions.children).toEqual(controls);expect(content.emptyCount).toBe(0);controls[1].onclick!();expect(plugin.setPaused).toHaveBeenCalledWith(true);modal.onClose();
@@ -115,6 +123,7 @@ describe("stable live UI",()=>{
     expect(root.emptyCount).toBe(0);expect(root.querySelector("details")).toBe(details);expect(details.open).toBe(true);expect(details.querySelector("summary")).toBe(summary);expect(root.querySelector(".gib-sync-status-head")).toBe(header);
   });
   it("updates repeated console rows in place without clearing the scrolling surface",()=>{
+    vi.stubGlobal("requestAnimationFrame",vi.fn(()=>1));vi.stubGlobal("cancelAnimationFrame",vi.fn());
     const plugin=pluginFixture(),tab=new GibSyncSettingTab({} as never,plugin as never),root=new Element();(tab as any).liveRoot=root;plugin.liveStatus.activities=[{phase:"checking",level:"info",message:"Checking",at:new Date().toISOString()}];(tab as any).renderConsole();const row=root.querySelector(".gib-sync-console-row");plugin.liveStatus.activities[0].repeats=2;(tab as any).renderConsole();
     expect(root.emptyCount).toBe(0);expect(root.querySelector(".gib-sync-console-row")).toBe(row);expect(row?.querySelector(".gib-sync-console-message")?.textContent).toContain("repeated 2 times");
   });

@@ -10,6 +10,7 @@ import {conflictLineComparison,type ConflictChoice,type ConflictInboxItem} from 
 import {DeviceLifecycleProbe,DeviceSyncActivityProbe,runDeviceProbe,type DeviceProbeReport} from "./device-diagnostics";
 import {normalizeSetupServer,parseSetupInvite,parseSetupInviteUrl,renderSetupQr,setupInviteUrl,setupQrInviteUrl,type SetupInvite} from "./setup-qr";
 import {ConsoleModel,type ConsoleRow} from "./console-model";
+import {ConsoleScrollFollower} from "./console-scroll";
 
 export type QuickCodeInvite=SetupInvite;
 const alreadyConnected=(plugin:GibSyncPlugin)=>Boolean(plugin.settings.deviceToken||plugin.settings.vaultId);
@@ -348,10 +349,11 @@ export class GibSyncSettingTab extends PluginSettingTab {
   private unsubscribe:(()=>void)|null=null;private liveRoot:HTMLElement|null=null;private liveRenderTimer:number|null=null;
   private liveFields=new Map<string,HTMLElement>();private liveValues=new Map<string,HTMLElement>();
   private consoleModel=new ConsoleModel();
+  private readonly consoleScroll=new ConsoleScrollFollower();
   private consoleRows=new Map<string,{row:HTMLElement;time:HTMLElement;phase:HTMLElement;message:HTMLElement;value:ConsoleRow}>();
   private page:"status"|"sync"|"content"|"safety"|"console"="status";private pageEl!:HTMLElement;
   constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
-  display(){this.unsubscribe?.();this.unsubscribe=null;if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;this.liveRoot=null;this.liveFields.clear();this.liveValues.clear();this.consoleRows.clear();this.consoleModel=new ConsoleModel();this.containerEl.empty();this.containerEl.addClass("gib-sync-settings");
+  display(){this.unsubscribe?.();this.unsubscribe=null;this.consoleScroll.stop();if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;this.liveRoot=null;this.liveFields.clear();this.liveValues.clear();this.consoleRows.clear();this.consoleModel=new ConsoleModel();this.containerEl.empty();this.containerEl.addClass("gib-sync-settings");
     const header=this.containerEl.createDiv({cls:"gib-sync-settings-header"});header.createEl("h2",{text:"Gib Sync"});header.createSpan({text:"Vault sync with readable Seafile storage"});
     const tabs:[typeof this.page,string,string][]=[["status","Connection","activity"],["content","What syncs","files"],["sync","Automation","refresh-cw"],["safety","Devices & recovery","shield-check"],["console","Diagnostics","terminal"]];
     const tablist=this.containerEl.createDiv({cls:"gib-sync-settings-tabs",attr:{role:"tablist","aria-label":"Gib Sync settings"}});
@@ -439,7 +441,7 @@ export class GibSyncSettingTab extends PluginSettingTab {
     const clear=toolbar.createEl("button",{text:"Clear",attr:{type:"button"}});clear.onclick=()=>this.plugin.clearActivity();toolbar.createSpan({text:"Live session activity"});
     this.liveRoot=this.pageEl.createDiv({cls:"gib-sync-console",attr:{role:"log","aria-live":"off","aria-label":"Detailed sync activity"}});this.renderConsole();
   }
-  hide(){this.unsubscribe?.();this.unsubscribe=null;if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;}
+  hide(){this.unsubscribe?.();this.unsubscribe=null;this.consoleScroll.stop();if(this.liveRenderTimer!==null)window.clearTimeout(this.liveRenderTimer);this.liveRenderTimer=null;}
   private included(path:string,exclusions:string[],syncBookmarks:boolean,syncConfig:boolean,syncPlugins:boolean):boolean{
     return shouldSyncChangedPath(path,{...this.plugin.settings,exclusions,syncBookmarks,syncObsidianConfig:syncConfig,syncPlugins});
   }
@@ -468,13 +470,13 @@ export class GibSyncSettingTab extends PluginSettingTab {
     if(server){item(technical,"Stored history",`${server.snapshotCount} snapshots · ${server.blobCount} blobs · ${bytes(server.blobBytes)}`);item(technical,"External edits",server.externalError||"Watching for Seafile edits");item(technical,"Client compatibility",server.compatibility?`Minimum ${server.compatibility.minimumVersion} · recommended ${server.compatibility.recommendedVersion}`:"Not advertised");item(technical,"Server notices",server.healthAlerts.map((alert)=>alert.message).join(" · ")||"None");}
   }
   private renderConsole(){if(!this.liveRoot)return;const root=this.liveRoot,{rows,changed}=this.consoleModel.update(this.plugin.liveStatus.activities);if(!changed&&root.children.length)return;
-    const nearBottom=root.scrollHeight-root.scrollTop-root.clientHeight<48,keys=new Set(rows.map(row=>row.key));let index=0,layoutChanged=false;
+    const scrollTop=root.scrollTop,nearBottom=root.scrollHeight-scrollTop-root.clientHeight<48,keys=new Set(rows.map(row=>row.key));let index=0,layoutChanged=false;
     for(const value of rows){let item=this.consoleRows.get(value.key);if(!item){const row=root.createDiv({cls:"gib-sync-console-row"});item={row,time:row.createEl("time"),phase:row.createSpan({cls:"gib-sync-console-phase"}),message:row.createSpan({cls:"gib-sync-console-message"}),value};this.consoleRows.set(value.key,item);item.row.setAttr("data-level",value.level);item.phase.textContent=value.phase;item.time.textContent=value.time;item.message.textContent=value.message;layoutChanged=true;}
       else if(item.value!==value){item.time.textContent=value.time;if(item.value.message!==value.message){item.message.textContent=value.message;layoutChanged=true;}item.value=value;}
       if(root.children[index]!==item.row){root.insertBefore(item.row,root.children[index]??null);layoutChanged=true;}index++;}
     for(const [key,item]of this.consoleRows)if(!keys.has(key)){item.row.remove();this.consoleRows.delete(key);layoutChanged=true;}
     const empty=root.querySelector<HTMLElement>(".gib-sync-console-empty");if(rows.length)empty?.remove();else if(!empty)root.createDiv({cls:"gib-sync-console-empty",text:"No activity recorded in this session."});
-    if(nearBottom&&layoutChanged)root.scrollTop=root.scrollHeight;
+    if(nearBottom&&layoutChanged)this.consoleScroll.schedule(root,scrollTop);
   }
 }
 
