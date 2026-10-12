@@ -98,6 +98,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   const canOperateVault=(vaultId:string)=>containment.allows(vaultId)&&!retirements.isRetired(vaultId);
   const externalImporter=new ExternalImporter(config,store,storage,safeguards,(vaultId)=>canOperateVault(vaultId)&&!healthRepairLocks.has(vaultId));let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null,closing=false;
   const skipExternalOnce=new Set<string>(),restoreApprovedVaults=new Set<string>(),healthRepairLocks=new Set<string>(),mirrorWriteSettles=new Map<string,{snapshotId:string;until:number}>();
+  const healthRepairPermit=Symbol('accepted-checkpoint-repair');
+  const assertWritable=(vaultId:string,permit?:symbol)=>{if(healthRepairLocks.has(vaultId)&&permit!==healthRepairPermit)throw Object.assign(new Error('The server is repairing its accepted checkpoint. Saved edits will sync automatically when it finishes.'),{statusCode:503,healthRepairActive:true});};
   const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
   function notifyVault(vaultId:string,headId:string|null,attention=false){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
@@ -114,7 +116,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   await app.register(multipart, { limits: { fileSize: config.MAX_BLOB_BYTES, files: 1 } });
   await app.register(sensible);
   app.setErrorHandler((error,_request,reply)=>{
-    const typed=error as Error & {statusCode?:number;compatibility?:unknown;containment?:unknown},compatibility=typed.compatibility;
+    const typed=error as Error & {statusCode?:number;compatibility?:unknown;containment?:unknown;healthRepairActive?:boolean},compatibility=typed.compatibility;
+    if(typed.statusCode===503&&typed.healthRepairActive===true)return reply.code(503).header('Retry-After','5').send({error:typed.message,healthRepairActive:true});
     if(typed.statusCode===426&&compatibility)return reply.code(426).send({error:typed.message,message:typed.message,compatibility});
     if(typed.statusCode===423&&typed.containment)return reply.code(423).send({error:typed.message,message:typed.message,containment:typed.containment});
     return reply.send(error);
@@ -164,7 +167,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if (!row?.storage_url || !row.storage_token) throw new Error("Vault storage is not configured");
     return row;
   }
-  const snapshotCommitter=new SnapshotCommitter(store,storage,storageRow);
+  const snapshotCommitter=new SnapshotCommitter(store,storage,storageRow,assertWritable);
   const contentUploads=await registerContentUploads(app,{config,store,storage,authenticate,storageRow});
 
   async function reconcileReadableFolders(vaultId:string,snapshot:Snapshot,mayContinue:()=>boolean=()=>true):Promise<{created:number;deleted:number;remaining:string[]}>{
@@ -261,6 +264,15 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
       const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>!closing&&!leaseLost&&durableJobs.owns(lease)&&headStillCurrent()&&!externalScanRequests.has(vaultId)&&canOperateVault(vaultId);let superseded=false;
       for(const entry of snapshot.entries){if(!mayContinue()){superseded=true;break;}const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash&&visible.get(entry.path)?.size===entry.size)continue;
+        // Explicit repair verifies unchanged readable bytes instead of rewriting
+        // every note/plugin. This is a read-back proof, never a size/hash guess;
+        // final generation verification still checks the current backend IDs.
+        const observed=visible.get(entry.path);
+        if(restoreApprovedVaults.has(vaultId)&&observed?.size===entry.size){
+          const existing=await verifiedBlobs.readable(row,entry.path);
+          try{if(existing.hash===entry.hash){if(!mayContinue()){superseded=true;break;}store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at,storage_id,storage_mtime) VALUES(?,?,?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at,storage_id=excluded.storage_id,storage_mtime=excluded.storage_mtime",vaultId,entry.path,entry.hash,existing.size,new Date().toISOString(),observed.id,observed.mtime);continue;}}
+          finally{await existing.dispose();}
+        }
         const clear=await verifiedBlobs.clear(row,entry.hash);
         try{
           const operation=await projectionJournal.prepare(row,entry.path,snapshot.id,current?.hash??null,entry.hash,restoreApprovedVaults.has(vaultId));
@@ -323,7 +335,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       for(const entry of snapshot.entries){const original=entry.path.replace(generatedSuffix,"");if(original===entry.path)continue;const copies=groups.get(original)??[];copies.push(entry);groups.set(original,copies);}
       const byPath=new Map(snapshot.entries.map((entry)=>[entry.path,entry])),redundant=new Set<string>();for(const [original,copies] of groups){const intact=byPath.get(original);if(!intact)continue;for(const copy of copies)if(copy.hash===intact.hash)redundant.add(copy.path);}
       if(redundant.size){
-        const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)),snapshot.folders);
+        const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)),snapshot.folders,snapshot.folderRepair,undefined,undefined,snapshot.folderEntries,healthRepairPermit);
         if(!cleaned)return reply.conflict("Vault changed while health repair was preparing the cleaned snapshot");
         snapshot=cleaned;removedConflictCopies=redundant.size;
       }
@@ -503,14 +515,15 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     folderImpactCount:z.number().int().min(1).max(200000),fileGrowthBytes:z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER),
     fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
 
-  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[],folderRepair?:Snapshot["folderRepair"],operationBatch?:OperationBatch,onAccepted?:(snapshot:Snapshot)=>void,folderEntries?:FolderEntry[]):Promise<Snapshot|null>{
+  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[],folderRepair?:Snapshot["folderRepair"],operationBatch?:OperationBatch,onAccepted?:(snapshot:Snapshot)=>void,folderEntries?:FolderEntry[],maintenancePermit?:symbol):Promise<Snapshot|null>{
+    assertWritable(vaultId,maintenancePermit);
     const parent=parentId?store.getSnapshot(parentId):null,inheritedRepair=parent?.folderRepair,sourceRepair=folderRepair??inheritedRepair;
     const effectiveRepair=sourceRepair?{...sourceRepair,issuedAt:sourceRepair.issuedAt??(folderRepair?new Date().toISOString():parent?.createdAt??new Date().toISOString())}:undefined;
-    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,folderEntries,folderRepair:effectiveRepair,operationBatch,afterInsert:accepted=>{store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId);onAccepted?.(accepted);}});if(!snapshot)return null;
+    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,folderEntries,folderRepair:effectiveRepair,operationBatch,maintenancePermit,afterInsert:accepted=>{store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId);onAccepted?.(accepted);}});if(!snapshot)return null;
     safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
 
-  await registerOperationRoutes(app,{store,committer:snapshotCommitter,safeguards,deploymentDigest:config.GIBSYNC_RELEASE_DIGEST,canaryConfig:config,authenticate,beforeCommit:ingestExternalChanges,accepted:(vaultId,snapshotId)=>{safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
+  await registerOperationRoutes(app,{store,committer:snapshotCommitter,safeguards,deploymentDigest:config.GIBSYNC_RELEASE_DIGEST,canaryConfig:config,authenticate,beforeCommit:async(vaultId)=>{assertWritable(vaultId);await ingestExternalChanges(vaultId);assertWritable(vaultId);},accepted:(vaultId,snapshotId)=>{safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
   await registerConflictInbox(app,{store,authenticate});
   await registerConfigRoots(app,{store,committer:snapshotCommitter,blobs:verifiedBlobs,storageRow,authenticate,beforeCommit:ingestExternalChanges,accepted:(vaultId,snapshotId)=>{mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
 
@@ -680,7 +693,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   app.post("/v1/commit", async (request, reply) => {
     const device = await authenticate(request);
     if(integrityBlockedVaults.has(device.vault_id))return reply.code(423).send({error:"Sync is blocked because the accepted snapshot failed server integrity checks"});
+    assertWritable(device.vault_id);
     await ingestExternalChanges(device.vault_id);
+    assertWritable(device.vault_id);
     const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),folders:z.array(folderSchema).max(200000).default([]),folderEntries:z.array(folderEntrySchema).max(200000).optional(),
       clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),deviceLocalCleanupPaths:z.array(z.string().max(1000)).max(5000).optional(),vaultIdentity:z.string().max(500).optional(),staleBaseline:z.boolean().optional()}).optional() }).parse(request.body) as CommitRequest;
     if(body.clientTime){const skew=Date.parse(body.clientTime)-Date.now();store.run("UPDATE devices SET clock_skew_ms=? WHERE id=?",Number.isFinite(skew)?Math.round(skew):0,device.id);}

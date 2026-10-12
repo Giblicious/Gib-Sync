@@ -14,6 +14,12 @@ import {ConsoleScrollFollower} from "./console-scroll";
 
 export type QuickCodeInvite=SetupInvite;
 const alreadyConnected=(plugin:GibSyncPlugin)=>Boolean(plugin.settings.deviceToken||plugin.settings.vaultId);
+function modalOwnerFor(app:App):GibSyncPlugin|undefined{return (app as App&{plugins?:{plugins?:Record<string,GibSyncPlugin>}}).plugins?.plugins?.['gib-sync'];}
+class PluginOwnedModal extends Modal{
+  constructor(app:App,private readonly modalOwner:GibSyncPlugin|undefined=modalOwnerFor(app)){super(app);}
+  open(){this.modalOwner?.modalRegistry?.add(this);try{super.open();}catch(error){this.modalOwner?.modalRegistry?.release(this);throw error;}}
+  close(){try{super.close();}finally{this.modalOwner?.modalRegistry?.release(this);}}
+}
 
 function defaultDeviceName(): string {
   if (Platform.isIosApp) return "iPhone / iPad";
@@ -27,7 +33,7 @@ function assessmentText(value:ChangeAssessment):string{return `${value.created} 
 function mobileContent(element:HTMLElement):void{element.addClass("gib-sync-modal-content");}
 function onboardingChoice(element:HTMLElement,selected:(mode:"preserve-local"|"server-first")=>void,initial:"preserve-local"|"server-first"="preserve-local"){new Setting(element).setName("First download").setDesc("Compare and preserve is safest if this device already has notes. Use the server copy when this device should adopt the existing vault; replaced or device-only files remain in local recovery.").addDropdown(dropdown=>dropdown.addOption("preserve-local","Compare and preserve local files").addOption("server-first","Use server copy; keep local backups").setValue(initial).onChange(value=>selected(value as "preserve-local"|"server-first")));}
 
-class ConfirmActionModal extends Modal{
+class ConfirmActionModal extends PluginOwnedModal{
   private settled=false;
   constructor(app:App,private readonly heading:string,private readonly message:string,private readonly confirmText:string,private readonly resolve:(value:boolean)=>void,private readonly warning=false){super(app);}
   onOpen(){mobileContent(this.contentEl);this.setTitle(this.heading);this.contentEl.createEl("p",{text:this.message});
@@ -40,7 +46,7 @@ function confirmAction(app:App,heading:string,message:string,confirmText="Contin
   return new Promise((resolve)=>new ConfirmActionModal(app,heading,message,confirmText,resolve,warning).open());
 }
 
-class TextPromptModal extends Modal{
+class TextPromptModal extends PluginOwnedModal{
   private settled=false;private value="";
   constructor(app:App,private readonly heading:string,private readonly label:string,initial:string,private readonly resolve:(value:string|null)=>void){super(app);this.value=initial;}
   onOpen(){mobileContent(this.contentEl);this.setTitle(this.heading);let input!:HTMLInputElement;
@@ -61,8 +67,8 @@ async function copyText(value:string):Promise<boolean>{
   try{return document.execCommand("copy");}catch{return false;}finally{area.remove();}
 }
 
-export class SetupModal extends Modal {
-  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app); }
+export class SetupModal extends PluginOwnedModal {
+  constructor(app: App, private readonly plugin: GibSyncPlugin) { super(app,plugin); }
   onOpen() {
     mobileContent(this.contentEl);
     this.setTitle("Connect Gib Sync");
@@ -105,11 +111,11 @@ export class SetupModal extends Modal {
   onClose(){this.contentEl.empty();}
 }
 
-export class QuickCodeDisplayModal extends Modal {
+export class QuickCodeDisplayModal extends PluginOwnedModal {
   private timer:number|null=null;private expiresAt=0;private refreshing=false;private closed=false;private generation=0;private retryAt=0;private refreshError="";private codeEl!:HTMLElement;private statusEl!:HTMLElement;
   private expiryTimer:number|null=null;private qrExpiryTimer:number|null=null;private qrEl!:HTMLElement;private qrMessage!:HTMLElement;private copyLink!:HTMLButtonElement;private invite:{url:string;expiresAt:number;generation:number}|null=null;
   private approvals!:HTMLElement;private approvalsLoading=false;private nextApprovalCheck=0;private approvalRows=new Map<string,HTMLElement>();
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.closed=false;const generation=++this.generation;this.refreshing=false;this.expiresAt=0;this.retryAt=0;this.refreshError="";this.setTitle("Connect another device");this.contentEl.createEl("p",{text:"On your phone, scan the QR with the Camera app, then choose “Open Gib Sync” and review the vault in Obsidian. Camera access inside Obsidian is not needed."});this.qrEl=this.contentEl.createDiv({cls:"gib-sync-setup-qr",attr:{"aria-label":"Temporary setup QR"}});this.qrMessage=this.contentEl.createEl("p",{cls:"gib-sync-setup-qr-caption",text:"Getting a fresh invitation…"});this.copyLink=this.contentEl.createEl("button",{text:"Copy setup link",attr:{type:"button"}});this.copyLink.disabled=true;this.copyLink.onclick=()=>{const invite=this.invite;if(!invite||Date.now()>=invite.expiresAt){this.retireInvite();return;}void copyText(invite.url).then(copied=>{if(!this.closed&&this.invite===invite)new Notice(copied?"Temporary setup link copied. It contains no vault keys or account credentials.":"Clipboard unavailable.");});};this.contentEl.createEl("p",{text:"Or enter this five-digit code manually in Gib Sync on the other device."});this.codeEl=this.contentEl.createDiv({cls:"gib-sync-quick-code",text:"-----"});this.statusEl=this.contentEl.createEl("p",{cls:"gib-sync-muted",attr:{role:"status","aria-live":"polite"}});
     const retry=this.contentEl.createEl("button",{text:"New code",attr:{type:"button"}});retry.onclick=()=>void this.refresh(true);this.approvals=this.contentEl.createDiv({cls:"gib-sync-device-requests"});
     await this.refresh();if(!this.closed&&generation===this.generation)this.timer=window.setInterval(()=>this.tick(),1000);}
@@ -134,27 +140,27 @@ function renderDeviceRequest(row:HTMLElement,request:TrustedDeviceRequest,plugin
   actions.createEl("button",{text:"Decline",attr:{type:"button"}}).onclick=()=>void decide(false);actions.createEl("button",{text:"Approve device",cls:"mod-cta",attr:{type:"button"}}).onclick=()=>void decide(true);
 }
 
-export class DeviceRequestsModal extends Modal{
+export class DeviceRequestsModal extends PluginOwnedModal{
   private closed=false;private timer:number|null=null;private loading=false;private list!:HTMLElement;private status!:HTMLElement;private rows=new Map<string,HTMLElement>();
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   onOpen(){mobileContent(this.contentEl);this.setTitle("Approve a new device");this.status=this.contentEl.createEl("p",{text:"Checking device requests…",attr:{role:"status"}});this.list=this.contentEl.createDiv();void this.refresh();this.timer=window.setInterval(()=>void this.refresh(),2000);}
   private async refresh(){if(this.closed||this.loading)return;this.loading=true;try{const requests=await this.plugin.api.pendingDeviceClaims();if(this.closed)return;this.status.setText(requests.length?"Only approve a device whose confirmation number you can verify.":"No device is waiting for approval.");const ids=new Set(requests.map(item=>item.id));for(const [id,row]of this.rows)if(!ids.has(id)){row.remove();this.rows.delete(id);}for(const item of requests)if(!this.rows.has(item.id)){const row=this.list.createDiv({cls:"gib-sync-device-request"});this.rows.set(item.id,row);renderDeviceRequest(row,item,this.plugin,()=>this.closed);}}catch(error){if(!this.closed)this.status.setText(error instanceof Error?error.message:String(error));}finally{this.loading=false;}}
   onClose(){this.closed=true;if(this.timer!==null)window.clearInterval(this.timer);this.contentEl.empty();}
 }
 
-class DeviceApprovalWaitModal extends Modal{
+class DeviceApprovalWaitModal extends PluginOwnedModal{
   private closed=false;private settled=false;private timer:number|null=null;private status!:HTMLElement;
   private readonly abort=()=>this.close();
-  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly server:string,private readonly claim:PendingDeviceClaim,private readonly done:(result:{pairingId:string;envelope:string}|Error)=>void,private readonly signal?:AbortSignal){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly server:string,private readonly claim:PendingDeviceClaim,private readonly done:(result:{pairingId:string;envelope:string}|Error)=>void,private readonly signal?:AbortSignal){super(app,plugin);}
   onOpen(){if(this.signal?.aborted){this.close();return;}this.signal?.addEventListener("abort",this.abort,{once:true});mobileContent(this.contentEl);this.setTitle("Approve on your connected device");this.contentEl.createEl("p",{text:`Compare this number with the request on the connected device:`});this.contentEl.createDiv({cls:"gib-sync-quick-code",text:this.claim.confirmationCode});this.status=this.contentEl.createEl("p",{text:"Waiting for approval…",attr:{role:"status","aria-live":"polite"}});this.contentEl.createEl("button",{text:"Cancel",attr:{type:"button"}}).onclick=()=>this.close();void this.poll();}
   private async poll(){if(this.closed)return;if(Date.parse(this.claim.expiresAt)<=Date.now()){this.finish(new Error("Device approval expired. Request a new quick code."));return;}try{const response=await this.plugin.api.pollDeviceClaim(this.server,this.claim.ticket);if(this.closed){if(response.status==="approved")void this.plugin.api.cancelDeviceClaim(this.server,this.claim.ticket).catch(()=>{});return;}if(response.status==="approved"){this.finish(response);return;}}catch(error){if(this.closed)return;if((error as {status?:number}).status===410){this.finish(error as Error);return;}this.status.setText("Connection interrupted. Still waiting safely for approval…");}if(!this.closed)this.timer=window.setTimeout(()=>void this.poll(),1500);}
   private finish(result:{pairingId:string;envelope:string}|Error){if(this.settled)return;this.settled=true;this.done(result);this.close();}
   onClose(){this.closed=true;this.signal?.removeEventListener("abort",this.abort);if(this.timer!==null)window.clearTimeout(this.timer);if(!this.settled){this.settled=true;void this.plugin.api.cancelDeviceClaim(this.server,this.claim.ticket).catch(()=>{});this.done(new Error("Device connection cancelled."));}this.contentEl.empty();}
 }
 
-export class QuickCodeEntryModal extends Modal {
+export class QuickCodeEntryModal extends PluginOwnedModal {
   private closed=false;private generation=0;private controller=new AbortController();
-  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly prefill?:QuickCodeInvite,private readonly closedCallback?:()=>void){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly prefill?:QuickCodeInvite,private readonly closedCallback?:()=>void){super(app,plugin);}
   onOpen(){this.closed=false;const generation=++this.generation;if(this.controller.signal.aborted)this.controller=new AbortController();if(alreadyConnected(this.plugin)){new Notice("This vault is already connected. Open an unconnected vault to use a setup invitation.");this.close();return;}let invite:QuickCodeInvite|undefined;try{if(this.prefill)invite=parseSetupInvite({action:"gib-sync-setup",server:this.prefill.server,...(this.prefill.token?{token:this.prefill.token}:{code:this.prefill.code}),expires:String(this.prefill.expiresAt)});}catch{new Notice("This setup invitation is invalid or expired. Scan a fresh QR or enter a new code manually.");this.close();return;}mobileContent(this.contentEl);this.setTitle(invite?"Review Gib Sync setup":"Enter quick code");let server=invite?.server||this.plugin.settings.serverUrl||"";let code=invite?.code||"";let deviceName=defaultDeviceName();let onboardingMode:"preserve-local"|"server-first"=invite?"server-first":"preserve-local";
     if(invite){const review=this.contentEl.createDiv({cls:"gib-sync-setup-review"});review.createEl("strong",{text:`Current vault: ${this.app.vault.getName()}`});review.createEl("p",{text:`Server: ${invite.server}`});review.createEl("p",{text:"Confirm this is the vault and server you intended. Nothing connects until you choose Connect. The connected device must still approve the matching verification number."});}
     this.contentEl.createEl("p",{text:invite?"Setup was filled from the QR. Review the server and current vault, then choose Connect.":"On an already connected device, choose “Show quick code,” then type that temporary code here."});
@@ -171,8 +177,8 @@ export class QuickCodeEntryModal extends Modal {
   onClose(){this.closed=true;this.generation++;this.controller.abort();this.contentEl.empty();this.closedCallback?.();}
 }
 
-class SelectiveRestoreModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly snapshot:HistoryItem,private readonly restored:()=>void){super(app);}
+class SelectiveRestoreModal extends PluginOwnedModal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly snapshot:HistoryItem,private readonly restored:()=>void){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Restore selected files");this.contentEl.empty();const status=this.contentEl.createEl("p",{text:"Loading changed files…"});
     try{const plan=await this.plugin.api.selectiveRestorePlan(this.snapshot.id);status.remove();if(!plan.changes.length){this.contentEl.createEl("p",{text:"This snapshot already matches the current vault."});return;}
       const selected=new Set<string>(),controls=this.contentEl.createDiv({cls:"gib-sync-row-actions"}),search=this.contentEl.createEl("input",{cls:"gib-sync-selective-restore-search"}),list=this.contentEl.createDiv({cls:"gib-sync-selective-restore-list"});search.type="search";search.placeholder="Filter changed paths";
@@ -189,8 +195,8 @@ class SelectiveRestoreModal extends Modal{
   onClose(){this.contentEl.empty();}
 }
 
-export class HistoryModal extends Modal {
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+export class HistoryModal extends PluginOwnedModal {
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Gib Sync history");this.contentEl.empty();const container=this.contentEl.createDiv({cls:"gib-sync-history"});container.setText("Loading…");try{const history=await this.plugin.api.history();container.empty();for(const item of history)this.row(container,item);if(!history.length)container.setText("No snapshots yet.");}catch(error){container.setText(error instanceof Error?error.message:String(error));}}
   private row(container:HTMLElement,item:HistoryItem){const row=container.createDiv({cls:"gib-sync-history-row"});const details=row.createDiv();details.createEl("strong",{text:`${item.bookmarked?"★ ":""}${item.message}`});details.createEl("div",{cls:"gib-sync-muted",text:`${new Date(item.createdAt).toLocaleString()} · ${item.deviceName} · ${item.fileCount} files`});
     const actions=row.createDiv({cls:"gib-sync-row-actions"}),bookmark=actions.createEl("button",{text:item.bookmarked?"Unbookmark":"Bookmark"});
@@ -204,8 +210,8 @@ export class HistoryModal extends Modal {
   onClose(){this.contentEl.empty();}
 }
 
-export class SafeguardReviewModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly closed:()=>void=()=>{}){super(app);}
+export class SafeguardReviewModal extends PluginOwnedModal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin,private readonly closed:()=>void=()=>{}){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Gib Sync quarantined changes");this.contentEl.empty();this.contentEl.setText("Loading…");try{const items=await this.plugin.api.quarantines();this.contentEl.empty();if(!items.length){this.contentEl.createEl("p",{text:"No changes are waiting for approval."});return;}for(const item of items)this.item(item);}catch(error){this.contentEl.setText(error instanceof Error?error.message:String(error));}}
   private item(item:QuarantineItem){
     const card=this.contentEl.createDiv({cls:"gib-sync-safeguard-card"});card.createEl("h3",{text:`${item.deviceName} · ${item.source==="seafile"?"Seafile/WebDAV":"Obsidian device"}`});
@@ -225,8 +231,8 @@ export class SafeguardReviewModal extends Modal{
   onClose(){this.contentEl.empty();this.closed();}
 }
 
-export class DeviceManagementModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+export class DeviceManagementModal extends PluginOwnedModal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Gib Sync devices");this.contentEl.setText("Loading…");await this.plugin.refreshServerStatus();this.contentEl.empty();const devices=this.plugin.serverStatus?.devices??[];
     for(const device of devices)this.row(device);if(!devices.length)this.contentEl.setText("No device information available.");}
   private row(device:DeviceInfo){const row=this.contentEl.createDiv({cls:"gib-sync-history-row"}),details=row.createDiv();details.createEl("strong",{text:`${device.name}${device.current?" (this device)":""}`});
@@ -239,9 +245,9 @@ export class DeviceManagementModal extends Modal{
 }
 
 /** Recovery browsing is read-only; opening it never modifies accepted or local files. */
-export class LocalRecoveryModal extends Modal{
+export class LocalRecoveryModal extends PluginOwnedModal{
   private closed=false;
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){this.closed=false;mobileContent(this.contentEl);this.setTitle("Recovery copies on this device");this.contentEl.createEl("p",{text:"Originals replaced or deleted during sync are kept here. These copies stay on this device, outside normal synchronization. Preview a copy before restoring anything; accepted server versions are available separately in Version history."});const list=this.contentEl.createDiv({cls:"gib-sync-history"}),status=list.createEl("p",{text:"Looking for recovery copies…"});
     try{const adapter=this.app.vault.adapter,root=".gib-sync/local-recovery",configDir=this.app.vault.configDir??".obsidian",physical=(path:string)=>path.startsWith(".obsidian/")?`${configDir}${path.slice(".obsidian".length)}`:path,packages=typeof this.plugin.listPackageRecoveryOriginals==="function"?await this.plugin.listPackageRecoveryOriginals():[],roots=[root,...packages.map(item=>item.path).filter(isSafeVaultPath)],pending:Array<{logical:string;root:string}>=[],files:string[]=[];let visited=0;
       for(const directory of roots)if(await adapter.exists(physical(directory)))pending.push({logical:directory,root:directory});
@@ -253,9 +259,9 @@ export class LocalRecoveryModal extends Modal{
   onClose(){this.closed=true;this.contentEl.empty();}
 }
 
-export class ConflictInboxModal extends Modal{
+export class ConflictInboxModal extends PluginOwnedModal{
   private closed=false;private generation=0;private list!:HTMLElement;private detail!:HTMLElement;private status!:HTMLElement;private records:ConflictInboxItem[]=[];
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.modalEl.addClass("gib-sync-conflict-modal");this.setTitle("Conflicts & recovery");this.contentEl.createEl("p",{text:"Both originals are safe. Compare the actual versions, choose the result, or keep both. Decisions can be undone while those files have no newer edits."});this.status=this.contentEl.createEl("p",{text:"Loading preserved versions…",attr:{role:"status","aria-live":"polite"}});const search=this.contentEl.createEl("input",{attr:{type:"search",placeholder:"Find a file","aria-label":"Find conflict"}});this.list=this.contentEl.createDiv({cls:"gib-sync-conflict-list"});this.detail=this.contentEl.createDiv({cls:"gib-sync-conflict-detail"});search.oninput=()=>this.renderList(search.value);await this.refresh();}
   private async refresh(){const generation=++this.generation;try{const records=await this.plugin.listConflictInbox();if(this.closed||generation!==this.generation)return;this.records=records;this.status.setText(records.length?`${records.filter(item=>item.state==="open"&&item.actionRequired!==false).length} need a decision · originals preserved`:"No recorded conflicts. Local recovery copies and version history are available in settings.");this.renderList("");}catch(error){if(!this.closed)this.status.setText(error instanceof Error?error.message:String(error));}}
   private renderList(query:string){this.list.empty();const matches=this.records.filter(item=>!query||item.path.toLowerCase().includes(query.toLowerCase()));for(const item of matches.slice(0,100)){const button=this.list.createEl("button",{text:`${item.path} · ${item.state==="resolved"?"Resolved":item.actionRequired===false?"Auto-merged · originals kept":"Review"}`,attr:{type:"button"}});button.onclick=()=>void this.preview(item);}if(matches.length>100)this.list.createEl("p",{text:`Showing 100 of ${matches.length}. Refine the search to find another record.`});}
@@ -267,15 +273,15 @@ export class ConflictInboxModal extends Modal{
   onClose(){this.closed=true;this.generation++;this.contentEl.empty();}
 }
 
-export class DeviceDiagnosticsModal extends Modal{
+export class DeviceDiagnosticsModal extends PluginOwnedModal{
   private readonly probe=new DeviceLifecycleProbe();private readonly activity=new DeviceSyncActivityProbe();private readonly controller=new AbortController();private report:DeviceProbeReport|null=null;private unsubscribe:(()=>void)|null=null;private testing=false;
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   onOpen(){mobileContent(this.contentEl);this.setTitle("Device readiness test");this.probe.start();this.activity.start(this.probe);this.activity.observe(this.plugin.liveStatus);this.unsubscribe=this.plugin.subscribeStatus(()=>this.activity.observe(this.plugin.liveStatus));this.contentEl.createEl("p",{text:"This separately measures idle frames, frames during generated 1 MB native file work, and frames during a real sync while this window stays open. Background and return during an observed sync to check resume. A small synthetic test does not certify a large vault. Reports contain timing and phase counts only, never content, paths, identity, or credentials."});const status=this.contentEl.createEl("p",{text:"Ready",attr:{role:"status"}}),run=this.contentEl.createEl("button",{text:"Run generated device test",attr:{type:"button"}}),sync=this.contentEl.createEl("button",{text:"Run observed sync",attr:{type:"button"}}),copy=this.contentEl.createEl("button",{text:"Copy safe test report",attr:{type:"button"}});copy.disabled=true;run.onclick=async()=>{if(this.plugin.liveStatus.running||this.testing){status.setText("Wait for this sync to finish before generated testing.");return;}this.testing=true;run.disabled=true;sync.disabled=true;status.setText("Testing native streaming and interface responsiveness…");try{this.report=await runDeviceProbe(this.app.vault.adapter,this.plugin.manifest.version,Platform.isIosApp?"ios":Platform.isAndroidApp?"android":"desktop",this.probe,this.controller.signal,this.activity);if(!this.controller.signal.aborted){status.setText("Generated test complete. Observe a real sync for representative measurements, then copy the report.");copy.disabled=false;}}catch(error){if(!this.controller.signal.aborted)status.setText(error instanceof Error?error.message:String(error));}finally{this.testing=false;run.disabled=false;sync.disabled=false;}};sync.onclick=async()=>{if(this.testing||this.plugin.liveStatus.running){status.setText("Already observing the current work.");return;}sync.disabled=true;status.setText("Observing real sync. You can background Obsidian and return.");try{const complete=await this.plugin.runSync();if(!this.controller.signal.aborted)status.setText(complete?"Observed sync completed. Its responsiveness and lifecycle counts are included in the report.":"Sync did not finish; observed timing is still retained. Check the normal sync status.");}finally{sync.disabled=false;}};copy.onclick=async()=>{if(!this.report)return;const actualSync=this.activity.snapshot(),report={...this.report,lifecycle:{...this.probe.counts},responsiveness:{...this.report.responsiveness,actualSync},evidence:{...this.report.evidence,syntheticOnly:actualSync.startedRuns===0,realRunObserved:actualSync.startedRuns>0}},copied=await copyText(JSON.stringify(report,null,2));if(!this.controller.signal.aborted)status.setText(copied?"Safe device test report copied.":"Clipboard unavailable.");};}
   onClose(){this.controller.abort();this.unsubscribe?.();this.unsubscribe=null;this.activity.stop();this.probe.stop();this.contentEl.empty();}
 }
 
-export class SafeguardSettingsModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+export class SafeguardSettingsModal extends PluginOwnedModal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   async onOpen(){mobileContent(this.contentEl);this.setTitle("Mass-change safeguards");this.contentEl.setText("Loading…");try{const state=await this.plugin.api.safeguards(),policy={...state.policy,protectedPaths:[...state.policy.protectedPaths]};this.contentEl.empty();
     this.contentEl.createEl("p",{text:"Balanced and strict modes use server-maintained thresholds. Custom mode uses every value below. Protected paths are enforced in every mode."});
     const maintenance=new Setting(this.contentEl).setName("Vault maintenance session").setDesc(state.trustedUntil?`Mass changes from this device are allowed until ${when(state.trustedUntil)}. Snapshot history and conflict handling remain active.`:"Temporarily allow intentional bulk edits, conflict-copy cleanup, and reorganizing from this device. Protection resumes automatically after 60 minutes.");
@@ -297,8 +303,8 @@ export class SafeguardSettingsModal extends Modal{
   onClose(){this.contentEl.empty();}
 }
 
-export class NativeSyncConflictModal extends Modal{
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+export class NativeSyncConflictModal extends PluginOwnedModal{
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   onOpen(){
     mobileContent(this.contentEl);this.modalEl.addClass("gib-sync-native-sync-modal");this.setTitle("Obsidian Sync must be disabled");
     this.contentEl.createEl("p",{text:"Gib Sync has paused all scheduled and incoming synchronization because the Obsidian Sync core plugin is enabled. Running two sync engines against the same vault can create duplicate, conflicting, or deleted files."});
@@ -310,10 +316,10 @@ export class NativeSyncConflictModal extends Modal{
   onClose(){this.contentEl.empty();}
 }
 
-export class StatusOverviewModal extends Modal{
+export class StatusOverviewModal extends PluginOwnedModal{
   private unsubscribe:(()=>void)|null=null;
   private hero!:HTMLElement;private icon!:HTMLElement;private overviewTitleEl!:HTMLElement;private descriptionEl!:HTMLElement;private metaEl!:HTMLElement;private progress!:HTMLElement;private progressValue!:HTMLElement;private primary!:HTMLButtonElement;private pause!:HTMLButtonElement;
-  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app);}
+  constructor(app:App,private readonly plugin:GibSyncPlugin){super(app,plugin);}
   onOpen(){
     mobileContent(this.contentEl);this.modalEl.addClass("gib-sync-status-modal");this.setTitle("Sync status");
     this.hero=this.contentEl.createDiv({cls:"gib-sync-status-overview"});this.icon=this.hero.createSpan({cls:"gib-sync-status-overview-icon"});this.icon.setAttr("aria-hidden","true");

@@ -16,8 +16,10 @@ import { deriveIndicatorState } from "./status";
 import { assertSetupServerCompatible,enforceServerCompatibility,unavailableServerCompatibility } from "./server-compatibility";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
 import {parseSetupInvite} from "./setup-qr";
+import {ModalRegistry,closeLegacyPluginDialogs} from './modal-lifecycle';
 
 export default class GibSyncPlugin extends Plugin {
+  readonly modalRegistry=new ModalRegistry();
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
   private statusEl!: HTMLElement; private timer: number | null = null; private debounce: number | null = null;
   private debounceKind: "automatic"|"file-change"|null = null;
@@ -69,6 +71,7 @@ export default class GibSyncPlugin extends Plugin {
   private readonly persistSettings=createSerializedSettingsWriter(()=>this.settings,(snapshot)=>this.saveData(snapshot));
 
   async onload() {
+    if(typeof document!=='undefined'&&typeof document.querySelectorAll==='function')closeLegacyPluginDialogs(document);
     this.settings = await loadSettings(this);this.settings.configDir=normalizePath(this.app.vault.configDir);this.settings.fullScanRequired=true;
     this.registerSetupInviteHandler();
     for(const path of this.settings.pendingPaths)this.pathVersions.set(path,++this.pathRevision);
@@ -130,6 +133,7 @@ export default class GibSyncPlugin extends Plugin {
 
   onunload() {
     this.stopped=true;
+    this.modalRegistry.dispose();
     this.setupInviteModal?.close();this.setupInviteModal=null;
     this.configWatcher?.stop();
     this.cancelOperation();
@@ -482,7 +486,7 @@ export default class GibSyncPlugin extends Plugin {
     if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("checking","Checking for changes");
-    let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false,retryStarted=false;
+    let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false,retryStarted=false,serverRepairWaiting=false;
     const startingVersions=new Map(this.pathVersions),startingPathTimes={...this.settings.pendingPathTimes},startingFullScanRevision=this.fullScanRevision;
     try {
       const result = await recoverSync(async()=>{
@@ -532,6 +536,8 @@ export default class GibSyncPlugin extends Plugin {
       if(error instanceof SyncCancelledError){
         if(this.stopped)return false;
         if(this.settings.paused)this.report("blocked","Synchronization paused");
+      }else if(error instanceof ApiError&&error.status===503&&(error.responseBody as {healthRepairActive?:boolean}|null)?.healthRepairActive===true){
+        serverRepairWaiting=true;this.report('scheduled','Waiting for the server to finish repair · your saved edits will sync automatically','info');
       }else if(error instanceof FileChangedDuringReadError){
         changedDuringRead=error;
         const nowMs=Date.now(),previous=this.changedDuringReadFailures.get(error.path);
@@ -554,6 +560,7 @@ export default class GibSyncPlugin extends Plugin {
       this.syncApplicationRevisions=null;
       this.scheduleExpectedVerification();
       if(this.stopped||this.settings.paused||this.safetyHold||this.compatibilityBlocked||this.nativeSyncBlocked){this.liveStatus.nextSyncAt=null;this.emitStatus();}
+      else if(serverRepairWaiting){this.fileChangePending=false;this.queueSync(5000,'Waiting for server repair to finish','automatic');}
       else if(changedDuringRead){this.fileChangePending=false;this.queueSync(2000,"File changed during sync; retrying");}
       else if(this.fileChangePending&&this.settings.syncOnFileChange){this.fileChangePending=false;this.queueSync(genericFailure?15_000:2000,genericFailure?"Files changed; retrying with error backoff":"Files changed during sync");}
       else this.scheduleNextSyncLabel();

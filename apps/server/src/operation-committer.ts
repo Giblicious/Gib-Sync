@@ -11,12 +11,13 @@ export interface SnapshotCommit {
   vaultId:string;parentId:string|null;deviceId:string;deviceName:string;message:string;entries:ManifestEntry[];folders?:string[];folderEntries?:FolderEntry[];folderRepair?:FolderRepairDirective;createdAt?:string;
   operationBatch?:OperationBatch;afterInsert?:(snapshot:Snapshot)=>void;
   signal?:AbortSignal;
+  maintenancePermit?:symbol;
 }
 export interface BatchPreview {tree:SyncTree;parentId:string|null;createdAt:string;sequence:number;planned:PlannedOperations;}
 
 /** Sole authority: operations, live tree, accepted snapshot and receipt commit together. */
 export class OperationSnapshotCommitter {
-  constructor(private readonly store:Store,private readonly storage:SeafileStorage,private readonly storageRow:(vaultId:string)=>VaultStorageRow){}
+  constructor(private readonly store:Store,private readonly storage:SeafileStorage,private readonly storageRow:(vaultId:string)=>VaultStorageRow,private readonly assertWritable?:(vaultId:string,permit?:symbol)=>void){}
   getBatch(vaultId:string,batchId:string,deviceId?:string):OperationReceipt|null{return getOperationReceipt(this.store,vaultId,batchId,deviceId);}
   private ensure(vaultId:string):void{if(!this.store.one("SELECT 1 FROM sync_vault_state WHERE vault_id=?",vaultId)){this.store.db.exec("BEGIN IMMEDIATE");try{bootstrapSyncState(this.store);this.store.db.exec("COMMIT");}catch(error){this.store.db.exec("ROLLBACK");throw error;}}}
   previewBatch(vaultId:string,batch:OperationBatch,deviceId:string,deviceName:string,createdAt=new Date().toISOString()):BatchPreview{
@@ -34,6 +35,7 @@ export class OperationSnapshotCommitter {
     const supplied=input.operationBatch,payloadHash=supplied?batchHash(supplied):null;
     const replay=()=>{if(!supplied)return null;const existing=this.store.one<{device_id:string;payload_hash:string;result_snapshot_id:string}>("SELECT device_id,payload_hash,result_snapshot_id FROM sync_batches WHERE vault_id=? AND batch_id=?",input.vaultId,supplied.batchId);if(!existing)return null;if(existing.device_id!==input.deviceId||existing.payload_hash!==payloadHash)throw new OperationConflict("Batch ID was reused with different ownership or content");return getSnapshotView(this.store,existing.result_snapshot_id);};
     const existing=replay();if(existing)return existing;
+    this.assertWritable?.(input.vaultId,input.maintenancePermit);
     const current=this.store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",input.vaultId)?.head_id??null;if(current!==input.parentId)return null;
     const acceptedSizes=new Map((current?this.store.getSnapshot(current)?.entries??[]:[]).map(entry=>[entry.hash,entry.size]));
     for(const entry of input.entries){const proof=this.store.one<{clear_size:number}>("SELECT clear_size FROM blob_integrity WHERE vault_id=? AND hash=?",input.vaultId,entry.hash),known=proof?.clear_size??acceptedSizes.get(entry.hash);if(known!==undefined&&known!==entry.size)throw new OperationConflict("Proposed content size differs from its verified clear content");}
@@ -48,6 +50,10 @@ export class OperationSnapshotCommitter {
     if(input.folderRepair)snapshot.folderRepair={...input.folderRepair,retiredFolders:canonicalManifest([],input.folderRepair.retiredFolders).folders??[],originSnapshotIds:[...new Set(input.folderRepair.originSnapshotIds)].sort()};
     await this.storage.put(this.storageRow(input.vaultId),`snapshots/${snapshot.id}.json`,Buffer.from(JSON.stringify(snapshot)),"application/json",input.signal);
     input.signal?.throwIfAborted();
+    const acceptedWhileWriting=replay();if(acceptedWhileWriting)return acceptedWhileWriting;
+    // A repair may begin while the immutable sidecar PUT is in flight. An
+    // unaccepted sidecar is harmless; the authoritative head must not advance.
+    this.assertWritable?.(input.vaultId,input.maintenancePermit);
     this.store.db.exec("BEGIN IMMEDIATE");
     try{
       const concurrentReplay=replay();if(concurrentReplay){this.store.db.exec("ROLLBACK");return concurrentReplay;}

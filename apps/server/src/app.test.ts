@@ -635,6 +635,24 @@ describe("Gib Sync API", () => {
     expect(store.one("SELECT 1 FROM mirror_mutations WHERE vault_id=? AND path='upload.bin' AND write_acknowledged=1 AND fence_commit IS NOT NULL AND state='captured'",setup.vaultId)).toBeDefined();
     await app.close();
   });
+  it('repairs verified unchanged readable files without rewriting them or changing accepted identities',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Desktop')})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},clear=Buffer.from('unchanged complete content'),hash=sha256(clear);
+    await app.inject({method:'PUT',url:`/v1/blobs/${hash}`,headers:{...auth,'content-type':'application/octet-stream'},payload:encryptedFixture(clear,Buffer.from(setup.vaultKey,'base64url'),hash)});
+    const first=(await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:null,message:'Initial',entries:[{path:'note.md',hash,size:clear.length,mtime:1}],folders:[]}})).json();
+    expect((await app.inject({method:'POST',url:'/v1/mirror/complete',headers:auth,payload:{snapshotId:first.id}})).statusCode).toBe(200);
+    const write=vi.spyOn(storage,'putReadable'),before=store.getSnapshot(first.id)!,result=await app.inject({method:'POST',url:'/v1/health/repair',headers:auth,payload:{restoreAcceptedHead:true}});
+    expect(result.statusCode).toBe(200);expect(result.json().mirrorCurrent).toBe(true);expect(write).not.toHaveBeenCalled();expect(store.getSnapshot(first.id)).toEqual(before);expect(storage.files.get(`read:${setup.vaultId}:note.md`)).toEqual(clear);await app.close();
+  });
+  it('holds normal accepted writes during a checkpoint repair, then accepts the unchanged saved proposal afterward',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Desktop')})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},clear=Buffer.from('protected content'),hash=sha256(clear);
+    await app.inject({method:'PUT',url:`/v1/blobs/${hash}`,headers:{...auth,'content-type':'application/octet-stream'},payload:encryptedFixture(clear,Buffer.from(setup.vaultKey,'base64url'),hash)});
+    const first=(await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:null,message:'Initial',entries:[{path:'note.md',hash,size:clear.length,mtime:1}],folders:[]}})).json();await app.inject({method:'POST',url:'/v1/mirror/complete',headers:auth,payload:{snapshotId:first.id}});
+    const read=storage.getReadable.bind(storage);let release!:()=>void,entered=false;const held=new Promise<void>(resolve=>release=resolve);vi.spyOn(storage,'getReadable').mockImplementation(async(...args)=>{if(!entered){entered=true;await held;}return read(...args);});
+    const repair=Promise.resolve(app.inject({method:'POST',url:'/v1/health/repair',headers:auth,payload:{restoreAcceptedHead:true}}));
+    await vi.waitFor(()=>expect(entered).toBe(true));const proposal={parentId:first.id,message:'Saved edit during repair',entries:first.entries,folders:['New empty']};
+    const deferred=await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal});expect(deferred.statusCode).toBe(503);expect(deferred.json().healthRepairActive).toBe(true);expect(deferred.headers['retry-after']).toBe('5');expect(store.one('SELECT head_id FROM vaults WHERE id=?',setup.vaultId)).toEqual({head_id:first.id});expect(store.all('SELECT id FROM quarantines WHERE vault_id=?',setup.vaultId)).toHaveLength(0);
+    release();expect((await repair).statusCode).toBe(200);const accepted=await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal});expect(accepted.statusCode).toBe(201);expect(accepted.json().entries[0].fileId).toBe(first.entries[0].fileId);expect(accepted.json().folders).toEqual(['New empty']);await app.close();
+  });
   it("resumes a partial mirror into a newer large generation without inventing deletions",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},key=Buffer.from(setup.vaultKey,"base64url");

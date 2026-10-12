@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.73 candidate
+
+- Tie all Gib Sync dialogs to their loaded plugin instance. Unloading closes status subscriptions, diagnostic observers, setup timers and pending prompts; closed windows are not retained, and legacy marked windows close through Obsidian's normal UI during an update.
+- Verify already-correct readable files during accepted-checkpoint repair instead of needlessly rewriting every note and plugin. Complete content hashing and final generation/backend-identity verification remain required.
+- Hold new device head commits during a checkpoint rebuild, including commits whose immutable upload began before the repair. Only the internal repair transaction has an opaque permit; previously accepted operation receipts remain replayable.
+- Treat known repair-in-progress responses as quiet waiting with automatic retry, not a failure notification. Saved edits remain on the device and publish after the repair boundary clears.
+- Add native-window lifecycle, delayed acceptance, repair/read-back and quiet-resume regressions. The full candidate suite contains 1,014 tests; physical and preserving server validation remain independent gates.
+
+This candidate is distributed only through Gib-Sync-Canary. Current-user publication and production deployment remain blocked until acceptance.
+
 ## 0.8.72 candidate
 
 - Preserve the original file identity when a newer accepted head interrupts a partial readable projection. Require path/commit-scoped immutable capture, a backend write acknowledgement, an authenticated fence, and the exact accepted file identity; matching bytes or timing alone are insufficient.

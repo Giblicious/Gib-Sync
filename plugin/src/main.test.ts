@@ -24,6 +24,7 @@ beforeEach(()=>{vi.useFakeTimers();vi.stubGlobal("window",globalThis);setupEntri
 afterEach(()=>{vi.useRealTimers();vi.unstubAllGlobals();vi.restoreAllMocks();});
 
 describe("review-only setup URI routing",()=>{
+  it('closes every registered plugin window on unload without retaining or reopening its controls',()=>{const {plugin}=fixture(),close=vi.fn();plugin.modalRegistry.add({close});vi.stubGlobal('document',{querySelectorAll:()=>[]});plugin.onunload();expect(close).toHaveBeenCalledOnce();expect(plugin.modalRegistry.size).toBe(0);expect(()=>plugin.modalRegistry.add({close})).toThrow('unloaded');});
   const params=()=>({action:"gib-sync-setup",server:"https://sync.example.test/canary",code:"12345",expires:String(Date.now()+60_000),vault:"Must not silently select this vault"});
   function unpaired(){const {plugin}=fixture();plugin.settings.deviceToken="";plugin.settings.vaultId="";plugin.acceptSetup=vi.fn(async()=>{});return plugin;}
   it("registers the exact protocol action and opens only a parsed prefilled review modal",()=>{const plugin=unpaired(),register=vi.fn();(plugin as any).registerObsidianProtocolHandler=register;const before=structuredClone(plugin.settings);(plugin as any).registerSetupInviteHandler();expect(register).toHaveBeenCalledWith("gib-sync-setup",expect.any(Function));register.mock.calls[0][1](params());expect(setupEntries).toHaveLength(1);expect(setupEntries[0].invite).toEqual({server:"https://sync.example.test/canary",code:"12345",expiresAt:Date.now()+60_000});expect(setupEntries[0].open).toHaveBeenCalledOnce();expect(claimSetup).not.toHaveBeenCalled();expect(plugin.acceptSetup).not.toHaveBeenCalled();expect(plugin.saveSettings).not.toHaveBeenCalled();expect(plugin.settings).toEqual(before);});
@@ -81,6 +82,13 @@ describe("plugin synchronization lifecycle",()=>{
     const {plugin,sync}=fixture();sync.mockRejectedValue(new ApiError("Busy",503,null));
     const run=plugin.runSync();await vi.advanceTimersByTimeAsync(17000);await expect(run).resolves.toBe(false);
     expect(sync).toHaveBeenCalledTimes(4);expect(plugin.liveStatus.phase).toBe("error");expect(Notice).toHaveBeenCalledTimes(1);
+  });
+  it('waits quietly for an acknowledged server repair and syncs automatically after it finishes',async()=>{
+    const {plugin,sync}=fixture();sync.mockRejectedValue(new ApiError('Checkpoint repair',503,{healthRepairActive:true}));
+    const run=plugin.runSync();await vi.advanceTimersByTimeAsync(17000);await expect(run).resolves.toBe(false);
+    expect(plugin.liveStatus.phase).toBe('scheduled');expect(plugin.settings.lastError).toBe('');expect(Notice).not.toHaveBeenCalled();
+    sync.mockResolvedValue({uploaded:0,mirrored:0,downloaded:0,deleted:0,conflicts:0,prunedFolders:0,pendingRetiredFolders:0,snapshotId:'accepted'});
+    await vi.advanceTimersByTimeAsync(5000);expect(plugin.liveStatus.phase).toBe('up-to-date');expect(Notice).not.toHaveBeenCalled();
   });
   it("surfaces safety blocks immediately and keeps the blocked state",async()=>{
     const {plugin,sync}=fixture();sync.mockRejectedValue(new SyncSafetyError("Baseline is unavailable"));

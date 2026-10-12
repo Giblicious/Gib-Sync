@@ -1,0 +1,8 @@
+import {describe,expect,it,vi} from 'vitest';
+import {closeLegacyPluginDialogs,ModalRegistry} from './modal-lifecycle';
+describe('plugin-owned dialog lifecycle',()=>{
+  it('closes each open window on unload and forgets already closed windows',()=>{const r=new ModalRegistry(),a={close:vi.fn()},b={close:vi.fn()};r.add(a);r.add(a);r.add(b);r.release(b);expect(r.size).toBe(1);expect(r.dispose()).toBe(0);expect(a.close).toHaveBeenCalledTimes(1);expect(b.close).not.toHaveBeenCalled();expect(r.size).toBe(0);});
+  it('continues cleanup after one failed close and never reopens an unloaded owner',()=>{const r=new ModalRegistry(),a={close:()=>{throw new Error('close failed');}},b={close:vi.fn()};r.add(a);r.add(b);expect(r.dispose()).toBe(1);expect(b.close).toHaveBeenCalledOnce();expect(()=>r.add(b)).toThrow('unloaded');expect(r.dispose()).toBe(0);});
+  it('handles close callbacks releasing themselves without skipping other windows',()=>{const r=new ModalRegistry(),a={close:()=>r.release(a)},b={close:vi.fn()};r.add(a);r.add(b);expect(r.dispose()).toBe(0);expect(b.close).toHaveBeenCalledOnce();});
+  it('migrates only marked legacy Gib Sync dialogs through native close actions',()=>{const click=vi.fn(),modal={querySelector:vi.fn(()=>({click}))},content={closest:vi.fn(()=>modal)},root={querySelectorAll:vi.fn(()=>[content,content,{closest:()=>null}])};expect(closeLegacyPluginDialogs(root as unknown as ParentNode)).toBe(1);expect(root.querySelectorAll).toHaveBeenCalledWith('.gib-sync-modal-content');expect(modal.querySelector).toHaveBeenCalledWith('.modal-close-button');expect(click).toHaveBeenCalledOnce();});
+});
