@@ -32,3 +32,24 @@ These instructions apply to every automated or AI-assisted change in this reposi
 - State exactly what was published or deployed and where.
 - When a BRAT update is required, say that the release is ready for BRAT and leave the installed vault untouched.
 - Never claim a client plugin is updated merely because release files were built or published.
+
+## Isolated candidates and v2 rollout
+
+- BRAT includes prereleases in automatic updates. Never publish an unaccepted
+  candidate release in `Giblicious/Gib-Sync`, even with `make_latest=false`.
+- The source candidate workflow publishes only an Actions bundle and versioned
+  image. Disposable-device BRAT distribution belongs in the explicitly authorized
+  `Giblicious/Gib-Sync-Canary` repository; a candidate build is not a stable release.
+- Preserve the exact original Actions archive and verify its independent GitHub
+  artifact digest, source workflow success/commit, internal asset hashes and image
+  digest. Distribution/publication workflows own release assets; never rebuild,
+  recompress, patch or manually upload them after testing.
+- Stable publication uses the owned publication workflow only after isolated
+  canary, real physical iPhone and preserving migration evidence are reviewed.
+  Copy the same verified assets and promote the same image digest, not a new build.
+- A validation server must enforce its dedicated account/library before backend
+  authentication, registration and worker startup. Never enroll a real user vault
+  as a canary or copy canary rows into production.
+- Production deployment requires verified backup, isolated migration rehearsal,
+  pinned runtime and signed isolated release evidence. Rollback never rewinds a
+  database over accepted writes; re-upgrade must preserve/replay those writes.

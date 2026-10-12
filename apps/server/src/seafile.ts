@@ -4,13 +4,16 @@ import { createReadStream, openAsBlob } from "node:fs";
 import type { Config } from "./config.js";
 import { allowedSeafileHosts } from "./config.js";
 import { openJson, sealJson } from "./security.js";
+import {PrivateStaging,type StagedFile} from "./security-stream.js";
 
 type Repo = { id?: string; repo_id?: string; name: string };
 type SeafileDirEntry={type:string;parent_dir:string;id:string;name:string;mtime:number;size?:number};
 export interface ReadableStorageEntry{path:string;id:string;mtime:number;size:number;}
 export interface ReadableStorageTree{files:ReadableStorageEntry[];folders:string[];}
 export interface ReadableRevision{commitId:string;size:number;mtime:number;}
+export interface ReadableEvent{commitId:string;mtime:number;operation:"created"|"modified"|"deleted"|"renamed";path:string;previousPath?:string;directory?:boolean;}
 export class RevisionMissingError extends Error{constructor(){super("File does not exist in this immutable Seafile revision");this.name="RevisionMissingError";}}
+export class StorageMissingError extends Error{constructor(){super("Seafile content is confirmed missing");this.name="StorageMissingError";}}
 
 export interface VaultStorageRow {
   id: string;
@@ -51,7 +54,9 @@ export function safeRelativePath(value:string):string {
 
 export class SeafileStorage {
   private readonly knownDirectories = new Set<string>();
+  private readonly shutdown=new AbortController();
   constructor(private readonly config: Config) {}
+  close():void{this.shutdown.abort(new DOMException("Server is shutting down","AbortError"));}
 
   validateUrl(value: string): string {
     const url = new URL(value);
@@ -63,7 +68,7 @@ export class SeafileStorage {
 
   private async request(credentials: StorageCredentials, path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers); headers.set("Authorization", `Token ${credentials.token}`);
-    return fetch(new URL(path, `${credentials.url}/`), { ...init, headers,signal:init.signal??AbortSignal.timeout(120_000) });
+    return fetch(new URL(path, `${credentials.url}/`), { ...init, headers,signal:AbortSignal.any([this.shutdown.signal,init.signal??AbortSignal.timeout(120_000)]) });
   }
   private async readBounded(response:Response,maximumBytes:number):Promise<Uint8Array>{
     const header=response.headers.get("content-length"),declared=header===null?null:Number(header);
@@ -125,45 +130,49 @@ export class SeafileStorage {
   }
   private readableRoot(row:VaultStorageRow):string { return row.mirror_base_path==="/"?"":row.mirror_base_path; }
 
-  private async mkdir(row: VaultStorageRow, path: string): Promise<void> {
+  private async mkdir(row: VaultStorageRow, path: string,signal?:AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const key=`${row.storage_url}|${row.storage_repo_id}|${path}`;if(this.knownDirectories.has(key))return;
-    const existing=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`);
+    const existing=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`,{signal});
     if(existing.ok){this.knownDirectories.add(key);return;}
     if(existing.status!==404)throw new Error(`Seafile directory check ${path} failed (${existing.status})`);
-    const response = await this.request(this.credentials(row), `/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`, { method: "POST", body: new URLSearchParams({ operation: "mkdir" }) });
-    if(!response.ok){const raced=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`);if(!raced.ok)throw new Error(`Seafile mkdir ${path} failed (${response.status})`);}
+    const response = await this.request(this.credentials(row), `/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`, { method: "POST", body: new URLSearchParams({ operation: "mkdir" }),signal });
+    if(!response.ok){const raced=await this.request(this.credentials(row),`/api2/repos/${row.storage_repo_id}/dir/?p=${encodeURIComponent(path)}`,{signal});if(!raced.ok)throw new Error(`Seafile mkdir ${path} failed (${response.status})`);}
     this.knownDirectories.add(key);
   }
 
-  private async ensureDirectory(row:VaultStorageRow,path:string):Promise<void>{
+  private async ensureDirectory(row:VaultStorageRow,path:string,signal?:AbortSignal):Promise<void>{
     const parts=path.split("/").filter(Boolean);let current="";
-    for (const part of parts) { current += `/${part}`; await this.mkdir(row, current); }
+    for (const part of parts) { signal?.throwIfAborted();current += `/${part}`; await this.mkdir(row, current,signal); }
   }
 
-  private async ensureParents(row: VaultStorageRow, path: string): Promise<void> { await this.ensureDirectory(row,path.slice(0,path.lastIndexOf("/"))||"/"); }
+  private async ensureParents(row: VaultStorageRow, path: string,signal?:AbortSignal): Promise<void> { await this.ensureDirectory(row,path.slice(0,path.lastIndexOf("/"))||"/",signal); }
 
   async initVault(row: VaultStorageRow): Promise<void> { await this.ensureDirectory(row,this.root(row)); }
 
-  private async putAt(row:VaultStorageRow,path:string,bytes:Uint8Array,contentType="application/octet-stream"):Promise<void>{
-    await this.ensureParents(row, path);
+  private async putAt(row:VaultStorageRow,path:string,bytes:Uint8Array,contentType="application/octet-stream",signal?:AbortSignal):Promise<void>{
+    signal?.throwIfAborted();await this.ensureParents(row, path,signal);
     const parent = path.slice(0, path.lastIndexOf("/")) || "/"; const name = path.slice(path.lastIndexOf("/") + 1); const credentials = this.credentials(row);
-    const linkResponse = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/upload-link/?p=${encodeURIComponent(parent)}`);
+    const linkResponse = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/upload-link/?p=${encodeURIComponent(parent)}`,{signal});
     if (!linkResponse.ok) throw new Error(`Seafile upload link failed (${linkResponse.status})`);
     const uploadUrl = await linkResponse.json() as string; const form = new FormData();
     const exactBytes=Uint8Array.from(bytes);
     form.set("parent_dir", parent); form.set("replace", "1"); form.set("file", new Blob([exactBytes.buffer], { type: contentType }), name);
-    const response = await this.request(credentials, uploadUrl, { method: "POST", body: form });
+    const response = await this.request(credentials, uploadUrl, { method: "POST", body: form,signal });
     if (!response.ok) throw new Error(`Seafile upload ${path} failed (${response.status}: ${await response.text()})`);
   }
 
-  async put(row: VaultStorageRow, relativePath: string, bytes: Uint8Array, contentType = "application/octet-stream"): Promise<void> {
-    await this.putAt(row,`${this.root(row)}/${relativePath.replace(/^\/+/, "")}`,bytes,contentType);
+  async put(row: VaultStorageRow, relativePath: string, bytes: Uint8Array, contentType = "application/octet-stream",signal?:AbortSignal): Promise<void> {
+    await this.putAt(row,`${this.root(row)}/${relativePath.replace(/^\/+/, "")}`,bytes,contentType,signal);
   }
 
   async putFile(row: VaultStorageRow, relativePath: string, localPath: string, signal?: AbortSignal, progress?: (stage: "uploading" | "checking", processedBytes: number) => void): Promise<void> {
     const path = `${this.root(row)}/${safeRelativePath(relativePath)}`;
+    await this.putAtFile(row,path,localPath,signal,progress);
+  }
+
+  private async putAtFile(row:VaultStorageRow,path:string,localPath:string,signal?:AbortSignal,progress?:(stage:"uploading"|"checking",processedBytes:number)=>void):Promise<void>{
     const file = await openAsBlob(localPath, { type: "application/octet-stream" });
-    await this.ensureParents(row, path);
     const parent = path.slice(0, path.lastIndexOf("/")) || "/", name = path.slice(path.lastIndexOf("/") + 1), credentials = this.credentials(row);
     // Completion is polled asynchronously. Give genuinely large files a finite
     // size-dependent backend budget rather than retrying every two minutes.
@@ -171,6 +180,7 @@ export class SeafileStorage {
     // caller pause/shutdown can still cancel it immediately.
     const budget = Math.max(120_000, Math.min(2 * 60 * 60_000, Math.ceil(file.size / (256 * 1024)) * 2000 + 60_000));
     const transferSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(budget)]) : AbortSignal.timeout(budget);
+    transferSignal.throwIfAborted();await this.ensureParents(row,path,transferSignal);
     const linkResponse = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/upload-link/?p=${encodeURIComponent(parent)}`, { signal: transferSignal });
     if (!linkResponse.ok) throw new Error(`Seafile upload link failed (${linkResponse.status})`);
     const uploadUrl = await linkResponse.json() as string, form = new FormData();
@@ -202,6 +212,34 @@ export class SeafileStorage {
     const safe=safeRelativePath(relativePath);await this.putAt(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,bytes);
   }
 
+  async putReadableFile(row:VaultStorageRow,relativePath:string,localPath:string,signal?:AbortSignal):Promise<void>{
+    const safe=safeRelativePath(relativePath);await this.putAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,localPath,signal);
+  }
+
+  private async downloadAtFile(row:VaultStorageRow,path:string,staging:PrivateStaging,maximumBytes:number,signal?:AbortSignal,revision?:string):Promise<StagedFile>{
+    const credentials=this.credentials(row),budget=Math.max(120_000,Math.min(2*60*60_000,Math.ceil(maximumBytes/(256*1024))*2000+60_000)),transferSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(budget)]):AbortSignal.timeout(budget);
+    const endpoint=revision?`/api2/repos/${row.storage_repo_id}/file/revision/?p=${encodeURIComponent(path)}&commit_id=${encodeURIComponent(revision)}`:`/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`;
+    const link=await this.request(credentials,endpoint,{signal:transferSignal});
+    if(revision&&link.status===404)throw new RevisionMissingError();
+    if(link.status===404)throw new StorageMissingError();
+    if(!link.ok)throw new Error(`Seafile content link failed (${link.status})`);
+    const response=await this.request(credentials,await link.json() as string,{signal:transferSignal});
+    if(revision&&response.status===404)throw new RevisionMissingError();
+    if(response.status===404){await response.body?.cancel();throw new StorageMissingError();}
+    if(!response.ok||!response.body){await response.body?.cancel();throw new Error(`Seafile content stream failed (${response.status})`);}
+    const header=response.headers.get("content-length"),declared=header===null?null:Number(header);
+    if(declared!==null&&(!Number.isSafeInteger(declared)||declared<0||declared>maximumBytes)){await response.body.cancel();throw new Error("Seafile content exceeds its permitted byte limit");}
+    const reader=response.body.getReader();
+    async function* chunks(){let complete=false;try{for(;;){transferSignal.throwIfAborted();const item=await reader.read();if(item.done){complete=true;break;}yield item.value;}}finally{if(!complete)await reader.cancel().catch(()=>{});reader.releaseLock();}}
+    let file:StagedFile;try{file=await staging.fromChunks(chunks(),maximumBytes,transferSignal);}catch(error){if(response.body.locked){await reader.cancel().catch(()=>{});reader.releaseLock();}else await response.body.cancel().catch(()=>{});throw error;}
+    if(declared!==null&&file.size!==declared){await file.dispose();throw new Error("Seafile content stream ended before its declared size");}
+    return file;
+  }
+
+  getToFile(row:VaultStorageRow,relativePath:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{return this.downloadAtFile(row,`${this.root(row)}/${safeRelativePath(relativePath)}`,staging,this.config.MAX_BLOB_BYTES+1024,signal);}
+  getReadableToFile(row:VaultStorageRow,relativePath:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{const safe=safeRelativePath(relativePath);return this.downloadAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,staging,this.config.MAX_BLOB_BYTES,signal);}
+  getReadableRevisionToFile(row:VaultStorageRow,relativePath:string,commitId:string,staging:PrivateStaging,signal?:AbortSignal):Promise<StagedFile>{if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid immutable revision");const safe=safeRelativePath(relativePath);return this.downloadAtFile(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`,staging,this.config.MAX_BLOB_BYTES,signal,commitId);}
+
   async ensureReadableFolder(row:VaultStorageRow,relativePath:string):Promise<void>{
     const safe=safeRelativePath(relativePath);await this.ensureDirectory(row,`${this.readableRoot(row)}/${safe}`||`/${safe}`);
   }
@@ -228,8 +266,10 @@ export class SeafileStorage {
   async get(row: VaultStorageRow, relativePath: string): Promise<Uint8Array> {
     const path = `${this.root(row)}/${relativePath.replace(/^\/+/, "")}`; const credentials = this.credentials(row);
     const link = await this.request(credentials, `/api2/repos/${row.storage_repo_id}/file/?p=${encodeURIComponent(path)}`);
+    if(link.status===404)throw new StorageMissingError();
     if (!link.ok) throw new Error(`Seafile file link failed (${link.status})`);
     const response = await this.request(credentials, await link.json() as string);
+    if(response.status===404){await response.body?.cancel();throw new StorageMissingError();}
     if (!response.ok) throw new Error(`Seafile download failed (${response.status})`);
     return this.readBounded(response,path.endsWith(".gbs")?this.config.MAX_BLOB_BYTES+1024:64*1024*1024);
   }
@@ -296,9 +336,33 @@ export class SeafileStorage {
       const response=await this.request(this.credentials(row),`/api/v2.1/repos/${row.storage_repo_id}/commits/${revision.commitId}/`);
       if(!response.ok)throw new Error(`Seafile commit provenance failed (${response.status})`);
       const body=await response.json() as {commit_diffs?:Array<{op_type:string;path:string;new_path:string}>};if(!Array.isArray(body.commit_diffs))throw new Error("Seafile returned invalid commit provenance");
-      for(const entry of body.commit_diffs)if(entry.op_type==="renamed"&&entry.path.startsWith(prefix)&&entry.new_path.startsWith(prefix))renames.push({previousPath:safeRelativePath(entry.path.slice(prefix.length)),path:safeRelativePath(entry.new_path.slice(prefix.length))});
+      for(const entry of body.commit_diffs)if(entry.op_type==="renamed"&&typeof entry.path==="string"&&typeof entry.new_path==="string"&&entry.path.startsWith(prefix)&&entry.new_path.startsWith(prefix)){
+        const previous=entry.path.slice(prefix.length),next=entry.new_path.slice(prefix.length);if(previous===".gib-sync"||previous.startsWith(".gib-sync/")||next===".gib-sync"||next.startsWith(".gib-sync/"))continue;
+        renames.push({previousPath:safeRelativePath(previous),path:safeRelativePath(next)});
+      }
     }
     return renames;
+  }
+  async readableEvents(row:VaultStorageRow,baseline:string):Promise<ReadableEvent[]>{
+    const history=await this.repoHistory(row,baseline),prefix=`${this.readableRoot(row)}/`,events:ReadableEvent[]=[];
+    for(const revision of history.reverse()){
+      const response=await this.request(this.credentials(row),`/api/v2.1/repos/${row.storage_repo_id}/commits/${revision.commitId}/`);
+      if(!response.ok)throw new Error(`Seafile operation provenance failed (${response.status})`);
+      const body=await response.json() as {commit_diffs?:Array<{op_type:string;path:string;new_path?:string;is_dir?:boolean;type?:string}>};
+      if(!Array.isArray(body.commit_diffs))throw new Error("Seafile returned invalid operation provenance");
+      for(const entry of body.commit_diffs){
+        // Filter the official vocabulary and private sidecar before public-path
+        // validation: ordinary blob/history commits are not vault edits.
+        const operation=entry.op_type==="new"||entry.op_type==="newdir"?"created":entry.op_type==="removed"||entry.op_type==="deldir"?"deleted":entry.op_type==="modified"?"modified":entry.op_type==="renamed"?"renamed":null;
+        if(!operation)continue;
+        if(typeof entry.path!=="string"||!entry.path.startsWith(prefix))continue;
+        const relative=entry.path.slice(prefix.length);if(relative===".gib-sync"||relative.startsWith(".gib-sync/"))continue;
+        const path=safeRelativePath(relative),directory=typeof entry.is_dir==="boolean"?entry.is_dir:entry.type==="dir"?true:entry.type==="file"?false:undefined;
+        // These are the official seahub RepoCommitView diff_status_dict values.
+        if(operation==="renamed"){if(typeof entry.new_path!=="string"||!entry.new_path.startsWith(prefix))continue;const next=entry.new_path.slice(prefix.length);if(next===".gib-sync"||next.startsWith(".gib-sync/"))continue;events.push({commitId:revision.commitId,mtime:revision.mtime,operation,path:safeRelativePath(next),previousPath:path,...(directory!==undefined?{directory}:{})});}
+        else events.push({commitId:revision.commitId,mtime:revision.mtime,operation,path,...(entry.op_type==="newdir"||entry.op_type==="deldir"?{directory:true}:directory!==undefined?{directory}:{})});
+      }
+    }return events;
   }
   async getReadableRevision(row:VaultStorageRow,relativePath:string,commitId:string):Promise<Uint8Array>{
     if(!/^[a-f0-9]{40}$/i.test(commitId))throw new Error("Invalid Seafile revision identifier");

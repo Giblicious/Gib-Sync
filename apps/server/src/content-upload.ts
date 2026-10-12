@@ -258,6 +258,8 @@ export class ContentUploads {
         this.options.store.db.exec("BEGIN IMMEDIATE");
         try {
           this.options.store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)", device.vault_id, row.hash, row.size + 29, new Date().toISOString());
+          const integrity=this.options.store.one<{clear_size:number}>("SELECT clear_size FROM blob_integrity WHERE vault_id=? AND hash=?",device.vault_id,row.hash);if(integrity&&integrity.clear_size!==row.size)fail(409,"Verified content size contradicts its immutable hash");
+          this.options.store.run("INSERT INTO blob_integrity(vault_id,hash,clear_size,cipher_size,verified_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,hash) DO UPDATE SET cipher_size=excluded.cipher_size,verified_at=excluded.verified_at",device.vault_id,row.hash,row.size,row.size+29,new Date().toISOString());
           this.options.store.run("UPDATE content_uploads SET state='complete',updated_at=? WHERE id=? AND lease_owner=?", Date.now(), id, this.owner);
           this.options.store.db.exec("COMMIT");
         } catch (error) { this.options.store.db.exec("ROLLBACK"); throw error; }

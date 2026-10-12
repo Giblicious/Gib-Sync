@@ -4,14 +4,20 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 permissions: { contents: write, packages: write }
+concurrency: { group: gib-sync-release-publication, cancel-in-progress: false }
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: echo "RELEASE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with: { node-version: 24, check-latest: true, cache: npm }
       - run: node --test scripts/verify-server-runtime.test.mjs
+      - run: node --test scripts/release-channel.test.mjs
+      - run: node --test scripts/release-artifacts.test.mjs
+      - run: python3 -B -m unittest discover -s scripts -p 'verify_candidate_archive_test.py'
+      - run: node --test scripts/publish-verified-release.test.mjs
       - run: node scripts/verify-server-runtime.mjs
       - run: npm ci
       - run: npm run typecheck
@@ -20,22 +26,45 @@ jobs:
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run build
       - run: node scripts/verify-release.mjs "${GITHUB_REF_NAME}"
+      - id: channel
+        run: node scripts/release-channel.mjs "${GITHUB_REF_NAME}"
+      - run: node scripts/release-artifacts.mjs guard
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
       - run: cd plugin && zip ../gib-sync-${GITHUB_REF_NAME}.zip main.js manifest.json styles.css versions.json
       - uses: docker/login-action@v3
         with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
-      - uses: docker/build-push-action@v6
+      - id: image
+        uses: docker/build-push-action@v6
         with:
           context: .
           pull: true
           push: true
-          tags: |
-            ghcr.io/giblicious/gib-sync:${{ github.ref_name }}
-            ghcr.io/giblicious/gib-sync:latest
-      - uses: softprops/action-gh-release@v2
+          tags: '${{ steps.channel.outputs.tags }}'
+          labels: |
+            org.opencontainers.image.revision=${{ env.RELEASE_COMMIT }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+      - run: node scripts/release-artifacts.mjs create
+        env: { RELEASE_IMAGE_DIGEST: '${{ steps.image.outputs.digest }}' }
+      - name: Retain exact candidate bytes without exposing a BRAT update
+        if: steps.channel.outputs.publish_release == 'false'
+        run: |
+          mkdir release-bundle
+          cp plugin/main.js plugin/manifest.json plugin/styles.css plugin/versions.json release-artifacts.json "gib-sync-${GITHUB_REF_NAME}.zip" release-bundle/
+      - uses: actions/upload-artifact@v4
+        if: steps.channel.outputs.publish_release == 'false'
         with:
+          name: gib-sync-${{ github.ref_name }}
+          path: release-bundle/*
+          retention-days: 30
+      - uses: softprops/action-gh-release@v2
+        if: steps.channel.outputs.publish_release == 'true'
+        with:
+          prerelease: '${{ steps.channel.outputs.prerelease == ''true'' }}'
+          make_latest: '${{ steps.channel.outputs.prerelease == ''true'' && ''false'' || ''true'' }}'
           files: |
             plugin/main.js
             plugin/manifest.json
             plugin/styles.css
             plugin/versions.json
             gib-sync-${{ github.ref_name }}.zip
+            release-artifacts.json

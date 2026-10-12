@@ -1,132 +1,184 @@
-# Durable synchronization foundation (0.8.62)
+# Durable synchronization v2 (0.8.63 candidate)
 
-## Authority and invariants
+## Authority and identities
 
-The SQLite accepted snapshot is authoritative for coordination. Content hashes,
-immutable manifests, and encrypted history remain in the existing Seafile sidecar.
-The readable Seafile tree is a bidirectional, asynchronously materialized copy,
-not proof that a device downloaded or applied a snapshot.
+SQLite stores the accepted operation ledger, its materialized file/folder tree,
+immutable snapshots, exact batch receipts and device acknowledgments. The readable
+Seafile tree is a bidirectional asynchronous projection, not proof that a device
+has downloaded or applied accepted state. Encrypted content-addressed history and
+immutable manifests remain in the existing Seafile sidecar.
 
-Every device acknowledges its exact applied snapshot after verification. Older
-devices without a new acknowledgment are displayed as unconfirmed, not assumed
-current. This does not revoke their token or raise the minimum supported version.
+An operation addresses a stable entity and exact base revision, not merely a path.
+Creates, edits, deletes, recreations and file/folder moves are distinct operations.
+Folder moves fence descendant revisions. Delete-and-recreate gets a new identity
+even when bytes match. Temporary move paths exist only inside an atomic accepted
+batch, never as an intermediate accepted snapshot.
 
-File identity and revision provenance are additive manifest fields. Unique stable
-identity, exact content identity, recorded Obsidian rename events, and recorded
-Seafile commit renames can establish move ancestry. Similar names and sizes may
-inform a safeguard assessment but never fabricate a three-way merge base.
+The shared deterministic policy drives plugin and server reconciliation. Content
+equality, known identity, durable editor intents and proven Seafile rename events
+can establish ancestry. Filename similarity, timestamps and device display names
+never invent a merge base. Unknown historical ancestry retains differing complete
+originals instead of guessing which version may be discarded.
 
-## Durable operations
+The compatibility snapshot endpoint passes through the same authority. Accepted
+snapshot, operations, materialized state and receipt commit in one SQLite
+transaction. Repeating an exact batch returns its original receipt; reusing its ID
+with different content fails. Immutable prior-state evidence supports replay
+audits without inferring a historical baseline from the current tree.
 
-Local replacement stages and verifies incoming bytes before replacing a file.
-Per-operation journals record planning, verified staging, backup, copy-in-progress,
-rollback, and verified completion boundaries.
-The previous original remains under `.gib-sync/local-recovery/`; the plugin offers
-a read-only inventory and bounded text preview. Recovery never deletes a note
-merely because its filename resembles an old conflict artifact.
+## Durable client application
 
-Server projection jobs have durable SQLite leases, retries, and ownership fencing.
-Timers wake those jobs; restarting the process does not discard them. Incoming
-Seafile revisions are captured before and after projection mutations, including
-historical directory contents around a recursive folder removal. Unknown content
-is retained in encrypted history before another projection can finish. A unique
-encrypted operation fence must appear in immutable repository history before a
-mutation's journal can be considered captured; a delayed history listing cannot
-silently retire that recovery obligation. These small fences remain recoverable
-in the hidden sidecar. Only the
-latest outstanding historical version of each path participates in the next
-reconciliation; earlier versions remain recoverable instead of being replayed as
-simultaneous edits.
+The plugin persists editor intents and exact proposals before publication.
+Vault/device-scoped journals retain receipts across lost responses, suspension and
+restart. A checkpoint advances only after accepted content and folder topology are
+verified. Changes during a download reconcile against actual prior content.
 
-Seafile does not provide an HTTP compare-and-swap file write. Its immutable
-repository history is therefore a required recovery dependency for readable
-mutations. History disabled, an unavailable revision, a retention gap, or an
-exhausted traversal budget defers projection rather than claiming success.
-Local promotion and rollback use Obsidian's documented no-overwrite copy API,
-never a check-then-rename over a public destination. A creation racing with the
-copy is retained. Native copies need not have atomic visibility: an interrupted
-copy with uncertain destination bytes is held without publication, and explicit
-accepted-state repair retains both original and uncertain bytes. Run one
-synchronization engine per vault.
+Local writes stage and verify incoming bytes before promotion. Original and
+uncertain bytes remain under `.gib-sync/local-recovery/`. Recovery never deletes a
+note because its name resembles a conflict copy. Mutations recheck editor revision
+and content preconditions.
 
-## Performance and configuration
+Plugin packages have a separate complete-package journal. Managed code/settings
+are verified together; excluded caches stay local and move natively without
+buffering. Supported adapters retain the old directory and switch the verified
+staged directory into place. This is recoverable, not a universal atomic or
+gap-free filesystem guarantee. Unsupported behavior, late writes, collisions or
+uncertain phases hold that component and retain originals while notes continue.
 
-Unchanged checks do not repeatedly hash every note. Event journals, authenticated
-snapshot deltas, and a bounded metadata cache limit ordinary work. Full startup
-and periodic integrity audits still inspect the included vault. Hidden enabled
-configuration files are tracked separately using a yielding stat inventory; no
-private Obsidian raw-event hook is required.
+Running managed plugins are suspended without rewriting synchronized enablement.
+Unload-time settings saves drain before filesystem preconditions are checked.
+Stale runtime and premature default saves are preserved privately, not written
+over incoming settings. Complete packages and platform-filtered enablement apply
+before runtime activation; nonempty settings require a fresh read. Arbitrary
+third-party direct filesystem writes cannot be sandboxed by Gib Sync; detected
+bypasses are preserved and held rather than silently counted as convergence.
 
-Supported native resource URLs and `appendBinary` permit streamed hashing and
-large incoming staging. Hashing and appending use bounded chunks and cooperative
-yields. Upgraded HTTPS servers advertise resumable large outgoing transfers:
-256 KiB chunks have independent hashes and durable receipts, and the complete
-source is rehashed even when resuming an acknowledged prefix. The server streams
-the verified source into the existing AES-GCM-v1 envelope before registering it.
-Finalization is asynchronous and single-owner: the device polls actual processing
-state rather than keeping a long HTTP request open. Cancellation targets its exact
-processing attempt, and shutdown drains it before closing the database.
-Unaccepted server staging uses private, UUID-owned files with a seven-day expiry;
-temporary clear bytes are restricted to the server's private staging directory.
-Accepted blobs and snapshots are not subject to that expiry.
+## Inventory and responsiveness
 
-Small files and older servers retain the encrypted upload endpoint. Resource
-streaming depends on the native adapter/WebView: a large outgoing file that
-cannot be streamed is retained locally with an actionable error rather than
-silently allocating an unbounded buffer. HTTP development servers retain the
-encrypted legacy path, never the new clear-chunk transport. This is not a
-universal fixed-memory guarantee for every backend operation and does not add
-block-level deduplication.
+Persistent stat/hash inventory avoids hashing every unchanged note on every
+check. Events dirty affected paths and persist create/move/delete intent. Yielding
+periodic metadata listings catch external changes; startup and rolling content
+verification catch timestamp-preserving changes. Stat values are hints, not
+permanent content proof.
 
-Actual vault configuration directories are respected for scope and safety, but
-different configuration-root names on separate devices are not automatically
-remapped to one canonical path. Gib Sync's own credentials,
-workspaces, and generated caches remain device-local. Ordinary settings use shared
-three-way JSON logic; unique-ID collections merge by identity, while native
-bookmarks use unique creation-time/type identity, including nested groups.
-Unknown or ambiguous arrays remain whole values instead of inventing identity.
-Plugin code/package selection and bootstrap protections remain compatible.
+Traversal, hashing, planning and application yield cooperatively. Foreground sync
+preempts background verification. Transfers use cancellation, durable receipts
+and bounded caches. This limits Gib Sync's work; it cannot promise that every
+adapter or third-party plugin will never block Obsidian.
 
-## Automatic migration and rollout
+Physical diagnostics separately measure idle frames, generated native IO, real
+sync frames and background/return events without exporting paths or credentials.
+Synthetic tests and a small native probe do not certify full-scale performance
+or replace a physical iPhone test.
 
-No re-pairing, credential reset, vault-key rotation, history rewrite, or manual
-settings conversion is required. New settings preserve existing values and defaults.
-New SQLite tables and columns are additive and migrated in a transaction.
-Old clients retain the existing protocol and endpoints; optional deltas, revision
-metadata, explicit acknowledgments, resumable uploads, and server-managed
-projection are additive.
+## Bounded server content paths
 
-Before a version upgrade, the service makes a consistent SQLite online backup,
-including its WAL, reopens it, runs integrity and foreign-key checks, verifies
-accepted-head references, and records a checksum. Daily backup due time persists
-across restarts. Database backups do not replace backing up the existing Seafile
-blobs: both are required for complete disaster recovery. No automatic backup,
-snapshot, or original-file retention deletion is introduced.
+Production upload/download, readable import/projection, integrity verification
+and historical capture are file-backed and streaming. Private clear staging uses
+UUID-owned files, restricted permissions, size limits, disk reserve, cancellation
+and cleanup. AES-GCM-v1 authentication, clear SHA-256 and size verify before use.
+The encryption format and vault keys do not change. Accepted content/history
+never expire under staging cleanup.
 
-`rehearseMigration` migrates an isolated consistent copy without network workers.
-It fingerprints every original table and column, including routing, keys, device
-credentials, safeguard preferences, quarantine state, and immutable manifests.
-Production rollout must pass this drill, deploy a tested immutable image digest,
-and verify compatibility and accepted-head preservation. Keep the old container
-recoverable. Never restore an older database over writes accepted after rollout.
-The supplied container uses Node 24; direct server installations require Node
-22.16 or later for the [SQLite online backup API](https://nodejs.org/api/sqlite.html#sqlitebackupsourcedb-path-options).
-The embedded SQLite must also include the
-[WAL-reset fix](https://www.sqlite.org/wal.html#the_wal_reset_bug): version 3.51.3
-or later, or official backports 3.50.7 / 3.44.6. A Node major-version check alone
-does not establish this. Run `node scripts/verify-server-runtime.mjs` before a
-manual server start or migration. CI, release jobs, and both Docker build/runtime
-layers enforce this requirement without gating local plugin development.
+Large HTTPS client uploads use 256 KiB independently hashed resumable chunks.
+Finalization is asynchronous, single-owner and drains safely on shutdown. Older
+clients retain the encrypted endpoint; large bodies there also stage on disk.
+Ambiguous historical blob-size rows remain unchanged; new independently verified
+clear/cipher-size records establish integrity proof.
 
-BRAT owns installation and activation of the published plugin. Publication or
-server deployment never overwrites real vaults or their installed `data.json`.
+Repair of missing/corrupt current blobs requires matching accepted readable
+content. Backend outages, cancellation and resource failures do not authorize
+repair or extra uploads. Large local files require a native resource stream;
+unsupported adapters retain files with an actionable component error rather than
+silently allocating unbounded buffers.
 
-## Validation limits
+Projection jobs have durable leases, retries and ownership fencing. Readable
+generations are captured before and after mutation, including historical content
+around folder deletion. Preserved bytes are verified, not assumed from a registry
+row. Seafile lacks HTTP file-write CAS, so immutable repository history is
+required. Missing/disabled history or retention/traversal gaps defer projection.
+Proven commit events distinguish delete/recreate even with identical bytes; the
+event vocabulary follows Seafile's
+[official commit-diff API](https://github.com/haiwen/seahub/blob/master/seahub/api2/endpoints/repo_commit.py).
 
-Automated tests cover transfer integrity, interrupted apply phases, cancellation,
-editor races, custom configuration roots, move identity, plugin settings bootstrap,
-onboarding choices, hidden config tracking, native-stream simulation, projection
-restart/race recovery, auth/rate limits, portable path collisions, and migration.
-Synthetic mobile DOM and adapter tests are not a physical iPhone smoke test.
-The service cannot guarantee the absence of every future backend or filesystem
-failure; recovery history and truthful status are part of the safety model.
+## Settings, pairing and conflicts
+
+Actual Obsidian configuration roots map automatically to a canonical namespace.
+Legacy collisions retain originals. Credentials, Gib Sync's own files,
+workspaces, generated caches and existing include/exclude preferences remain
+local. New mobile defaults do not replace established rich settings.
+
+Portable JSON settings use bounded three-way key/identity merging; ambiguous
+arrays remain whole values. Plugin code/assets are complete packages, with settings
+independently mergeable. Desktop-only enablement remains intact on desktop when
+mobile filters it from its local runtime.
+
+Conflict originals and provenance are durable. The inbox supports bounded
+comparisons, keep/combine/keep-both and conditional undo. Newer edits invalidate old
+resolutions. Automatic system-file choices are informational recovery records,
+not deep user-facing conflict forks or mandatory manual settings resolution.
+
+Five-digit codes remain optional. A claim alone never releases vault credentials:
+the trusted originating device must approve a matching verification number.
+Opaque claim tickets, expiry, single-use delivery and rate budgets apply. Older
+unsafe pairing flows cannot create codes; paired protocol-7 clients keep syncing.
+
+## Automatic migration and staged rollout
+
+Migration is additive and transactional: no credential reset, key rotation,
+routing/preference changes or historical manifest rewrite. Legacy endpoints remain.
+New capability flags are explicit and the compatibility bridge stays authoritative
+during shadow rollout.
+
+Shadow observations compare policy with an independently implemented causal
+witness. Explained identity-safe differences retain evidence; unexplained
+divergence holds v2 promotion without resetting counts. Real users are not
+canaries. An isolated candidate enforces its exact disposable Seafile account and
+library before authentication, registration and worker startup.
+
+Production activation requires signed operator-reviewed evidence binding the exact
+release/image to generated sequences, disposable operation receipts, preserving
+migration rehearsal and physical iPhone checks. Import writes only global release
+validation, never canary users/content. Eligible healthy vaults activate
+automatically after distinct matching observations; old clients retain the bridge.
+
+Before deployment, verify a consistent SQLite online backup including WAL and
+rehearse migration in an isolated copy without workers. The drill fingerprints
+every original table/column, routing, key, token, preference, quarantine, snapshot
+and blob reference. Daily backup due time persists. Database backups do not replace
+Seafile content/history backups; no automatic original/history/backup deletion is
+introduced.
+
+Node 24 runtime checks the actual SQLite WAL-reset fix: SQLite 3.51.3+ or official
+3.50.7/3.44.6 backports. See the
+[SQLite advisory](https://www.sqlite.org/wal.html#the_wal_reset_bug) and
+[Node backup API](https://nodejs.org/api/sqlite.html#sqlitebackupsourcedb-path-options).
+
+## Publication and rollback boundaries
+
+The owned source workflow publishes a numeric candidate tag, Actions artifact
+bundle, versioned image and SHA-256 artifact manifest. Its guards refuse to
+overwrite existing release/image tags; they are not registry/GitHub-wide access
+controls. It creates no candidate release in the production distribution repo.
+BRAT includes prereleases when selecting updates, as documented in its
+[developer guide](https://github.com/TfTHacker/obsidian42-brat/blob/main/BRAT-DEVELOPER-GUIDE.md).
+Physical BRAT candidates therefore require an isolated distribution repository.
+
+After acceptance, the publication workflow copies the exact isolated candidate
+assets into an owned draft, independently reads back all six assets, and only
+then makes the complete release visible to BRAT. Interrupted staging resumes
+missing assets only; existing bytes are never overwritten. The versioned and
+pinned image digests are verified before publication. The same image is retagged
+after successful live asset verification, without rebuilding or moving Git tags. Docker's
+[carbon-copy manifest behavior](https://docs.docker.com/reference/cli/docker/buildx/imagetools/create/)
+is used and the promoted digest verified. Production deploys that digest after
+backup/rehearsal; the old pinned runtime remains recoverable.
+
+Rollback changes the runtime, never restores an old DB over newly accepted writes.
+Re-upgrade must verify compatibility snapshot and operation authority agree before
+v2 writes resume.
+
+BRAT owns client installation/activation. Publication or server deployment never
+overwrites installed plugins, real vaults or their settings. Physical and automated
+evidence remain separate in the [acceptance checklist](v2-acceptance.md); an
+unperformed check is never passed.

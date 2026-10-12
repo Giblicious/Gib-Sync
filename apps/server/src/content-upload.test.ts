@@ -207,7 +207,7 @@ describe("durable bounded content uploads", () => {
       const final = decipher.final(); actual.update(final); clearBytes += final.length; observedHash = actual.digest("hex");
     };
     expect(await f.uploads.complete(f.device, session.id)).toMatchObject({ complete: true }); expect(largestRead).toBeLessThanOrEqual(64 * 1024); expect(clearBytes).toBe(32 * 1024 * 1024); expect(observedHash).toBe(hash);
-  });
+  },30_000); // 128 durable fsyncs may exceed Vitest's 5s default on loaded Windows/CI.
   it("enforces a chunk parser limit even without a trustworthy Content-Length", async () => {
     const f = fixture(), app = Fastify(); app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => done(null, body));
     await registerContentUploads(app, { ...f.options(), authenticate: async () => f.device });

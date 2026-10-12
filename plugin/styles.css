@@ -117,6 +117,18 @@
 .gib-sync-status-overview-actions button { flex: 1 1 0; min-height: 36px; }
 
 /* Settings follow the compact navigation and console language used across Gib plugins. */
+.gib-sync-conflict-modal { width: min(960px,calc(100vw - 24px)); }
+.gib-sync-conflict-list { max-height: 220px; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+.gib-sync-conflict-list button,.gib-sync-device-request button,.gib-sync-conflict-detail button { min-height: 44px; white-space: normal; text-align: left; }
+.gib-sync-device-request { padding: 12px; margin-top: 12px; border: 1px solid var(--background-modifier-border); border-radius: 8px; }
+.gib-sync-conflict-panes { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+.gib-sync-conflict-panes pre { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gib-sync-conflict-diff { max-height: 320px; overflow: auto; border: 1px solid var(--background-modifier-border); }
+.gib-sync-conflict-diff > div { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+.gib-sync-conflict-diff pre { padding: 2px 6px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.gib-sync-conflict-diff .is-changed { background: color-mix(in srgb,var(--color-orange) 12%,transparent); border-inline-start: 2px solid var(--color-orange); }
+.gib-sync-conflict-combine { width: 100%; min-height: 200px; }
+@media(max-width:600px) { .gib-sync-conflict-panes { grid-template-columns: minmax(0,1fr); } .gib-sync-conflict-diff { font-size: 11px; } }
 .gib-sync-settings { --gib-sync-status-green: var(--color-green); --gib-sync-status-amber: var(--color-yellow); --gib-sync-status-red: var(--color-red); }
 .gib-sync-settings-header { display: flex; align-items: baseline; gap: 10px; }
 .gib-sync-settings-header h2 { margin-bottom: 8px; }

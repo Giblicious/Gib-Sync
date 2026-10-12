@@ -9,6 +9,7 @@ import type {SnapshotCache} from "./snapshot-cache";
 afterEach(()=>vi.unstubAllGlobals());
 
 describe("incremental snapshot transport",()=>{
+  it("refuses an older server's unconfirmed short code without affecting existing sync",async()=>{const settings={...DEFAULT_SETTINGS,serverUrl:"https://sync.test",deviceToken:"token"},api=new GibSyncApi(()=>settings);for(const requiresConfirmation of [undefined,false]){vi.mocked(requestUrl).mockResolvedValueOnce({status:200,json:{code:"12345",expiresAt:new Date(Date.now()+60000).toISOString(),requiresConfirmation}}as any);await expect(api.createPairing()).rejects.toThrow("server must be updated");}vi.mocked(requestUrl).mockResolvedValueOnce({status:200,json:{code:"12345",requiresConfirmation:true}}as any);await expect(api.createPairing()).resolves.toMatchObject({requiresConfirmation:true});expect(settings.deviceToken).toBe("token");});
   it("reconstructs the authenticated head without advancing the device checkpoint",async()=>{
     const entry=(path:string)=>({path,hash:"a".repeat(64),size:1,mtime:1});
     const base={id:"base",vaultId:"vault",entries:[entry("keep.md"),entry("old.md")]};

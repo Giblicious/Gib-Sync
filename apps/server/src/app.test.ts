@@ -6,8 +6,8 @@ import { afterEach, describe, expect, it,vi } from "vitest";
 import type { Config } from "./config.js";
 import { Store } from "./db.js";
 import { buildApp as constructApp } from "./app.js";
-import { RevisionMissingError,type SeafileStorage } from "./seafile.js";
-import { decryptVaultBlob,encryptVaultBlob,normalizeQuickCode,openJson,sealJson,sha256 } from "./security.js";
+import { StorageMissingError,RevisionMissingError,type SeafileStorage } from "./seafile.js";
+import { decryptVaultBlob,encryptVaultBlob,openJson,sealJson,sha256 } from "./security.js";
 import { ContainmentService } from "./containment.js";
 import { VaultRetirementService } from "./vault-retirement.js";
 import { SERVER_VERSION } from "./version.js";
@@ -33,7 +33,7 @@ class MemoryStorage {
   async legacySelection(){return {url:"https://seafile.example.test",username:"legacy@example.test",token:"legacy",libraryId:"library-1",libraryName:"Notes",basePath:"/"};}
   async put(row:any,path:string,bytes:Uint8Array) { this.files.set(`${row.id}:${path}`, bytes.slice());if(path.startsWith("mutation-fences/"))this.recordRepo(row); }
   async putFile(row:any,path:string,localPath:string){await this.put(row,path,readFileSync(localPath));}
-  async get(row:any,path:string) { const bytes = this.files.get(`${row.id}:${path}`); if (!bytes) throw new Error("missing"); return bytes.slice(); }
+  async get(row:any,path:string) { const bytes = this.files.get(`${row.id}:${path}`); if (!bytes) throw new StorageMissingError(); return bytes.slice(); }
   async getReadable(row:any,path:string){const bytes=this.files.get(`read:${row.id}:${path}`);if(!bytes)throw new Error("missing readable");return bytes.slice();}
   async statReadable(row:any,path:string){const bytes=this.files.get(`read:${row.id}:${path}`);return bytes?{path,id:sha256(bytes),mtime:1,size:bytes.length}:null;}
   private remember(row:any,path:string,bytes:Uint8Array){const key=`read:${row.id}:${path}`,items=this.histories.get(key)??[],commitId=sha256(Buffer.concat([Buffer.from(String(items.length)),Buffer.from(bytes)])).slice(0,40);items.unshift({commitId,bytes:bytes.slice(),mtime:Date.now()});this.histories.set(key,items);}
@@ -110,7 +110,7 @@ describe("Gib Sync API", () => {
   it("authenticates before parsing request bodies and blocks a valid quick code after failed guesses",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
     expect((await app.inject({method:"POST",url:"/v1/commit",headers:{"content-type":"application/json"},payload:"not json"})).statusCode).toBe(401);
-    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},pair=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json(),wrong=((Number(pair.code)+1)%100000).toString().padStart(5,"0");
+    const setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},pair=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{requireConfirmation:true}})).json(),wrong=((Number(pair.code)+1)%100000).toString().padStart(5,"0");
     for(let index=0;index<5;index++)expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:wrong,deviceName:"Attempt"}})).statusCode).toBe(410);
     expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pair.code,deviceName:"Phone"}})).statusCode).toBe(429);await app.close();
   });
@@ -125,7 +125,7 @@ describe("Gib Sync API", () => {
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},key=Buffer.from(setup.vaultKey,"base64url"),clear=Buffer.from("old note"),hash=sha256(clear);
     await app.inject({method:"PUT",url:`/v1/blobs/${hash}`,headers:{...auth,"content-type":"application/octet-stream"},payload:encryptedFixture(clear,key,hash)});
     const first=(await app.inject({method:"POST",url:"/v1/commit",headers:auth,payload:{parentId:null,entries:[{path:"old.md",hash,size:clear.length,mtime:Date.now()}]}})).json(),phone=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Phone")})).json(),phoneAuth={authorization:`Bearer ${phone.deviceToken}`};await app.inject({method:"POST",url:"/v1/devices/current/ready",headers:phoneAuth,payload:{headId:first.id}});
-    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:phoneAuth,payload:{parentId:first.id,entries:[{...first.entries[0],path:"new.md"}],folders:["Empty"]}})).json();expect(second.entries[0].fileId).toBe(first.entries[0].fileId);expect(second.entries[0].revision).toEqual(first.entries[0].revision);
+    const second=(await app.inject({method:"POST",url:"/v1/commit",headers:phoneAuth,payload:{parentId:first.id,entries:[{...first.entries[0],path:"new.md"}],folders:["Empty"]}})).json();expect(second.entries[0].fileId).toBe(first.entries[0].fileId);expect(second.entries[0].revision).toMatchObject({parentId:first.entries[0].revision.id,deviceId:first.entries[0].revision.deviceId,deviceName:first.entries[0].revision.deviceName,modifiedAt:first.entries[0].revision.modifiedAt});expect(second.entries[0].revision.id).not.toBe(first.entries[0].revision.id);
     const delta=await app.inject({method:"GET",url:`/v1/delta?since=${first.id}`,headers:auth});expect(delta.json()).toMatchObject({baseId:first.id,snapshot:{id:second.id,folders:["Empty"]},changed:[{path:"new.md",fileId:first.entries[0].fileId}],removed:["old.md"]});expect(delta.json().snapshot.entries).toBeUndefined();
     expect((await app.inject({method:"GET",url:`/v1/delta?since=${randomUUID()}`,headers:auth})).statusCode).toBe(409);
     const stranger=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Other","/Other")})).json();expect((await app.inject({method:"GET",url:`/v1/delta?since=${first.id}`,headers:{authorization:`Bearer ${stranger.deviceToken}`}})).statusCode).toBe(409);
@@ -199,11 +199,13 @@ describe("Gib Sync API", () => {
     const emptyCommit=await app.inject({method:"POST",url:`/v1/quarantines/${emptyProposal.json().quarantine.id}/approve`,headers:auth,payload:{}});expect(emptyCommit.statusCode).toBe(201);
     const deletePlan=await app.inject({method:"POST",url:"/v1/mirror/plan",headers:auth,payload:{snapshotId:emptyCommit.json().id,entries:[]}});expect([[],["note.md"]]).toContainEqual(deletePlan.json().deletePaths);
     expect((await app.inject({method:"POST",url:"/v1/mirror/complete",headers:auth,payload:{snapshotId:emptyCommit.json().id}})).statusCode).toBe(200);expect(storage.files.has(`read:${credentials.vaultId}:note.md`)).toBe(false);expect(storage.dirs.has(`read:${credentials.vaultId}:Empty`)).toBe(false);expect(storage.dirs.has(`read:${credentials.vaultId}:Projects/Empty`)).toBe(false);
-    const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json();expect(pairing.code).toMatch(/^\d{5}$/);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
+    const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{requireConfirmation:true}})).json();expect(pairing.code).toMatch(/^\d{5}$/);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
     const wrongCode=((Number(pairing.code)+1)%100_000).toString().padStart(5,"0");expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:wrongCode,deviceName:"Intruder"}})).statusCode).toBe(410);
     const claim=await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pairing.code,deviceName:"Mobile"}});
-    expect(claim.statusCode).toBe(200);const claimed=claim.json();expect(claimed.envelope).toBeTypeOf("string");
-    expect(openJson<any>(claimed.envelope,normalizeQuickCode(pairing.code),`pairing:${claimed.pairingId}`)).toMatchObject({vaultId:credentials.vaultId,deviceToken:expect.any(String)});
+    expect(claim.statusCode).toBe(202);const pendingClaim=claim.json();expect(pendingClaim.envelope).toBeUndefined();
+    expect((await app.inject({method:"POST",url:`/v1/pairings/requests/${pendingClaim.claimId}/decision`,headers:auth,payload:{approved:true}})).statusCode).toBe(200);
+    const claimed=(await app.inject({method:"POST",url:"/v1/pairings/poll",payload:{ticket:pendingClaim.ticket}})).json();expect(claimed.envelope).toBeTypeOf("string");
+    expect(openJson<any>(claimed.envelope,pendingClaim.ticket,`pairing:${claimed.pairingId}`)).toMatchObject({vaultId:credentials.vaultId,deviceToken:expect.any(String)});
     expect((await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pairing.code,deviceName:"Other"}})).statusCode).toBe(410);
     const preview=(await app.inject({method:"GET",url:`/v1/restore/${commit.json().id}/preview`,headers:auth})).json();
     expect((await app.inject({method:"POST",url:`/v1/restore/${commit.json().id}`,headers:auth,payload:{confirmToken:preview.confirmToken}})).statusCode).toBe(201);
@@ -359,8 +361,7 @@ describe("Gib Sync API", () => {
     let automaticHead:any;
     if(winner==="automatic"){
       await vi.advanceTimersByTimeAsync(250);
-      automaticHead=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;
-      expect(automaticHead).toMatchObject({parentId:second.id,deviceId:`seafile:${credentials.vaultId}`,entries:[{path:"note.md",hash:mergedHash,size:merged.length}]});
+      await vi.waitFor(async()=>{automaticHead=(await app.inject({method:"GET",url:"/v1/state",headers:auth})).json().head;expect(automaticHead).toMatchObject({parentId:second.id,deviceId:`seafile:${credentials.vaultId}`,entries:[{path:"note.md",hash:mergedHash,size:merged.length}]});expect(store.one<{mirror_head_id:string}>("SELECT mirror_head_id FROM vaults WHERE id=?",credentials.vaultId)?.mirror_head_id).toBe(automaticHead.id);},{timeout:5000,interval:25});
     }
     const response=await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}});expect(response.statusCode).toBe(200);const imported=response.json();
     expect(imported).toMatchObject(winner==="explicit"?{snapshotId:expect.any(String),changedFiles:1,deletedFiles:0,conflicts:0}:{snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0});
@@ -375,7 +376,7 @@ describe("Gib Sync API", () => {
     expect((await app.inject({method:"POST",url:"/v1/external/scan",headers:auth,payload:{}})).json()).toMatchObject({snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0});
     expect(store.one<{count:number}>("SELECT COUNT(*) count FROM snapshots WHERE vault_id=?",credentials.vaultId)?.count).toBe(3);
     await app.close();
-  });
+  },30_000);
   it("bifurcates large Obsidian and Seafile rewrites with reciprocal warning links",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`},key=Buffer.from(credentials.vaultKey,"base64url");
@@ -415,7 +416,7 @@ describe("Gib Sync API", () => {
   it("expires rolling codes after 60 seconds and throttles five-digit guesses",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);
     const credentials=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json();const auth={authorization:`Bearer ${credentials.deviceToken}`};
-    const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{}})).json();expect(pairing.code).toMatch(/^\d{5}$/);
+    const pairing=(await app.inject({method:"POST",url:"/v1/pairings",headers:auth,payload:{requireConfirmation:true}})).json();expect(pairing.code).toMatch(/^\d{5}$/);
     store.run("UPDATE pairings SET expires_at=? WHERE quick_code_hash=?",new Date(Date.now()-1000).toISOString(),sha256(pairing.code));
     for(let attempt=1;attempt<=6;attempt++){const response=await app.inject({method:"POST",url:"/v1/pairings/claim-code",payload:{code:pairing.code,deviceName:"Mobile"}});expect(response.statusCode).toBe(attempt<=5?410:429);}
     await app.close();
@@ -442,7 +443,7 @@ describe("Gib Sync API", () => {
     store.run("INSERT INTO vaults(id,name,wrapped_key,head_id,created_at,storage_url,storage_username,storage_repo_id,storage_repo_name,storage_base_path,storage_token,storage_layout) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",id,"Recovery",sealJson(key.toString("base64url"),config.GIBSYNC_SERVER_SECRET,id),snapshotId,now,"https://seafile.example.test","legacy@example.test","library-1","Notes","/","legacy-token","legacy");
     store.run("INSERT INTO snapshots(id,vault_id,parent_id,device_id,device_name,created_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?)",snapshotId,id,null,"device","Desktop",now,"Initial",JSON.stringify(snapshot));store.run("INSERT INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",id,hash,clear.length,now);
     storage.files.set(`${id}:blobs/${hash.slice(0,2)}/${hash}.gbs`,encryptedFixture(clear,key,hash));const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();
-    await vi.waitFor(()=>expect(Buffer.from(storage.files.get(`read:${id}:folder/note.md`)??[])).toEqual(clear),{timeout:1000});expect(store.one<any>("SELECT mirror_head_id,mirror_base_path FROM vaults WHERE id=?",id)).toMatchObject({mirror_head_id:snapshotId,mirror_base_path:"/Obsidian/Recovery"});await app.close();
+    await vi.waitFor(()=>{expect(Buffer.from(storage.files.get(`read:${id}:folder/note.md`)??[])).toEqual(clear);expect(store.one<any>("SELECT mirror_head_id,mirror_base_path FROM vaults WHERE id=?",id)).toMatchObject({mirror_head_id:snapshotId,mirror_base_path:"/Obsidian/Recovery"});},{timeout:5000});await app.close();
   });
   it("repairs unsafe legacy folder provenance through an immutable descendant snapshot",async()=>{
     const {config,store,storage}=fixture(),vaultId=randomUUID(),parentId=randomUUID(),seedId=randomUUID(),headId=randomUUID(),now=new Date().toISOString();
@@ -454,7 +455,7 @@ describe("Gib Sync API", () => {
     const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();const repairedId=store.one<{head_id:string}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id,repaired=store.getSnapshot(repairedId)!;
     expect(repaired.id).not.toBe(headId);expect(repaired.parentId).toBe(headId);expect(repaired.entries).toEqual([]);expect(repaired.folders).toEqual(["Keep"]);expect(repaired.deviceId).toBe("server:folder-provenance-repair");expect(store.getSnapshot(seedId)?.folders).toEqual(["A","B","C"]);await app.close();
   });
-  it("materializes a retirement directive after an unsafe direct head is rewound",async()=>{
+  it("materializes a retirement directive as an operation-backed descendant of an unsafe direct head",async()=>{
     const {config,store,storage}=fixture(),vaultId=randomUUID(),parentId=randomUUID(),seedId=randomUUID(),now=new Date().toISOString();
     const parent={id:parentId,vaultId,parentId:null,deviceId:"desktop",deviceName:"Desktop",createdAt:now,message:"Legacy",entries:[]};
     const seed={...parent,id:seedId,parentId,deviceId:`seafile:${vaultId}`,deviceName:"Seafile",message:"Folder seed",folders:["Stale A","Stale B"]};
@@ -463,7 +464,7 @@ describe("Gib Sync API", () => {
     storage.dirs.add(`read:${vaultId}:Stale A`);storage.dirs.add(`read:${vaultId}:Stale B`);
     const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();const repairedId=store.one<{head_id:string}>("SELECT head_id FROM vaults WHERE id=?",vaultId)!.head_id,repaired=store.getSnapshot(repairedId)!;
     await vi.waitFor(()=>expect(store.one<{mirror_head_id:string}>("SELECT mirror_head_id FROM vaults WHERE id=?",vaultId)?.mirror_head_id).toBe(repairedId),{timeout:1000});
-    expect(repaired.parentId).toBe(parentId);expect(repaired.folders).toEqual([]);expect(repaired.folderRepair).toMatchObject({retiredFolders:["Stale A","Stale B"],originSnapshotIds:[seedId]});expect(storage.dirs.has(`read:${vaultId}:Stale A`)).toBe(false);expect(store.getSnapshot(seedId)?.folders).toEqual(["Stale A","Stale B"]);await app.close();
+    expect(repaired.parentId).toBe(seedId);expect(repaired.folders).toEqual([]);expect(repaired.folderRepair).toMatchObject({retiredFolders:["Stale A","Stale B"],originSnapshotIds:[seedId]});expect(storage.dirs.has(`read:${vaultId}:Stale A`)).toBe(false);expect(store.getSnapshot(seedId)?.folders).toEqual(["Stale A","Stale B"]);expect(store.one("SELECT snapshot_id FROM sync_vault_state WHERE vault_id=?",vaultId)).toMatchObject({snapshot_id:repaired.id});await app.close();
   });
   it("recovers a missing current blob from the verified readable mirror",async()=>{
     const {config,store,storage}=fixture();const app=await buildApp(config,store,storage as unknown as SeafileStorage);

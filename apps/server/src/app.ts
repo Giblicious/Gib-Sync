@@ -15,16 +15,28 @@ import { clientCompatibility } from "./compatibility.js";
 import { readGeneration,validGeneration,writeGeneration } from "./mirror-generation.js";
 import { SERVER_CAPABILITIES,SERVER_VERSION } from "./version.js";
 import { ContainmentService } from "./containment.js";
-import { planLegacyFolderDescendantRepair,planMissingLegacyFolderRetirementDirective,planRetiredLegacyFolderRepair,repairUnsafeLegacyFolderHeads } from "./folder-migration.js";
+import { planLegacyFolderDescendantRepair,planMissingLegacyFolderRetirementDirective,planRetiredLegacyFolderRepair } from "./folder-migration.js";
 import { canonicalManifest } from "./manifest.js";
 import { auditHeadIntegrity } from "./integrity.js";
 import { SnapshotCommitter } from "./snapshot-commit.js";
 import { VaultRetirementService } from "./vault-retirement.js";
 import { DurableMirrorJobs } from "./jobs.js";
+import {VerifiedBlobStore,recoverableBlobFailure} from "./blob-store.js";
+import {parseBinaryBody,isStagedBinary} from "./binary-body.js";
+import {createReadStream} from "node:fs";
+import {readFile} from "node:fs/promises";
+import {decryptBlobFile,type StagedFile} from "./security-stream.js";
 import { takeRequestBudget } from "./request-budget.js";
 import { ProjectionJournal,ReadableChangedError } from "./projection-journal.js";
 import { BinaryAdmission } from "./admission.js";
+import { TrustedPairing } from "./trusted-pairing.js";
 import { CONTENT_UPLOAD_CHUNK_BYTES,registerContentUploads } from "./content-upload.js";
+import {registerOperationRoutes} from "./operation-routes.js";
+import {ConflictInbox,registerConflictInbox,type ConflictRecord} from "./conflict-inbox.js";
+import type {OperationBatch,FolderEntry} from "@gib-sync/protocol";
+import {registerConfigRoots,normalizeAliasEntries,normalizeAliasFolders,aliasCollisionRecords} from "./config-roots.js";
+import {CanaryScope} from "./canary-scope.js";
+import {getSnapshotView} from './snapshot-evidence.js';
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -37,6 +49,7 @@ function snapshotFolders(snapshot:Snapshot|null):Set<string>{
 const folderManifestInitialized=(snapshot:Snapshot|null):boolean=>Array.isArray(snapshot?.folders);
 
 export async function buildApp(config: Config, store = new Store(config.DATA_DIR), storage = new SeafileStorage(config)) {
+  const canaryScope=new CanaryScope(config);canaryScope.assertStore(store);
   const unmigrated = store.all<{id:string}>("SELECT id FROM vaults WHERE retired_at IS NULL AND (storage_url IS NULL OR storage_token IS NULL)");
   if (unmigrated.length) {
     const legacy = await storage.legacySelection();
@@ -51,7 +64,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const path=vault.storage_layout==="legacy"?`/Obsidian/${safeName}`:vault.storage_base_path;
     store.run("UPDATE vaults SET mirror_base_path=? WHERE id=?",path,vault.id);
   }
-  repairUnsafeLegacyFolderHeads(store);
+  // Folder provenance is repaired onReady through the same operation authority,
+  // never by rewinding the accepted head behind its materialized causal tree.
   const integrityBlockedVaults=new Set<string>();
   for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL AND retired_at IS NULL")){
     const audit=auditHeadIntegrity(store,vault.id,vault.head_id);if(audit.valid)continue;integrityBlockedVaults.add(vault.id);const now=new Date().toISOString();
@@ -62,6 +76,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   // must never provide unlimited independent pairing identities.
   const app = Fastify({ trustProxy:(address:string,hop:number)=>hop===0&&/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(address.replace(/^::ffff:/,"")),logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 64*1024*1024 });
   const durableJobs=new DurableMirrorJobs(store);
+  const verifiedBlobs=new VerifiedBlobStore(config,store,storage),requestStages=new WeakMap<FastifyRequest,StagedFile>(),requestControllers=new Set<AbortController>();
+  const requestSignal=(request:FastifyRequest,reply:import("fastify").FastifyReply)=>{const controller=new AbortController();requestControllers.add(controller);request.raw.once("aborted",()=>controller.abort());reply.raw.once("close",()=>{if(!reply.raw.writableFinished)controller.abort();requestControllers.delete(controller);});return controller.signal;};
+  const discardBody=async(request:FastifyRequest)=>{const file=requestStages.get(request);requestStages.delete(request);await file?.dispose();};
+  app.addHook("onResponse",async(request)=>discardBody(request));app.addHook("onError",async(request)=>discardBody(request));
+  app.addHook("preClose",async()=>{for(const controller of requestControllers)controller.abort();requestControllers.clear();if(typeof storage.close==="function")storage.close();});
+  app.addHook("onReady",async()=>{await verifiedBlobs.staging.cleanupExpired();});
   const binaryAdmission=new BinaryAdmission(Math.max(64*1024*1024,config.MAX_BLOB_BYTES+1024)),binaryReleases=new WeakMap<FastifyRequest,()=>void>(),binaryActive=new WeakSet<FastifyRequest>();
   const releaseBinary=(request:FastifyRequest)=>{binaryReleases.get(request)?.();binaryReleases.delete(request);};
   const binaryRoute=(route:string)=>route==="/v1/blobs/:hash"||route==="/v1/content/:hash"||route==="/v1/mirror/file"||route==="/v1/content-uploads/:id/chunks/:index"||route==="/v1/content-uploads/:id/complete";
@@ -98,7 +118,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(typed.statusCode===423&&typed.containment)return reply.code(423).send({error:typed.message,message:typed.message,containment:typed.containment});
     return reply.send(error);
   });
-  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: config.MAX_BLOB_BYTES }, (_request, body, done) => done(null, body));
+  app.addContentTypeParser("application/octet-stream", {bodyLimit:config.MAX_BLOB_BYTES+29},async(request:FastifyRequest,payload:import("node:stream").Readable)=>{
+    const body=await parseBinaryBody(payload as AsyncIterable<Uint8Array>,verifiedBlobs.staging,Math.min(request.routeOptions.bodyLimit,config.MAX_BLOB_BYTES+29));
+    if(isStagedBinary(body))requestStages.set(request,body.file);return body;
+  });
 
   const header=(request:FastifyRequest,name:string):string|null=>{const value=request.headers[name];return Array.isArray(value)?value[0]??null:value??null;};
   const compatibilityFor=(request:FastifyRequest)=>{
@@ -121,11 +144,11 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   app.addHook("onRequest",async(request,reply)=>{
     const route=request.routeOptions.url??request.url.split("?")[0];
-    const publicRoute=route==="/healthz"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code";
+    const publicRoute=route==="/healthz"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code"||route==="/v1/pairings/poll"||route==="/v1/pairings/cancel-claim";
     if(request.method==="OPTIONS")return;
     if(publicRoute&&Number(request.headers["content-length"]??0)>64*1024)return reply.code(413).send({error:"Setup request exceeds its permitted size"});
     if(!publicRoute)await authenticate(request,{allowIncompatible:route==="/v1/status"||route==="/v1/compatibility",allowContainment:route==="/v1/status"||route==="/v1/compatibility"});
-    else if(route!=="/healthz"&&!takeRequestBudget(store,"public-api",request.ip,120,60_000))return reply.code(429).send({error:"Too many requests; try again shortly"});
+    else if(route!=="/healthz"&&!takeRequestBudget(store,route==="/v1/pairings/poll"?"public-pairing-poll":"public-api",request.ip,route==="/v1/pairings/poll"?480:120,60_000))return reply.code(429).send({error:"Too many requests; try again shortly"});
     if(binaryRoute(route)){
       const hash=(request.params as {hash?:string})?.hash,device=store.one<AuthDevice>("SELECT id,vault_id,name FROM devices WHERE token_hash=?",sha256(request.headers.authorization?.replace(/^Bearer\s+/i,"")??""));
       const storedSize=device&&hash?store.one<{size:number}>("SELECT size FROM blobs WHERE vault_id=? AND hash=?",device.vault_id,hash)?.size:undefined;
@@ -161,7 +184,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const observed=visible.get(entry.path);if(!observed||observed.size!==entry.size){missing.push(entry.path);continue;}
       const verified=store.one<{hash:string;storage_id:string|null}>("SELECT hash,storage_id FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);
       if(verified?.hash===entry.hash&&verified.storage_id===observed.id)continue;
-      if(sha256(await storage.getReadable(row,entry.path))!==entry.hash){missing.push(entry.path);continue;}
+      const file=await verifiedBlobs.readable(row,entry.path);try{if(file.hash!==entry.hash){missing.push(entry.path);continue;}}finally{await file.dispose();}
       store.run("UPDATE mirror_entries SET storage_id=?,storage_mtime=? WHERE vault_id=? AND path=? AND hash=?",observed.id,observed.mtime,vaultId,entry.path,entry.hash);
     }
     const lingering=removedPaths.filter((path)=>visible.has(path));
@@ -232,13 +255,17 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
       const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>!closing&&!leaseLost&&durableJobs.owns(lease)&&headStillCurrent()&&!externalScanRequests.has(vaultId)&&canOperateVault(vaultId);let superseded=false;
       for(const entry of snapshot.entries){if(!mayContinue()){superseded=true;break;}const current=store.one<{hash:string}>("SELECT hash FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,entry.path);if(current?.hash===entry.hash&&visible.get(entry.path)?.size===entry.size)continue;
-        const encrypted=await loadEncryptedBlob(vaultId,entry.hash);if(!encrypted)throw new Error(`Encrypted blob is unavailable for ${entry.path}`);const clear=decryptVaultBlob(encrypted,key,entry.hash);
-        const operation=await projectionJournal.prepare(row,entry.path,snapshot.id,current?.hash??null,entry.hash,restoreApprovedVaults.has(vaultId));
-        if(!mayContinue()){superseded=true;break;}
-        mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.putReadable(row,entry.path,clear);
-        const raced=await projectionJournal.finish(row,operation);
-        if(!mayContinue()){superseded=true;break;}
-        store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at,storage_id=NULL,storage_mtime=NULL",vaultId,entry.path,entry.hash,clear.length,new Date().toISOString());if(raced)throw new ReadableChangedError();}
+        const clear=await verifiedBlobs.clear(row,entry.hash);
+        try{
+          const operation=await projectionJournal.prepare(row,entry.path,snapshot.id,current?.hash??null,entry.hash,restoreApprovedVaults.has(vaultId));
+          if(!mayContinue()){superseded=true;break;}
+          mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});
+          if(typeof storage.putReadableFile==="function")await storage.putReadableFile(row,entry.path,clear.path);
+          else{if(clear.size>2*1024*1024)throw new Error("Storage adapter cannot safely project this large file");await storage.putReadable(row,entry.path,await readFile(clear.path));}
+          const raced=await projectionJournal.finish(row,operation);
+          if(!mayContinue()){superseded=true;break;}
+          store.run("INSERT INTO mirror_entries(vault_id,path,hash,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(vault_id,path) DO UPDATE SET hash=excluded.hash,size=excluded.size,updated_at=excluded.updated_at,storage_id=NULL,storage_mtime=NULL",vaultId,entry.path,entry.hash,clear.size,new Date().toISOString());if(raced)throw new ReadableChangedError();
+        }finally{await clear.dispose();}}
       if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!canOperateVault(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
       const removedPaths:string[]=[];for(const {path,hash} of store.all<{path:string;hash:string}>("SELECT path,hash FROM mirror_entries WHERE vault_id=?",vaultId)){if(target.has(path))continue;if(!mayContinue()){superseded=true;break;}const operation=await projectionJournal.prepare(row,path,snapshot.id,hash,null,restoreApprovedVaults.has(vaultId));if(!mayContinue()){superseded=true;break;}mirrorWriteSettles.set(vaultId,{snapshotId:snapshot.id,until:Date.now()+5000});await storage.deleteReadable(row,path);const raced=await projectionJournal.finish(row,operation);if(!mayContinue()){superseded=true;break;}store.run("DELETE FROM mirror_entries WHERE vault_id=? AND path=?",vaultId,path);removedPaths.push(path);if(raced)throw new ReadableChangedError();}
       if(superseded){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!canOperateVault(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
@@ -265,7 +292,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     return {
       protocolVersion: PROTOCOL_VERSION, serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],serverUrl: config.PUBLIC_URL, vaultId, vaultName, deviceId, deviceToken,
       vaultKey: openJson<string>(vault.wrapped_key, config.GIBSYNC_SERVER_SECRET, vaultId),
-      head: vault.head_id ? store.getSnapshot(vault.head_id) : null, storage: storage.location(storageRow(vaultId))
+      head: vault.head_id ? getSnapshotView(store,vault.head_id) : null, storage: storage.location(storageRow(vaultId))
     };
   }
 
@@ -316,8 +343,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
 
   app.post("/v1/storage/discover",{bodyLimit:64*1024}, async (request) => {
-    const body = credentialsSchema.parse(request.body); const credentials = await storage.authenticate(body.seafileUrl, body.seafileUsername, body.seafilePassword);
-    const libraries=await storage.libraries(credentials);const libraryIds=new Set(libraries.map((item)=>item.id));
+    const body = credentialsSchema.parse(request.body);canaryScope.assertCredentials(body.seafileUrl,body.seafileUsername);const credentials = await storage.authenticate(body.seafileUrl, body.seafileUsername, body.seafilePassword);canaryScope.assertCredentials(credentials.url,credentials.username);
+    const libraries=canaryScope.libraries(await storage.libraries(credentials));const libraryIds=new Set(libraries.map((item)=>item.id));
     const existingVaults=store.all<{vaultId:string;vaultName:string;libraryId:string;libraryName:string;basePath:string;storageUrl:string}>(
       "SELECT id vaultId,name vaultName,storage_repo_id libraryId,storage_repo_name libraryName,storage_base_path basePath,storage_url storageUrl FROM vaults WHERE storage_username=? AND retired_at IS NULL ORDER BY created_at",credentials.username)
       .filter((vault)=>storage.equivalentServer(vault.storageUrl,credentials.url)&&libraryIds.has(vault.libraryId)).map(({storageUrl:_storageUrl,...vault})=>vault);
@@ -326,8 +353,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.post("/v1/setup",{bodyLimit:64*1024}, async (request, reply) => {
     const body = credentialsSchema.extend({ vaultName:z.string().min(1).max(100), deviceName:z.string().min(1).max(100), libraryId:z.string().min(1).max(100), libraryName:z.string().min(1).max(255), basePath:z.string().max(1000).default("/"), existingVaultId:z.string().uuid().optional() }).parse(request.body) as StorageSetupRequest;
-    const credentials = await storage.authenticate(body.seafileUrl, body.seafileUsername, body.seafilePassword);
-    const libraries = await storage.libraries(credentials); const library = libraries.find((item) => item.id === body.libraryId);
+    canaryScope.assertCredentials(body.seafileUrl,body.seafileUsername);canaryScope.assertLibrary(body.libraryId);
+    const credentials = await storage.authenticate(body.seafileUrl, body.seafileUsername, body.seafilePassword);canaryScope.assertCredentials(credentials.url,credentials.username);
+    const libraries = canaryScope.libraries(await storage.libraries(credentials)); const library = libraries.find((item) => item.id === body.libraryId);
     if (!library) return reply.badRequest("The selected Seafile library is not accessible to this account");
     const basePath = normalizeBasePath(body.basePath);let vault:{id:string;name:string;storage_username:string;storage_url:string;head_id:string|null}|undefined,newRegistration=false;const now = new Date().toISOString();
     // Claim the physical folder under SQLite's cross-process write lock. No
@@ -358,49 +386,44 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
 
   type PairingRow={id:string;vault_id:string;expires_at:string;consumed_at:string|null};
-  function consumePairing(row:PairingRow,deviceName:string,secret:string,context:string){
-    if(retirements.isRetired(row.vault_id))return null;
-    const vault=store.one<{name:string}>("SELECT name FROM vaults WHERE id=?",row.vault_id)!;
-    const deviceId=randomUUID();const deviceToken=randomToken();const now=new Date().toISOString();
-    store.db.exec("BEGIN IMMEDIATE");
-    try{
-      const consumed=store.run("UPDATE pairings SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND expires_at>=?",now,row.id,now);
-      if(consumed.changes!==1){store.db.exec("ROLLBACK");return null;}
-      store.run("INSERT INTO devices(id,vault_id,name,token_hash,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",deviceId,row.vault_id,deviceName,sha256(deviceToken),now,now);
-      store.db.exec("COMMIT");
-    }catch(error){store.db.exec("ROLLBACK");throw error;}
-    return {pairingId:row.id,envelope:sealJson(setupResponse(row.vault_id,vault.name,deviceId,deviceToken),secret,context)};
-  }
-
-  app.post("/v1/pairings",async(request)=>{
+  const trustedPairing=new TrustedPairing(store,config.GIBSYNC_SERVER_SECRET,setupResponse);
+  app.post("/v1/pairings",{bodyLimit:4096},async(request)=>{
     const device=await authenticate(request);const pairingId=randomUUID();
+    const requestOptions=z.object({requireConfirmation:z.boolean().optional()}).parse(request.body??{});
+    if(requestOptions.requireConfirmation!==true)throw app.httpErrors.upgradeRequired("Update Gib Sync on the inviting device through BRAT to approve new devices securely. Existing synchronization is unaffected.");
+    const requiresConfirmation=true;
     const expiresAt=new Date(Date.now()+60_000).toISOString();
     store.run("UPDATE pairings SET quick_code_hash=NULL WHERE consumed_at IS NOT NULL OR expires_at<?",new Date().toISOString());
     let code="";let normalized="";
     for(let attempt=0;attempt<8;attempt++){code=quickCode();normalized=normalizeQuickCode(code);if(!store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))break;}
     if(!code||store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))throw new Error("Unable to allocate a quick code");
-    store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at) VALUES(?,?,?,?,?,?)",pairingId,device.vault_id,sha256(normalized),sha256(normalized),device.id,expiresAt);
-    return {code,expiresAt};
+    store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at,requires_confirmation) VALUES(?,?,?,?,?,?,?)",pairingId,device.vault_id,sha256(normalized),sha256(normalized),device.id,expiresAt,requiresConfirmation?1:0);
+    return {code,expiresAt,requiresConfirmation};
   });
 
   app.post("/v1/pairings/claim-code",{bodyLimit:64*1024},async(request,reply)=>{
     if(!takeRequestBudget(store,"quick-code",request.ip,5,60_000)||!takeRequestBudget(store,"quick-code-global","all",100,60_000))return reply.code(429).header("Retry-After","60").send({error:"Too many quick-code attempts; try again later"});
     const body=z.object({code:z.string().min(5).max(12),deviceName:z.string().min(1).max(100)}).parse(request.body);let code:string;
     try{code=normalizeQuickCode(body.code);}catch{return reply.code(410).send({error:"Quick code expired or invalid"});}
-    const row=store.one<PairingRow>("SELECT id,vault_id,expires_at,consumed_at FROM pairings WHERE quick_code_hash=?",sha256(code));
+    const row=store.one<PairingRow&{requires_confirmation:number}>("SELECT id,vault_id,expires_at,consumed_at,requires_confirmation FROM pairings WHERE quick_code_hash=?",sha256(code));
     if(!row||row.consumed_at||Date.parse(row.expires_at)<Date.now())return reply.code(410).send({error:"Quick code expired or invalid"});
-    return consumePairing(row,body.deviceName,code,`pairing:${row.id}`)??reply.code(410).send({error:"Quick code expired or invalid"});
+    if(!row.requires_confirmation)return reply.code(426).send({error:"This older quick code cannot connect devices securely. Update Gib Sync on the inviting device through BRAT and create a new code. Existing synchronization is unaffected."});
+    return reply.code(202).send(trustedPairing.claim(row.id,body.deviceName));
   });
+  app.get("/v1/pairings/pending",async(request)=>trustedPairing.list(await authenticate(request)));
+  app.post("/v1/pairings/requests/:id/decision",{bodyLimit:4096},async(request)=>{const device=await authenticate(request),{id}=z.object({id:z.string().uuid()}).parse(request.params),{approved}=z.object({approved:z.boolean()}).parse(request.body);return trustedPairing.decide(device,id,approved);});
+  app.post("/v1/pairings/poll",{bodyLimit:4096},async(request)=>{const {ticket}=z.object({ticket:z.string().min(40).max(50)}).parse(request.body);if(!takeRequestBudget(store,"pairing-poll",sha256(ticket),60,60_000))throw app.httpErrors.tooManyRequests("Device request polling is too frequent");return trustedPairing.poll(ticket);});
+  app.post("/v1/pairings/cancel-claim",{bodyLimit:4096},async(request)=>{const {ticket}=z.object({ticket:z.string().min(40).max(50)}).parse(request.body);return trustedPairing.cancel(ticket);});
 
   app.get("/v1/state", async (request) => {
     const device = await authenticate(request);
     const vault = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!;
-    return { head: vault.head_id ? store.getSnapshot(vault.head_id) : null };
+    return { head: vault.head_id ? getSnapshotView(store,vault.head_id) : null };
   });
   app.get("/v1/delta",async(request,reply)=>{
     const device=await authenticate(request),since=z.object({since:z.string().uuid()}).parse(request.query).since;
-    const base=store.getSnapshot(since),headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)?.head_id;
-    const head=headId?store.getSnapshot(headId):null;
+    const base=getSnapshotView(store,since),headId=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)?.head_id;
+    const head=headId?getSnapshotView(store,headId):null;
     if(!base||base.vaultId!==device.vault_id||!head)return reply.conflict("The delta baseline is unavailable; fetch the current snapshot");
     const before=new Map(base.entries.map((entry)=>[entry.path,entry])),after=new Map(head.entries.map((entry)=>[entry.path,entry]));
     const {entries:unusedEntries,...snapshot}=head;
@@ -443,7 +466,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const control=containment.state();
     return { protocolVersion:PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],vaultId:device.vault_id,vaultName:vault.name,deviceId:device.id,deviceName:device.name,
       deviceCount:store.one<{count:number}>("SELECT COUNT(*) count FROM devices WHERE vault_id=? AND revoked_at IS NULL",device.vault_id)?.count ?? 0,
-      snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?store.getSnapshot(vault.head_id):null,
+      snapshotCount:aggregate.snapshot_count,blobCount:aggregate.blob_count,blobBytes:aggregate.blob_bytes,head:vault.head_id?getSnapshotView(store,vault.head_id):null,
       storage:storage.location(storageRow(device.vault_id)),serverTime:new Date().toISOString(),mirrorHeadId:vault.mirror_head_id,
       mirrorFileCount:store.one<{count:number}>("SELECT COUNT(*) count FROM mirror_entries WHERE vault_id=?",device.vault_id)?.count??0,
       mirrorCurrent,projection:{state:projectionState,attempts:pending?.attempts??0,lastError:pending?.last_error??null},externalScanAt:vault.external_scan_at,externalImportAt:vault.external_import_at,externalError:vault.external_error,
@@ -458,17 +481,22 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   const entrySchema=z.object({path:z.string().min(1).max(4000).refine((value)=>{try{return safeRelativePath(value)===value;}catch{return false;}},"Invalid vault-relative file path"),hash:z.string().regex(/^[a-f0-9]{64}$/),size:z.number().int().nonnegative(),mtime:z.number().finite().nonnegative(),fileId:z.string().uuid().optional(),revision:z.object({id:z.string().uuid(),parentId:z.string().uuid().nullable(),deviceId:z.string().min(1).max(255),deviceName:z.string().min(1).max(100),modifiedAt:z.number().finite().nonnegative()}).optional()});
   const folderSchema=z.string().min(1).max(4000).refine((value)=>{try{return safeRelativePath(value)===value;}catch{return false;}},"Invalid vault-relative folder path");
+  const folderEntrySchema=z.object({folderId:z.string().uuid(),path:folderSchema,revision:z.object({id:z.string().uuid(),parentId:z.string().uuid().nullable(),deviceId:z.string().min(1).max(255),deviceName:z.string().min(1).max(100),modifiedAt:z.number().finite().nonnegative()})});
   const policySchema=z.object({mode:z.enum(["strict","balanced","custom"]),deletionCount:z.number().int().min(1).max(100000),smallVaultDeletionCount:z.number().int().min(1).max(100000),
     smallVaultDeletionPercent:z.number().min(1).max(100),changedCount:z.number().int().min(1).max(200000),changedPercent:z.number().min(1).max(100),
     folderImpactCount:z.number().int().min(1).max(200000),fileGrowthBytes:z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER),
     fileGrowthPercent:z.number().min(100).max(100000),clockSkewMinutes:z.number().min(1).max(1440),protectedPaths:z.array(z.string().min(1).max(4000)).max(1000)});
 
-  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[],folderRepair?:Snapshot["folderRepair"]):Promise<Snapshot|null>{
+  async function acceptSnapshot(vaultId:string,parentId:string|null,deviceId:string,deviceName:string,message:string,entries:ManifestEntry[],folders?:string[],folderRepair?:Snapshot["folderRepair"],operationBatch?:OperationBatch,onAccepted?:(snapshot:Snapshot)=>void,folderEntries?:FolderEntry[]):Promise<Snapshot|null>{
     const parent=parentId?store.getSnapshot(parentId):null,inheritedRepair=parent?.folderRepair,sourceRepair=folderRepair??inheritedRepair;
     const effectiveRepair=sourceRepair?{...sourceRepair,issuedAt:sourceRepair.issuedAt??(folderRepair?new Date().toISOString():parent?.createdAt??new Date().toISOString())}:undefined;
-    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,folderRepair:effectiveRepair,afterInsert:(accepted)=>store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId)});if(!snapshot)return null;
+    const snapshot=await snapshotCommitter.accept({vaultId,parentId,deviceId,deviceName,message,entries,folders,folderEntries,folderRepair:effectiveRepair,operationBatch,afterInsert:accepted=>{store.run("UPDATE quarantines SET status='stale',resolved_at=? WHERE vault_id=? AND status='pending' AND parent_id IS ?",accepted.createdAt,vaultId,parentId);onAccepted?.(accepted);}});if(!snapshot)return null;
     safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshot.id);scheduleMirror(vaultId);return snapshot;
   }
+
+  await registerOperationRoutes(app,{store,committer:snapshotCommitter,safeguards,deploymentDigest:config.GIBSYNC_RELEASE_DIGEST,canaryConfig:config,authenticate,beforeCommit:ingestExternalChanges,accepted:(vaultId,snapshotId)=>{safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
+  await registerConflictInbox(app,{store,authenticate});
+  await registerConfigRoots(app,{store,committer:snapshotCommitter,blobs:verifiedBlobs,storageRow,authenticate,beforeCommit:ingestExternalChanges,accepted:(vaultId,snapshotId)=>{mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
 
   app.get("/v1/safeguards",async(request)=>{const device=await authenticate(request);return safeguards.state(device.vault_id,device.id);});
   app.put("/v1/safeguards/policy",async(request)=>{
@@ -519,7 +547,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const heldManifest=JSON.parse(row.manifest_json) as unknown,parsedManifest=Array.isArray(heldManifest)?{entries:z.array(entrySchema).max(200000).parse(heldManifest) as ManifestEntry[],folders:[]}:z.object({entries:z.array(entrySchema).max(200000),folders:z.array(folderSchema).max(200000).default([])}).parse(heldManifest);
     const entries=parsedManifest.entries,folders=parsedManifest.folders;
     const approvalKind=body.trustMinutes?"manual_with_trust":"manual_once",resolvedAt=new Date().toISOString(),approvalLabel=body.trustMinutes?`manual approval + ${body.trustMinutes}-minute trust by ${device.name}`:`manual one-time approval by ${device.name}`;
-    const snapshot=await acceptSnapshot(device.vault_id,row.parent_id,row.device_id,row.device_name,`${row.message} (${approvalLabel})`,entries,folders);if(!snapshot){store.run("UPDATE quarantines SET status='stale' WHERE id=?",id);return reply.conflict("Vault changed after this proposal; review a new proposal");}
+    const pendingBatch=store.one<{batch_json:string}>("SELECT batch_json FROM sync_pending_batches WHERE vault_id=? AND quarantine_id=?",device.vault_id,id),pendingConflicts=store.one<{records_json:string}>("SELECT records_json FROM conflict_proposals WHERE vault_id=? AND quarantine_id=?",device.vault_id,id),pendingFolders=store.one<{folder_entries_json:string}>("SELECT folder_entries_json FROM sync_pending_folders WHERE vault_id=? AND quarantine_id=?",device.vault_id,id);
+    const snapshot=await acceptSnapshot(device.vault_id,row.parent_id,row.device_id,row.device_name,`${row.message} (${approvalLabel})`,entries,folders,undefined,pendingBatch?JSON.parse(pendingBatch.batch_json) as OperationBatch:undefined,accepted=>{if(pendingConflicts){const records=JSON.parse(pendingConflicts.records_json) as ConflictRecord[];new ConflictInbox(store).publishInTransaction({id:row.device_id,vault_id:device.vault_id,name:row.device_name},records.map(record=>({...record,originSnapshotId:accepted.id})));store.run("DELETE FROM conflict_proposals WHERE quarantine_id=?",id);}store.run("DELETE FROM sync_pending_folders WHERE quarantine_id=?",id);},pendingFolders?z.array(folderEntrySchema).parse(JSON.parse(pendingFolders.folder_entries_json)):undefined);if(!snapshot){store.run("UPDATE quarantines SET status='stale' WHERE id=?",id);return reply.conflict("Vault changed after this proposal; review a new proposal");}
     if(body.trustMinutes)store.run("UPDATE vaults SET trusted_until=?,trusted_device_id=? WHERE id=?",new Date(Date.now()+body.trustMinutes*60_000).toISOString(),row.device_id,device.vault_id);
     store.run("UPDATE quarantines SET status='approved',resolved_at=?,resolved_by=?,resolution_kind=?,resolution_context_json=? WHERE id=?",resolvedAt,device.id,approvalKind,JSON.stringify({approvedAt:resolvedAt,approvedByDeviceId:device.id,approvedByDeviceName:device.name,trustMinutes:body.trustMinutes,source:row.source,assessment:heldAssessment}),id);
     safeguards.clearResolvedQuarantineAlerts(device.vault_id);
@@ -554,7 +583,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const snapshotId=z.string().uuid().parse(request.headers["x-gib-sync-snapshot"]);const expectedHash=z.string().regex(/^[a-f0-9]{64}$/).parse(request.headers["x-gib-sync-hash"]);
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;if(vault.head_id!==snapshotId)return reply.conflict("Mirror snapshot is no longer the vault head");
     const snapshot=store.getSnapshot(snapshotId);const entry=snapshot?.entries.find((item)=>item.path===path&&item.hash===expectedHash);if(!entry)return reply.badRequest("File is not part of this snapshot");
-    const bytes=Buffer.from(request.body as Buffer);if(bytes.length!==entry.size||sha256(bytes)!==expectedHash)return reply.badRequest("Readable file integrity check failed");
+    const body=request.body,valid=isStagedBinary(body)?body.file.size===entry.size&&body.file.hash===expectedHash:Buffer.isBuffer(body)&&body.length===entry.size&&sha256(body)===expectedHash;if(!valid)return reply.badRequest("Readable file integrity check failed");
     // Protocol-7 clients retain this endpoint, but no longer own an independent
     // projection writer. The immutable accepted blob is the verified authority.
     scheduleMirror(device.vault_id,0);await reconcileReadableMirror(device.vault_id);
@@ -575,7 +604,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.get("/v1/snapshots/:id", async (request, reply) => {
     const device = await authenticate(request); const id = z.object({id:z.string().uuid()}).parse(request.params).id;
-    const snapshot = store.getSnapshot(id);
+    const snapshot = getSnapshotView(store,id);
     if (!snapshot || snapshot.vaultId !== device.vault_id) return reply.notFound();
     return snapshot;
   });
@@ -597,47 +626,38 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device=await authenticate(request),id=z.object({id:z.string().uuid()}).parse(request.params).id;const result=store.run("DELETE FROM snapshot_bookmarks WHERE vault_id=? AND snapshot_id=?",device.vault_id,id);if(!result.changes)return reply.notFound();return {ok:true};
   });
 
-  async function loadEncryptedBlob(vaultId:string,hash:string):Promise<Uint8Array|null>{
-    const exists=store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?",vaultId,hash);if(!exists)return null;
-    const row=storageRow(vaultId),vault=store.one<{head_id:string|null;wrapped_key:string}>("SELECT head_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;
-    const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId);let bytes:Uint8Array;
-    try{bytes=await storage.get(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`);decryptVaultBlob(bytes,key,hash);}
-    catch(error){
-      const entry=vault.head_id?store.getSnapshot(vault.head_id)?.entries.find((item)=>item.hash===hash):undefined;
-      if(!entry)throw error;
-      const clear=await storage.getReadable(row,entry.path);if(sha256(clear)!==hash)throw error;
-      bytes=encryptVaultBlob(clear,key,hash);await storage.put(row,`blobs/${hash.slice(0,2)}/${hash}.gbs`,bytes);
-      app.log.warn({vaultId,hash,path:entry.path},"Recovered missing or corrupt encrypted blob from readable mirror");
-    }
-    return bytes;
-  }
+  function sendFile(reply:import("fastify").FastifyReply,file:StagedFile){const stream=createReadStream(file.path,{highWaterMark:64*1024});reply.raw.once("close",()=>stream.destroy());stream.once("close",()=>{void file.dispose();});return reply.header("Content-Length",String(file.size)).type("application/octet-stream").send(stream);}
 
   app.get("/v1/content/:hash",async(request,reply)=>{
     const device=await authenticate(request),hash=z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
-    const encrypted=await loadEncryptedBlob(device.vault_id,hash);if(!encrypted)return reply.notFound();
-    const vault=store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",device.vault_id)!;
-    const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id),clear=decryptVaultBlob(encrypted,key,hash);
-    app.log.info({vaultId:device.vault_id,deviceId:device.id,hash,bytes:clear.byteLength},"Serving verified low-memory content");
-    return reply.header("Cache-Control","no-store").header("X-Content-SHA256",hash).type("application/octet-stream").send(Buffer.from(clear.buffer,clear.byteOffset,clear.byteLength));
+    if(!store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?",device.vault_id,hash))return reply.notFound();
+    const clear=await verifiedBlobs.clear(storageRow(device.vault_id),hash,requestSignal(request,reply));
+    return sendFile(reply.header("Cache-Control","no-store").header("X-Content-SHA256",hash),clear);
   });
 
   app.get("/v1/blobs/:hash", async (request, reply) => {
     const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
-    const bytes=await loadEncryptedBlob(device.vault_id,hash);if(!bytes)return reply.notFound();
-    return reply.type("application/octet-stream").send(Buffer.from(bytes.buffer,bytes.byteOffset,bytes.byteLength));
+    const bytes=await verifiedBlobs.encrypted(storageRow(device.vault_id),hash,requestSignal(request,reply));if(!bytes)return reply.notFound();
+    return sendFile(reply,bytes);
   });
 
-  app.put("/v1/blobs/:hash", {bodyLimit:config.MAX_BLOB_BYTES},async (request, reply) => {
+  app.put("/v1/blobs/:hash", {bodyLimit:config.MAX_BLOB_BYTES+29},async (request, reply) => {
     const device = await authenticate(request); const hash = z.object({hash:z.string().regex(/^[a-f0-9]{64}$/)}).parse(request.params).hash;
+    const signal=requestSignal(request,reply);signal.throwIfAborted();
     if (store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, hash)){
-      try{if(await loadEncryptedBlob(device.vault_id,hash))return reply.code(204).send();}catch{app.log.warn({vaultId:device.vault_id,hash},"Replacing a registered blob that failed storage integrity verification");}
+      try{const existing=await verifiedBlobs.encrypted(storageRow(device.vault_id),hash,signal);if(existing){await existing.dispose();return reply.code(204).send();}}catch(error){signal.throwIfAborted();if(!recoverableBlobFailure(error))throw error;app.log.warn({vaultId:device.vault_id,hash},"Replacing a registered blob that failed storage integrity verification");}
     }
-    const bytes = request.body as Buffer|undefined;
-    if (!bytes?.length) return reply.badRequest("Empty blob");
+    const body=request.body,bytes=Buffer.isBuffer(body)?body:null;
+    if(!isStagedBinary(body)&&!bytes?.length)return reply.badRequest("Empty blob");
     const vault=store.one<{wrapped_key:string}>("SELECT wrapped_key FROM vaults WHERE id=?",device.vault_id)!;
-    try{decryptVaultBlob(bytes,openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id),hash);}catch{return reply.code(422).send({error:"Encrypted blob authentication or content hash is invalid"});}
-    await storage.put(storageRow(device.vault_id), `blobs/${hash.slice(0,2)}/${hash}.gbs`, bytes);
-    store.run("INSERT INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?) ON CONFLICT(vault_id,hash) DO UPDATE SET size=excluded.size,created_at=excluded.created_at", device.vault_id, hash, bytes.length, new Date().toISOString());
+    const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,device.vault_id);
+    let clearSize:number;
+    if(isStagedBinary(body)){
+      try{const clear=await decryptBlobFile(body.file.path,key,hash,verifiedBlobs.staging,config.MAX_BLOB_BYTES,signal);clearSize=clear.size;await clear.dispose();}catch(error){signal.throwIfAborted();if(!recoverableBlobFailure(error))throw error;return reply.code(422).send({error:"Encrypted blob authentication or content hash is invalid"});}
+      await storage.putFile(storageRow(device.vault_id),`blobs/${hash.slice(0,2)}/${hash}.gbs`,body.file.path,signal);
+    }else{try{clearSize=decryptVaultBlob(bytes!,key,hash).byteLength;}catch{return reply.code(422).send({error:"Encrypted blob authentication or content hash is invalid"});}await storage.put(storageRow(device.vault_id),`blobs/${hash.slice(0,2)}/${hash}.gbs`,bytes!,"application/octet-stream",signal);}
+    signal.throwIfAborted();store.run("INSERT OR IGNORE INTO blobs(vault_id,hash,size,created_at) VALUES(?,?,?,?)",device.vault_id,hash,isStagedBinary(body)?body.file.size:bytes!.length,new Date().toISOString());
+    verifiedBlobs.recordVerified(device.vault_id,hash,clearSize,isStagedBinary(body)?body.file.size:bytes!.length);
     return reply.code(201).send();
   });
 
@@ -645,7 +665,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const device = await authenticate(request);
     if(integrityBlockedVaults.has(device.vault_id))return reply.code(423).send({error:"Sync is blocked because the accepted snapshot failed server integrity checks"});
     await ingestExternalChanges(device.vault_id);
-    const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),folders:z.array(folderSchema).max(200000).default([]),
+    const body = z.object({ parentId: z.string().uuid().nullable(), message: z.string().max(500).default("Sync"), entries: z.array(entrySchema).max(200000),folders:z.array(folderSchema).max(200000).default([]),folderEntries:z.array(folderEntrySchema).max(200000).optional(),
       clientTime:z.string().datetime().optional(),signals:z.object({highEntropyPaths:z.array(z.string()).max(1000).optional(),deviceLocalCleanupPaths:z.array(z.string().max(1000)).max(5000).optional(),vaultIdentity:z.string().max(500).optional(),staleBaseline:z.boolean().optional()}).optional() }).parse(request.body) as CommitRequest;
     if(body.clientTime){const skew=Date.parse(body.clientTime)-Date.now();store.run("UPDATE devices SET clock_skew_ms=? WHERE id=?",Number.isFinite(skew)?Math.round(skew):0,device.id);}
     let manifest;try{manifest=canonicalManifest(body.entries,body.folders);}catch(error){return reply.code(422).send({error:error instanceof Error?error.message:String(error)});}
@@ -653,16 +673,28 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const missing = body.entries.filter((entry) => !store.one("SELECT 1 FROM blobs WHERE vault_id=? AND hash=?", device.vault_id, entry.hash));
     if (missing.length) return reply.code(422).send({ error: "Missing blobs", hashes: missing.slice(0,100).map((e) => e.hash) });
     const current = store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?", device.vault_id)!.head_id;
-    if(current!==body.parentId)return reply.code(409).send({error:"Head moved",head:current?store.getSnapshot(current):null});
+    if(current!==body.parentId)return reply.code(409).send({error:"Head moved",head:current?getSnapshotView(store,current):null});
+    // Historical blobs.size has mixed clear/cipher meanings. A verified clear
+    // proof or immutable accepted entry is required; ambiguous legacy objects
+    // are authenticated once on disk before they can introduce new metadata.
+    const acceptedSizes=new Map((current?store.getSnapshot(current)?.entries??[]:[]).map(entry=>[entry.hash,entry.size])),verifiedSizes=new Map<string,number>(),signal=requestSignal(request,reply);
+    for(const entry of body.entries){signal.throwIfAborted();let size=verifiedSizes.get(entry.hash)??store.one<{clear_size:number}>("SELECT clear_size FROM blob_integrity WHERE vault_id=? AND hash=?",device.vault_id,entry.hash)?.clear_size??acceptedSizes.get(entry.hash);
+      if(size===undefined){const file=await verifiedBlobs.clear(storageRow(device.vault_id),entry.hash,signal);try{size=file.size;}finally{await file.dispose();}}
+      if(size!==entry.size)return reply.code(422).send({error:"Manifest byte size does not match its verified content",hash:entry.hash});verifiedSizes.set(entry.hash,size);
+    }
     const ready=store.one<{initial_sync_complete:number}>("SELECT initial_sync_complete FROM devices WHERE id=?",device.id)?.initial_sync_complete;
     if(current&&!ready)return reply.code(428).send({error:"This newly paired device must complete its first download before it can upload changes"});
-    const decision=safeguards.propose({vaultId:device.vault_id,deviceId:device.id,deviceName:device.name,parentId:body.parentId,message:body.message,entries:body.entries,folders:body.folders,source:"device",signals:body.signals});
+    const aliases=store.all<{config_root:string}>("SELECT config_root FROM vault_config_aliases WHERE vault_id=?",device.vault_id).map(row=>row.config_root),aliasConflicts=aliasCollisionRecords(body.entries,aliases,device.name);
+    body.entries=normalizeAliasEntries(body.entries,aliases);body.folders=normalizeAliasFolders(body.folders??[],aliases);
+    const decision=safeguards.propose({vaultId:device.vault_id,deviceId:device.id,deviceName:device.name,parentId:body.parentId,message:body.message,entries:body.entries,folders:body.folders,folderEntries:body.folderEntries,source:"device",signals:body.signals});
     if(!decision.allowed){
       if(decision.quarantine&&decision.created)safeguards.event(device.vault_id,"mass_change_quarantine","warning",`${device.name}'s changes were quarantined: ${decision.assessment.reasons.join("; ")}`);
+      if(decision.quarantine&&aliasConflicts.length)store.run("INSERT INTO conflict_proposals(quarantine_id,vault_id,records_json) VALUES(?,?,?) ON CONFLICT(quarantine_id) DO NOTHING",decision.quarantine.id,device.vault_id,JSON.stringify(aliasConflicts));
+      if(decision.quarantine&&body.folderEntries)store.run("INSERT INTO sync_pending_folders VALUES(?,?,?) ON CONFLICT(quarantine_id) DO NOTHING",decision.quarantine.id,device.vault_id,JSON.stringify(body.folderEntries));
       return reply.code(423).send({error:decision.locked?"Remote writes are frozen for this vault":"Suspicious vault changes require approval",locked:decision.locked,quarantine:decision.quarantine,assessment:decision.assessment});
     }
     const message=decision.authorization==="trusted_window"?`${body.message} (device maintenance approval: ${device.name})`:body.message;
-    const snapshot=await acceptSnapshot(device.vault_id,body.parentId,device.id,device.name,message,body.entries,body.folders??[]);
+    const snapshot=await acceptSnapshot(device.vault_id,body.parentId,device.id,device.name,message,body.entries,body.folders??[],undefined,undefined,accepted=>{if(aliasConflicts.length)new ConflictInbox(store).publishInTransaction(device,aliasConflicts.map(record=>({...record,originSnapshotId:accepted.id})));},body.folderEntries);
     if(!snapshot)return reply.code(409).send({error:"Head moved",head:store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)?.head_id});
     return reply.code(201).send(snapshot);
   });

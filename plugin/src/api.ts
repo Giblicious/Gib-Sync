@@ -2,11 +2,14 @@ import { requestUrl } from "obsidian";
 import { PROTOCOL_VERSION, type ClientCompatibility, type CommitRequest, type HealthRepairResult, type HistoryItem, type ManifestEntry, type MirrorCompleteResponse, type MirrorPlanResponse, type QuarantineItem, type QuickCodeClaim, type QuickCodePairing, type RestorePreview, type SafeguardPolicy, type SafeguardState, type SelectiveRestorePlan, type SelectiveRestorePreview, type ServerStatus, type SetupResponse, type Snapshot, type StorageDiscovery, type StorageSetupRequest, type SyncState, type WatchResponse } from "@gib-sync/protocol";
 import type { GibSyncSettings } from "./settings";
 import { hashBytes } from "./crypto";
-import type {SnapshotDelta} from "@gib-sync/protocol";
+import type {SnapshotDelta,SyncTree,OperationBatch,OperationReceipt,RolloutStatus,ReconciliationInput} from "@gib-sync/protocol";
 import type {SnapshotCache} from "./snapshot-cache";
 import {sha256} from "@noble/hashes/sha2.js";
 import {bytesToHex} from "@noble/hashes/utils.js";
 import {controlledIo} from "./io-control";
+import type {ConflictInboxItem} from "./conflict-inbox";
+export interface PendingDeviceClaim{status:"pending";claimId:string;ticket:string;expiresAt:string;confirmationCode:string;}
+export interface TrustedDeviceRequest{id:string;deviceName:string;confirmationCode:string;expiresAt:string;}
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly responseBody: unknown) { super(message); }
@@ -26,7 +29,7 @@ function errorBody(response:{json:unknown}):any{
   try{return response.json;}catch{return null;}
 }
 
-export const CLIENT_VERSION="0.8.62";
+export const CLIENT_VERSION="0.8.63";
 export interface ContentUploadState{id:string;hash:string;size:number;offset:number;chunkBytes:number;complete:boolean;processing?:boolean;processingId?:string;stage?:"verifying"|"uploading"|"checking"|"waiting";}
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
@@ -51,6 +54,13 @@ export class GibSyncApi {
   }
   supportsStreamUpload():boolean{try{if(new URL(this.settings().serverUrl).protocol!=="https:")return false;}catch{return false;}return this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.has("resumable-content-upload-v1")===true;}
   disableStreamUpload():void{this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.delete("resumable-content-upload-v1");}
+  supportsOperationsV2():boolean{return this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.has("snapshot-operations-v2")===true;}
+  syncTree(){return this.json<SyncTree>("GET","/v2/tree",undefined,this.settings().deviceToken);}
+  operationBatch(batch:OperationBatch){return this.json<OperationReceipt>("POST","/v2/batches",batch,this.settings().deviceToken);}
+  batchReceipt(id:string){return this.json<OperationReceipt>("GET",`/v2/batches/${encodeURIComponent(id)}`,undefined,this.settings().deviceToken);}
+  rolloutStatus(){return this.json<RolloutStatus>("GET","/v2/rollout",undefined,this.settings().deviceToken);}
+  observeReconciliation(input:ReconciliationInput,baseSnapshotId:string|null){return this.json<{matched:boolean;rollout:RolloutStatus}>("POST","/v2/shadow",{baseSnapshotId,...input},this.settings().deviceToken);}
+  declareConfigRoot(configDir:string){return this.json<{canonicalRoot:".obsidian";deviceRoot:string;headId:string|null;migrated:boolean;aliases:string[];conflictCount:number}>("POST","/v2/config-root",{configDir},this.settings().deviceToken);}
   discover(server:string,seafileUrl:string,seafileUsername:string,seafilePassword:string) { return this.json<StorageDiscovery>("POST","/v1/storage/discover",{seafileUrl,seafileUsername,seafilePassword},undefined,server); }
   serverInfo(server:string){return this.json<Pick<SetupResponse,"protocolVersion"|"serverVersion"|"serverCapabilities">>("GET","/healthz",undefined,undefined,server);}
   setup(server: string, body: StorageSetupRequest) { return this.json<SetupResponse>("POST", "/v1/setup", body, undefined, server); }
@@ -99,8 +109,16 @@ export class GibSyncApi {
   unbookmark(id:string){return this.json<{ok:boolean}>("DELETE",`/v1/bookmarks/${id}`,undefined,this.settings().deviceToken);}
   mirrorPlan(snapshotId:string,entries:ManifestEntry[]){return this.json<MirrorPlanResponse>("POST","/v1/mirror/plan",{snapshotId,entries},this.settings().deviceToken);}
   mirrorComplete(snapshotId:string){return this.json<MirrorCompleteResponse>("POST","/v1/mirror/complete",{snapshotId},this.settings().deviceToken);}
-  createPairing() { return this.json<QuickCodePairing>("POST", "/v1/pairings", {}, this.settings().deviceToken); }
-  claimQuickCode(server:string,code:string,deviceName:string){return this.json<QuickCodeClaim>("POST","/v1/pairings/claim-code",{code,deviceName},undefined,server);}
+  async createPairing() { const pairing=await this.json<QuickCodePairing&{requiresConfirmation?:boolean}>("POST", "/v1/pairings", {requireConfirmation:true}, this.settings().deviceToken);if(pairing.requiresConfirmation!==true)throw new Error("The server must be updated before secure quick-code setup is available. Existing synchronization is unaffected.");return pairing; }
+  claimQuickCode(server:string,code:string,deviceName:string){return this.json<QuickCodeClaim|PendingDeviceClaim>("POST","/v1/pairings/claim-code",{code,deviceName},undefined,server);}
+  pendingDeviceClaims(){return this.json<TrustedDeviceRequest[]>("GET","/v1/pairings/pending",undefined,this.settings().deviceToken);}
+  decideDeviceClaim(id:string,approved:boolean){return this.json<{ok:boolean}>("POST",`/v1/pairings/requests/${encodeURIComponent(id)}/decision`,{approved},this.settings().deviceToken);}
+  pollDeviceClaim(server:string,ticket:string){return this.json<{status:"pending";expiresAt:string}|{status:"approved";pairingId:string;envelope:string}>("POST","/v1/pairings/poll",{ticket},undefined,server);}
+  cancelDeviceClaim(server:string,ticket:string){return this.json<{ok:boolean}>("POST","/v1/pairings/cancel-claim",{ticket},undefined,server);}
+  async conflictInbox(){const records:ConflictInboxItem[]=[];for(let offset=0;offset<1000000;offset+=500){const page=await this.json<ConflictInboxItem[]>("GET",`/v1/conflicts?offset=${offset}`,undefined,this.settings().deviceToken);records.push(...page);if(page.length<500)return records;}throw new Error("Conflict history exceeded its retrieval budget; preserved records were not changed.");}
+  async publishConflicts(records:ConflictInboxItem[]){for(let offset=0;offset<records.length;offset+=50)await this.json<{ok:boolean}>("POST","/v1/conflicts",{records:records.slice(offset,offset+50)},this.settings().deviceToken);return {ok:true};}
+  recordConflictResolution(id:string,batchId:string,choice:string,after:Array<{path:string;hash:string|null}>,before:Array<{path:string;hash:string|null}>){return this.json<{ok:boolean}>("POST",`/v1/conflicts/${encodeURIComponent(id)}/resolution`,{batchId,choice,after,before},this.settings().deviceToken);}
+  recordConflictUndo(id:string,batchId:string,resolutionId:string){return this.json<{ok:boolean}>("POST",`/v1/conflicts/${encodeURIComponent(id)}/undo`,{batchId,resolutionId},this.settings().deviceToken);}
   async getBlob(hash: string): Promise<Uint8Array> {
     const response = await transport(()=>requestUrl({ url: this.url(`/v1/blobs/${hash}`), method: "GET", headers: { ...this.clientHeaders(),Authorization:`Bearer ${this.settings().deviceToken}` }, throw: false }));
     if (response.status !== 200) throw new ApiError(`Blob download failed (${response.status})`, response.status, null);

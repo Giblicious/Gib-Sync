@@ -55,6 +55,8 @@ export interface Snapshot {
   entries: ManifestEntry[];
   /** Explicit accepted folder topology. Omitted by snapshots created before protocol 7. */
   folders?: string[];
+  /** Stable identities for the complete folder tree; additive for legacy clients. */
+  folderEntries?: import("./operations.js").FolderEntry[];
   /** Server-authored cleanup guidance retained across descendant snapshots. */
   folderRepair?: FolderRepairDirective;
 }
@@ -194,6 +196,7 @@ export interface CommitRequest {
   message: string;
   entries: ManifestEntry[];
   folders?: string[];
+  folderEntries?: import("./operations.js").FolderEntry[];
   clientTime?: string;
   signals?: ClientSafetySignals;
 }
@@ -294,6 +297,7 @@ export interface DeviceInfo {
 
 export { mergeJsonValues } from "./json-merge.js";
 export { mergeText, type MergeKind, type MergeResult } from "./text-merge.js";
+export * from "./operations.js";
 
 export interface HealthAlert {
   code: string;
@@ -331,7 +335,7 @@ export function detectMoves(previous:ManifestEntry[],next:ManifestEntry[],mode:"
     if(destinations.length!==1||!destination||before.has(destination.path)||!created.some(item=>item.path===destination.path))continue;
     result.set(source.path,destination.path);usedCreated.add(destination.path);
   }
-  for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1||result.has(sources[0].path)||usedCreated.has(destinations[0].path))continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
+  for(const [hash,sources] of removedByHash){const destinations=createdByHash.get(hash)??[];if(sources.length!==1||destinations.length!==1||result.has(sources[0].path)||usedCreated.has(destinations[0].path))continue;if(sources[0].fileId&&destinations[0].fileId&&sources[0].fileId!==destinations[0].fileId)continue;result.set(sources[0].path,destinations[0].path);usedCreated.add(destinations[0].path);}
   // Structural resemblance is useful when assessing a deletion batch, but is
   // not proof that two edited files share an ancestor. Merge planning must use
   // identity mode so similarly named notes cannot inherit each other's base.

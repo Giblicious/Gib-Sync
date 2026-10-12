@@ -1,0 +1,84 @@
+name: Publish verified candidate
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable candidate tag already tested on a physical iPhone
+        required: true
+        type: string
+      image_digest:
+        description: Exact workflow-built and canary-tested sha256 image digest
+        required: true
+        type: string
+      evidence_sha256:
+        description: SHA256 of privately retained reviewed canary, migration and physical iPhone evidence
+        required: true
+        type: string
+      confirmation:
+        description: Type VERIFIED-PHYSICAL-IPHONE-AND-CANARY
+        required: true
+        type: string
+permissions: { contents: write, packages: write }
+concurrency: { group: gib-sync-release-publication, cancel-in-progress: false }
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: '${{ inputs.tag }}'
+      RELEASE_IMAGE_DIGEST: '${{ inputs.image_digest }}'
+      EVIDENCE_SHA256: '${{ inputs.evidence_sha256 }}'
+      CONFIRMATION: '${{ inputs.confirmation }}'
+      GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+    steps:
+      - name: Require explicit reviewed physical evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == 'Giblicious/Gib-Sync' ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == 'VERIFIED-PHYSICAL-IPHONE-AND-CANARY' ]]
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.tag }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, check-latest: true }
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: docker/setup-buildx-action@v3
+      - name: Verify immutable image availability before any live publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged="$(docker buildx imagetools inspect "ghcr.io/giblicious/gib-sync:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -r .digest)"
+          pinned="$(docker buildx imagetools inspect "ghcr.io/giblicious/gib-sync@$RELEASE_IMAGE_DIGEST" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$tagged" == "$RELEASE_IMAGE_DIGEST" && "$pinned" == "$RELEASE_IMAGE_DIGEST" ]]
+      - name: Verify published candidate and exact public bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RELEASE_COMMIT="$(git rev-parse HEAD)"
+          gh api "repos/Giblicious/Gib-Sync-Canary/releases/tags/$RELEASE_TAG" > candidate-release.json
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .prerelease == true and .draft == false' candidate-release.json
+          gh release download "$RELEASE_TAG" --repo Giblicious/Gib-Sync-Canary --dir candidate-assets
+          node scripts/release-artifacts.mjs verify candidate-assets
+          node --test scripts/publish-verified-release.test.mjs
+          node scripts/publish-verified-release.mjs stage candidate-assets
+      - name: Publish only a fully read-back verified draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RELEASE_COMMIT="$(git rev-parse HEAD)"
+          node scripts/publish-verified-release.mjs publish candidate-assets
+          gh release download "$RELEASE_TAG" --dir promoted-assets
+          node scripts/release-artifacts.mjs verify promoted-assets
+      - name: Promote the same immutable image, without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="$(docker buildx imagetools inspect "ghcr.io/giblicious/gib-sync:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$current" == "$RELEASE_IMAGE_DIGEST" ]]
+          docker buildx imagetools create --prefer-index=false --tag ghcr.io/giblicious/gib-sync:latest "ghcr.io/giblicious/gib-sync@$RELEASE_IMAGE_DIGEST"
+          promoted="$(docker buildx imagetools inspect ghcr.io/giblicious/gib-sync:latest --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$promoted" == "$RELEASE_IMAGE_DIGEST" ]]
+      - run: echo "Promoted $RELEASE_TAG unchanged; private reviewed evidence SHA256 $EVIDENCE_SHA256" >> "$GITHUB_STEP_SUMMARY"

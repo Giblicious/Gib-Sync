@@ -17,12 +17,14 @@ export interface RetiredPathState {
   retiredAt:number;
 }
 export interface PendingCommit {
+  intentSequence?:number;
   parentId:string|null;
   fingerprint:string;
   priorHashes:Record<string,string|null>;
   priorEntries?:Record<string,ManifestEntry>;
 }
 export interface ApplyOperation {
+  namespacePath?:string;
   targetHash:string|null;
   priorHash:string|null;
   stagePath:string;
@@ -30,6 +32,7 @@ export interface ApplyOperation {
   phase:"planned"|"staged"|"backed-up"|"promoting"|"applied";
 }
 export interface GibSyncSettings {
+  packageHolds:Record<string,{reason:string;at:number;kind?:"incomplete"|"activation";attempts?:number;retryAt?:number;fingerprint?:string;priorEntries?:Record<string,ManifestEntry&{sourcePath?:string}>}>;
   configDir:string;
   onboardingMode:"preserve-local"|"server-first";
   pendingMoves:Array<{from:string;to:string;at:number}>;
@@ -52,6 +55,7 @@ export interface GibSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
+  packageHolds:{},
   configDir:".obsidian",
   onboardingMode:"preserve-local",
   pendingMoves:[],fileCreationTimes:{},observedFolderSnapshotId:null,
@@ -82,6 +86,7 @@ export function createSerializedSettingsWriter<T>(read:()=>T,write:(snapshot:T)=
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
   const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
+  settings.packageHolds=stored?.packageHolds&&typeof stored.packageHolds==="object"&&!Array.isArray(stored.packageHolds)?Object.fromEntries(Object.entries(stored.packageHolds).filter(([id,hold])=>/^[a-z0-9._-]+$/i.test(id)&&hold&&typeof hold.reason==="string"&&typeof hold.at==="number"&&Number.isFinite(hold.at)).map(([id,hold])=>[id,{reason:hold.reason.slice(0,500),at:hold.at}])):{};
   settings.configDir=normalizedConfigDir(typeof stored?.configDir==="string"?stored.configDir:".obsidian");
   settings.onboardingMode=stored?.onboardingMode==="server-first"?"server-first":"preserve-local";
   settings.pendingMoves=Array.isArray(stored?.pendingMoves)?stored.pendingMoves.filter(move=>move&&typeof move.from==="string"&&isSafeVaultPath(move.from)&&typeof move.to==="string"&&isSafeVaultPath(move.to)&&typeof move.at==="number"&&Number.isFinite(move.at)&&move.at>0):[];
@@ -110,9 +115,10 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
       return [path,{path,hash:entry.hash,size:entry.size,mtime:entry.mtime,...(typeof entry.fileId==="string"?{fileId:entry.fileId}:{}),...(validRevision?{revision:{id:revision.id,parentId:revision.parentId,deviceId:revision.deviceId,deviceName:revision.deviceName,modifiedAt:revision.modifiedAt}}:{})}];
     })):{};
   settings.pendingApplyPriorEntries=validEntries(stored?.pendingApplyPriorEntries);
+  for(const [id,hold]of Object.entries(settings.packageHolds)){const saved=stored?.packageHolds?.[id];if(!saved)continue;if(saved.kind==="incomplete"||saved.kind==="activation")hold.kind=saved.kind;if(Number.isSafeInteger(saved.attempts)&&saved.attempts!>=0)hold.attempts=saved.attempts;if(typeof saved.retryAt==="number"&&Number.isFinite(saved.retryAt)&&saved.retryAt>=0)hold.retryAt=saved.retryAt;if(typeof saved.fingerprint==="string"&&/^[a-f0-9]{64}$/.test(saved.fingerprint))hold.fingerprint=saved.fingerprint;const entries=validEntries(saved.priorEntries);for(const [path,entry]of Object.entries(entries)){const source=saved.priorEntries?.[path]?.sourcePath;if(typeof source==="string"&&/^\.gib-sync\/package-hold-originals\/[0-9a-f-]{36}\.bin$/.test(source))(entry as ManifestEntry&{sourcePath?:string}).sourcePath=source;}if(Object.keys(entries).length)hold.priorEntries=entries;}
   const operations=stored?.pendingApplyOperations;
   settings.pendingApplyOperations=operations&&typeof operations==="object"&&!Array.isArray(operations)
-    ?Object.fromEntries(Object.entries(operations).filter(([path,operation])=>isSafeVaultPath(path)&&operation&&typeof operation==="object"
+    ?Object.fromEntries(Object.entries(operations).filter(([path,operation])=>isSafeVaultPath(path)&&operation&&typeof operation==="object"&&(!operation.namespacePath||isSafeVaultPath(operation.namespacePath))
       &&(operation.targetHash===null||typeof operation.targetHash==="string"&&/^[a-f0-9]{64}$/i.test(operation.targetHash))
       &&(operation.priorHash===null||typeof operation.priorHash==="string"&&/^[a-f0-9]{64}$/i.test(operation.priorHash))
       &&typeof operation.stagePath==="string"&&/^\.gib-sync\/apply\/[a-f0-9]{64}\.stage$/.test(operation.stagePath)
@@ -121,7 +127,7 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const replay=stored?.localReconcileBases;
   settings.localReconcileBases={...validEntries(replay),...Object.fromEntries(Object.entries(replay&&typeof replay==="object"&&!Array.isArray(replay)?replay:{}).filter(([path,entry])=>isSafeVaultPath(path)&&entry===null))};
   settings.pendingCommit=commit&&(commit.parentId===null||typeof commit.parentId==="string"&&Boolean(commit.parentId))&&typeof commit.fingerprint==="string"&&/^[a-f0-9]{64}$/i.test(commit.fingerprint)&&commit.priorHashes&&typeof commit.priorHashes==="object"&&!Array.isArray(commit.priorHashes)
-    ?{parentId:commit.parentId,fingerprint:commit.fingerprint,priorHashes:Object.fromEntries(Object.entries(commit.priorHashes).filter(([path,hash])=>isSafeVaultPath(path)&&(hash===null||typeof hash==="string"&&/^[a-f0-9]{64}$/i.test(hash)))),...(commit.priorEntries?{priorEntries:validEntries(commit.priorEntries)}:{})}:null;
+    ?{parentId:commit.parentId,fingerprint:commit.fingerprint,priorHashes:Object.fromEntries(Object.entries(commit.priorHashes).filter(([path,hash])=>isSafeVaultPath(path)&&(hash===null||typeof hash==="string"&&/^[a-f0-9]{64}$/i.test(hash)))),...(commit.priorEntries?{priorEntries:validEntries(commit.priorEntries)}:{}),...(Number.isSafeInteger(commit.intentSequence)&&commit.intentSequence!>=0?{intentSequence:commit.intentSequence}:{})}:null;
   settings.retiredPaths=stored?.retiredPaths&&typeof stored.retiredPaths==="object"&&!Array.isArray(stored.retiredPaths)
     ?Object.fromEntries(Object.entries(stored.retiredPaths).filter(([path,value])=>Boolean(path)&&Boolean(value)&&typeof value==="object"&&typeof value.hash==="string"&&/^[a-f0-9]{64}$/i.test(value.hash)&&typeof value.snapshotId==="string"&&Boolean(value.snapshotId)&&typeof value.retiredAt==="number"&&Number.isFinite(value.retiredAt)&&value.retiredAt>0)):{};
   settings.folderCreateTimes=stored?.folderCreateTimes&&typeof stored.folderCreateTimes==="object"&&!Array.isArray(stored.folderCreateTimes)
@@ -188,6 +194,7 @@ export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): 
   const actual=path.replace(/\\/g,"/").replace(/^\/+/,""),normalized=canonicalConfigPath(actual,settings.configDir).toLowerCase();
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/")||normalized===".trash"||normalized.startsWith(".trash/"))return false;
   if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
+  if(/^\.obsidian\/plugins\/\.gib-sync-package-[0-9a-f-]+\.(?:stage|original|probe)(?:\/|$)/i.test(normalized))return false;
   // Workspace files are rapidly rewritten UI state and differ between desktop
   // and mobile. They are always device-local, even when config sync is enabled.
   if(isDeviceLocalObsidianPath(normalized))return false;
@@ -201,7 +208,8 @@ export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): 
   if(!bookmarks&&!pluginPath&&!obsidianRoot&&!settings.syncObsidianConfig&&normalized.startsWith(".obsidian/"))return false;
   return !settings.exclusions.some((prefix)=>{
     const excluded=prefix.replace(/\\/g,"/").replace(/^\/+/,"").replace(/\/+$/,"");
-    return Boolean(excluded)&&(actual.toLowerCase()===excluded.toLowerCase()||actual.toLowerCase().startsWith(`${excluded.toLowerCase()}/`)||normalized===excluded.toLowerCase()||normalized.startsWith(`${excluded.toLowerCase()}/`));
+    const canonicalExcluded=canonicalConfigPath(excluded,settings.configDir).toLowerCase();
+    return Boolean(excluded)&&(actual.toLowerCase()===excluded.toLowerCase()||actual.toLowerCase().startsWith(`${excluded.toLowerCase()}/`)||normalized===canonicalExcluded||normalized.startsWith(`${canonicalExcluded}/`));
   });
 }
 

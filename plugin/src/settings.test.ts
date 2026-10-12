@@ -3,6 +3,7 @@ import type { Plugin } from "obsidian";
 import { createSerializedSettingsWriter,DEFAULT_SETTINGS,isGibSyncConflictPath,loadSettings,shouldSyncChangedPath } from "./settings";
 
 describe("file-change sync filtering",()=>{
+  it("honors physical custom-root exclusions after logical namespace mapping",()=>{const settings={...DEFAULT_SETTINGS,configDir:".obsidian-phone",syncPlugins:true,syncObsidianConfig:true,exclusions:[".obsidian-phone/snippets/private"]};expect(shouldSyncChangedPath(".obsidian/snippets/private/local.css",settings)).toBe(false);expect(shouldSyncChangedPath(".obsidian-phone/snippets/private/local.css",settings)).toBe(false);expect(shouldSyncChangedPath(".obsidian/snippets/shared.css",settings)).toBe(true);});
   it("never treats rooted paths or traversal as vault files",()=>{for(const path of ["../note.md","folder/../../note.md","/outside.md","C:/outside.md","folder//note.md","folder/./note.md","bad\0name"])expect(shouldSyncChangedPath(path,DEFAULT_SETTINGS)).toBe(false);expect(shouldSyncChangedPath("folder/note.md",DEFAULT_SETTINGS)).toBe(true);});
   it("recognizes only timestamped Gib Sync conflict-copy names",()=>{
     expect(isGibSyncConflictPath("Notes/Entry (conflict - Seafile - 2026-07-26 16-46-02 UTC - 2).md")).toBe(true);

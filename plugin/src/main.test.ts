@@ -16,13 +16,15 @@ function fixture(){
   plugin.checkObsidianSyncProtection=vi.fn(async()=>false);plugin.refreshServerStatus=vi.fn(async()=>{});
   (plugin as any).checkCompatibility=vi.fn(async()=>true);
   plugin.api={markDeviceReady:vi.fn(async()=>{}),headState:vi.fn(async()=>({headId:"accepted"}))} as any;
-  const sync=vi.fn().mockResolvedValue(result);plugin.engine={sync} as any;
+  const sync=vi.fn().mockResolvedValue(result);plugin.engine={sync,recordIntent:vi.fn(async()=>{}),verificationPending:0,stop:vi.fn()} as any;
   return {plugin,sync};
 }
 beforeEach(()=>{vi.useFakeTimers();vi.stubGlobal("window",globalThis);vi.mocked(Notice).mockClear();vi.spyOn(console,"error").mockImplementation(()=>{});});
 afterEach(()=>{vi.useRealTimers();vi.unstubAllGlobals();vi.restoreAllMocks();});
 
 describe("plugin synchronization lifecycle",()=>{
+  it("does not discard a held package's baseline and retry witness when runtime reports the same hold",()=>{const {plugin}=fixture(),prior={path:".obsidian/plugins/sample/data.json",hash:"a".repeat(64),size:1,mtime:1,sourcePath:'.gib-sync/package-hold-originals/00000000-0000-4000-8000-000000000001.bin'};plugin.settings.packageHolds.sample={reason:"Temporary",at:1,kind:"activation",attempts:3,retryAt:100000,fingerprint:"b".repeat(64),priorEntries:{[prior.path]:prior}};(plugin as any).recordRuntimeOutcome("sample","Still temporary",true);expect(plugin.settings.packageHolds.sample).toMatchObject({reason:"Still temporary",attempts:3,retryAt:100000,fingerprint:"b".repeat(64),priorEntries:{[prior.path]:prior}});});
+  it("keeps truthful green status for protected stale runtime saves but warns on actual component holds",()=>{const {plugin}=fixture();plugin.liveStatus.phase="up-to-date";plugin.liveStatus.message="Up to date";plugin.liveStatus.verified=true;(plugin as any).recordRuntimeOutcome("sample","Old save protected",false);(plugin as any).recordRuntimeOutcome("sample","Old save protected",false);expect(plugin.liveStatus).toMatchObject({phase:"up-to-date",message:"Up to date",verified:true});expect(plugin.settings.packageHolds).toEqual({});expect(plugin.liveStatus.activities.at(-1)).toMatchObject({level:"info",repeats:2});(plugin as any).recordRuntimeOutcome("sample","Package activation held",true);expect(plugin.liveStatus.verified).toBe(false);expect(plugin.settings.packageHolds.sample.reason).toBe("Package activation held");});
   it("retains a newer observed path revision and timestamp after a full sync",async()=>{
     const {plugin,sync}=fixture();(plugin as any).pathVersions.set("note.md",1);(plugin as any).pathRevision=1;plugin.settings.pendingPaths=["note.md"];plugin.settings.pendingPathTimes={"note.md":100};
     sync.mockImplementation(async()=>{plugin.scheduleFileChangeSync("note.md");return {...result,processedPaths:["note.md"],fullScan:true};});

@@ -13,13 +13,17 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Server-enforced mass-change safeguards for both Obsidian devices and direct Seafile/WebDAV edits.
 - Optional Obsidian bookmark synchronization, enabled by default without requiring full `.obsidian` configuration sync.
 
-## Interrupted-sync recovery
+## Durable synchronization and recovery
 
-Version 0.8.62 adds staged local application, durable server projection jobs,
-recorded move identity, explicit device acknowledgments, and verified automatic
-database backups. Existing accounts, settings, vault keys, and immutable history
-migrate automatically. See [architecture and migration](docs/architecture-and-migration.md)
-for the safety invariants, rollout procedure, and mobile/backend limitations.
+The 0.8.63 candidate adds an operation ledger, stable file and folder identities,
+exact retry receipts, a shared reconciliation policy, persistent content inventory,
+file-backed server transfers, recoverable whole-plugin switching and a conflict
+inbox. Existing accounts, settings, vault keys and immutable history migrate
+automatically. Candidates must be distributed separately from the production
+repository because BRAT includes prereleases in automatic updates. The stable
+release and production image stay unchanged until canary and iPhone checks pass. See
+[architecture and migration](docs/architecture-and-migration.md) for the safety
+invariants, rollout procedure and mobile/backend limitations.
 
 Before requesting a commit, the plugin saves a write-ahead receipt containing the proposed content fingerprint, its parent snapshot, and the actual pre-application file hashes. After a lost response or app suspension, it verifies that exact proposal against authenticated snapshot ancestry before advancing the local checkpoint. Device display names alone never establish ownership. Recovery only scans the local vault again after an interrupted operation; normal unchanged checks remain lightweight.
 
@@ -80,7 +84,7 @@ Legacy vaults initialize empty-folder topology from the first trusted upgraded O
 
 `.obsidian` is excluded by default because workspace state is often device-specific. **Sync Obsidian configuration** includes portable themes, snippets, hotkeys, and other settings, but workspace layout files always remain device-local. Concurrent JSON settings changes merge recursively by key; overlapping scalar or array values use the newer side, and non-JSON system files use the newer whole file. `.obsidian` system files never create user-facing conflict copies.
 
-**Sync installed plugins** treats each plugin's code and assets as an atomic package. On first activation or after upgrading from an older client, the device pulls the accepted server plugin inventory and settings before it may publish plugin changes; when the server has no plugin state yet, the first device establishes it. This prevents a phone's incomplete plugin set or freshly created default `data.json` files from resetting an established desktop. After bootstrap, a complete package beats an incomplete copy, a higher manifest version wins, and equal versions use the later package modification. `data.json` remains independently mergeable settings. Generated cache folders—including caches, indexes, embeddings, logs, and temporary data—remain device-local and are removed from future server snapshots. The enabled-plugin list is applied after package files and entries lacking a complete `manifest.json` plus `main.js` are disabled automatically, while Gib Sync always preserves its own enablement. Plugin `data.json` files can contain API keys and are copied to readable Seafile when plugin sync is enabled.
+**Sync installed plugins** selects each plugin's code and assets as a complete package and applies it using a verified, recoverable directory switch on supported adapters. On first activation or after upgrading from an older client, the device pulls the accepted server plugin inventory and settings before it may publish plugin changes; when the server has no plugin state yet, the first device establishes it. This prevents a phone's incomplete plugin set or freshly created default `data.json` files from resetting an established desktop. After bootstrap, a complete package beats an incomplete copy, a higher manifest version wins, and equal versions use the later package modification. `data.json` remains independently mergeable settings. Generated cache folders—including caches, indexes, embeddings, logs, and temporary data—remain device-local and are removed from future server snapshots. The enabled-plugin list is applied after package files and entries lacking a complete `manifest.json` plus `main.js` are disabled automatically, while Gib Sync always preserves its own enablement. Plugin `data.json` files can contain API keys and are copied to readable Seafile when plugin sync is enabled.
 
 **Excluded path prefixes** is the device-local ignore list. A prefix ignores that file or complete directory subtree on that device while preserving the accepted remote version and the copies used by other devices.
 
@@ -142,7 +146,7 @@ Open Gib Sync settings and choose **Manual setup**. Enter the Gib Sync and Seafi
 
 In plugin settings, **Periodic sync** controls timer-based remote checks independently from **Sync when files change**. File-change sync waits two seconds after a vault file is created, saved, renamed, or deleted, coalesces rapid edits into one run, and ignores excluded paths.
 
-Another device can repeat manual setup and select the discovered existing vault. Alternatively, choose **Show quick code** on a connected device, then choose **Enter quick code** on the new device. The five-digit numeric code changes every 60 seconds and works once. QR scanning and camera access are not used.
+Another device can repeat manual setup and select the discovered existing vault. Alternatively, choose **Show quick code** on a connected device, then choose **Enter quick code** on the new device. The five-digit numeric code changes every 60 seconds and works once. Confirm the matching verification number on the already connected device before the new device receives credentials. New quick-code pairing requires the upgraded approval flow; already paired older clients keep working. QR scanning and camera access are not used.
 
 ## Development
 

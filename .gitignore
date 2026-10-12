@@ -6,4 +6,6 @@ main.js
 .env
 .DS_Store
 coverage/
+__pycache__/
+*.py[cod]
 

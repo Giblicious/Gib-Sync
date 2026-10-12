@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { detectMoves, type ChangeAssessment,type ChangeItem,type ClientSafetySignals,type ManifestEntry,type QuarantineItem,type SafeguardPolicy,type Snapshot } from "@gib-sync/protocol";
+import { detectMoves, type ChangeAssessment,type ChangeItem,type ClientSafetySignals,type FolderEntry,type ManifestEntry,type QuarantineItem,type SafeguardPolicy,type Snapshot } from "@gib-sync/protocol";
 import { Store } from "./db.js";
 import { sha256 } from "./security.js";
 
@@ -75,7 +75,7 @@ export function assessChanges(previous:ManifestEntry[],next:ManifestEntry[],poli
 }
 
 type VaultSafetyRow={safeguard_policy:string|null;write_locked_at:string|null;write_locked_by:string|null;trusted_until:string|null;trusted_device_id:string|null};
-type Proposal={vaultId:string;deviceId:string;deviceName:string;parentId:string|null;message:string;entries:ManifestEntry[];folders?:string[];source:"device"|"seafile";signals?:ClientSafetySignals};
+type Proposal={vaultId:string;deviceId:string;deviceName:string;parentId:string|null;message:string;entries:ManifestEntry[];folders?:string[];folderEntries?:FolderEntry[];source:"device"|"seafile";signals?:ClientSafetySignals};
 
 export class SafeguardService{
   constructor(private readonly store:Store){}
@@ -98,10 +98,15 @@ export class SafeguardService{
     const hardReason=assessment.reasons.some((reason)=>/out-of-date device|completely empty|Protected path|grew unexpectedly|mostly emptied|high-entropy/i.test(reason));
     const explicitReview=Boolean(assessment.reasons.length&&(proposal.source==="seafile"||assessment.deleted>0||hardReason));
     if(!assessment.reasons.length||!previous.length||(trusted&&!explicitReview))return {allowed:true,locked:false,assessment,quarantine:null,created:false,authorization:trusted?"trusted_window":"policy"};
-    const manifest=JSON.stringify({entries:[...proposal.entries].sort((a,b)=>a.path.localeCompare(b.path)),folders:[...new Set(proposal.folders??[])].sort()});
-    const proposalHash=sha256(Buffer.from(JSON.stringify({parentId:proposal.parentId,message:proposal.message,manifest})));
-    const existing=this.store.one<{id:string}>("SELECT id FROM quarantines WHERE vault_id=? AND proposal_hash=? AND status='pending'",proposal.vaultId,proposalHash);
-    const id=existing?.id??randomUUID(),createdAt=new Date().toISOString(),expiresAt=new Date(Date.now()+7*24*60*60*1000).toISOString();
+    const manifest=JSON.stringify({entries:[...proposal.entries].sort((a,b)=>a.path.localeCompare(b.path)),folders:[...new Set(proposal.folders??[])].sort(),folderEntries:proposal.folderEntries});
+    // Review content, topology and generations once. A scan timestamp or an
+    // untrusted incoming revision label cannot turn identical work into a new
+    // approval, while different devices and causal generations stay separate.
+    const identity=(entries:ManifestEntry[],folders:string[]=[],identified?:FolderEntry[])=>JSON.stringify({entries:[...entries].sort((a,b)=>a.path.localeCompare(b.path)).map(({path,hash,size,fileId})=>({path,hash,size,fileId:fileId??null})),folders:[...new Set(folders)].sort(),folderIdentities:identified?.map(({path,folderId})=>({path,folderId})).sort((a,b)=>a.path.localeCompare(b.path))??null}),fingerprint=identity(proposal.entries,proposal.folders,proposal.folderEntries),proposalHash=sha256(Buffer.from(JSON.stringify({parentId:proposal.parentId,deviceId:proposal.deviceId,source:proposal.source,message:proposal.message,fingerprint}))),now=new Date().toISOString();
+    type Existing={id:string;created_at:string;expires_at:string;manifest_json:string;message:string};
+    let existing=this.store.one<Existing>("SELECT id,created_at,expires_at,manifest_json,message FROM quarantines WHERE vault_id=? AND proposal_hash=? AND status='pending' AND expires_at>?",proposal.vaultId,proposalHash,now);
+    if(!existing)for(const prior of this.store.all<Existing>("SELECT id,created_at,expires_at,manifest_json,message FROM quarantines WHERE vault_id=? AND device_id=? AND source=? AND parent_id IS ? AND status='pending' AND expires_at>?",proposal.vaultId,proposal.deviceId,proposal.source,proposal.parentId,now)){if(prior.message!==proposal.message)continue;try{const parsed=JSON.parse(prior.manifest_json),saved=Array.isArray(parsed)?{entries:parsed}:parsed,pending=this.store.one<{folder_entries_json:string}>('SELECT folder_entries_json FROM sync_pending_folders WHERE quarantine_id=? AND vault_id=?',prior.id,proposal.vaultId),identified=saved.folderEntries??(pending?JSON.parse(pending.folder_entries_json):undefined);if(identity(saved.entries,saved.folders,identified)===fingerprint){existing=prior;break;}}catch{/* An unparseable prior proposal is never silently approved or rewritten. */}}
+    const id=existing?.id??randomUUID(),createdAt=existing?.created_at??now,expiresAt=existing?.expires_at??new Date(Date.now()+7*24*60*60*1000).toISOString();
     if(!existing)this.store.run("INSERT INTO quarantines(id,vault_id,proposal_hash,source,device_id,device_name,parent_id,created_at,expires_at,status,message,manifest_json,assessment_json,changes_json) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
       id,proposal.vaultId,proposalHash,proposal.source,proposal.deviceId,proposal.deviceName,proposal.parentId,createdAt,expiresAt,proposal.message,manifest,JSON.stringify(assessment),JSON.stringify(changes));
     return {allowed:false,locked:false,assessment,created:!existing,authorization:"quarantine",quarantine:{id,proposalHash,source:proposal.source,deviceId:proposal.deviceId,deviceName:proposal.deviceName,parentId:proposal.parentId,

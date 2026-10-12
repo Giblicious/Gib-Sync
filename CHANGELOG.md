@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.63 candidate
+
+- Complete the shared operation authority, stable file/folder generations, causal moves/recreation and exact crash-retry receipts, including compatible snapshot clients.
+- Persist a yielding content inventory and editor intents; preempt background audits and verify timestamp-preserving changes without repeated full hashing.
+- Map configuration roots automatically, preserve existing preferences/credentials, and apply verified complete plugin packages with protected runtime settings saves and component-specific recovery.
+- Add a durable conflict inbox with original versions, practical comparisons, conditional decisions/undo and namespace-collision handling.
+- Stream backend uploads, downloads, projection, imports and history capture through verified private files without changing encryption keys or envelope format.
+- Require trusted-device approval for new quick-code claims; existing paired clients remain compatible.
+- Preserve immutable history and accepted writes during automatic migration, rollback and re-upgrade; gate production v2 activation on signed isolated canary and real iPhone evidence.
+- Separate BRAT candidate distribution from production updates and publish exactly the tested asset/image bytes through owned workflows.
+
+This candidate does not update existing BRAT installations or production. Physical acceptance and stable publication remain separate release gates.
+
 ## 0.8.62
 
 - Add staged, hash-verified local application with durable phase journals and retained original recovery copies.

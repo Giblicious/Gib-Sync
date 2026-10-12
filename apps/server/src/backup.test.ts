@@ -17,7 +17,9 @@ describe("verified database backup",()=>{
       const result=await verifiedDatabaseBackup(dir,"concurrent"),restored=new DatabaseSync(result.path,{readOnly:true});
       try{const captured=Number(restored.prepare("SELECT name FROM vaults WHERE id='v'").get()?.name);expect(mutations).toBeGreaterThan(0);expect(captured).toBeLessThan(mutations);expect(restored.prepare("SELECT COUNT(*) count FROM padding").get()?.count).toBe(256);expect(restored.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");}finally{restored.close();}
     }finally{if(timer)clearInterval(timer);store.db.close();await rm(dir,{recursive:true,force:true});}
-  },10_000);
+  // This 32 MiB WAL/IO drill shares disk bandwidth with the full fault suite.
+  // Keep every pinning/content assertion; a loaded Windows host needs headroom.
+  },30_000);
   it("keeps daily backup timing across restart instead of postponing it",async()=>{
     const dir=await mkdtemp(join(tmpdir(),"gib-backup-test-")),store=new Store(dir),now=Date.now();
     try{expect(await backupIfDue(dir,now)).toBe(true);expect(await backupIfDue(dir,now+1000)).toBe(false);expect(await backupIfDue(dir,now+24*60*60*1000)).toBe(true);}

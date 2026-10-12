@@ -1,4 +1,4 @@
-import { Menu, Notice, Platform, Plugin, TFolder, normalizePath, setIcon } from "obsidian";
+import { Menu, Notice, Platform, Plugin, TFolder, normalizePath, setIcon,type DataAdapter } from "obsidian";
 import type { ClientCompatibility, ServerStatus, SetupResponse } from "@gib-sync/protocol";
 import { ApiError,ApiTransportError,GibSyncApi } from "./api";
 import { recoverSync,SyncCancelledError } from "./sync-recovery";
@@ -7,7 +7,11 @@ import { NotificationGate } from "./notifications";
 import { ConfigWatcher } from "./config-watcher";
 import { SnapshotCache } from "./snapshot-cache";
 import { hashAdapterFile } from "./file-io";
-import { createSerializedSettingsWriter, DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
+import type {IntentKind} from "./intent-journal";
+import type {ConflictChoice,ConflictInboxItem,ConflictInboxPreview} from "./conflict-inbox";
+import {canonicalAdapter} from "./canonical-adapter";
+import {PluginRuntimeCoordinator,type RuntimeManager} from "./plugin-runtime";
+import { canonicalConfigPath,createSerializedSettingsWriter, DEFAULT_SETTINGS, initialLiveStatus, type ActivityLevel, type GibSyncSettings, type LiveSyncStatus, type SyncPhase, loadSettings, shouldSyncChangedPath } from "./settings";
 import { deriveIndicatorState } from "./status";
 import { assertSetupServerCompatible,enforceServerCompatibility,unavailableServerCompatibility } from "./server-compatibility";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
@@ -24,6 +28,13 @@ export default class GibSyncPlugin extends Plugin {
   private operationGeneration=0;
   private operationOwner=0;
   private stopped=false;
+  private vaultEventsReady=false;
+  private inventoryChecking=false;
+  private canonicalConfigEnabled=false;
+  private configAliases:string[]=[];
+  private declaredConfigScope="";
+  private syncAdapter!:DataAdapter;
+  private packageRuntime:PluginRuntimeCoordinator|null=null;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
@@ -61,7 +72,9 @@ export default class GibSyncPlugin extends Plugin {
     this.api = new GibSyncApi(() => this.settings,new SnapshotCache(this.app.vault.adapter));
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
     this.statusEl = this.addStatusBarItem();
-    this.engine = new SyncEngine(this.app.vault.adapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => {if(this.stopped)return;if(progress.remoteChanged||["applying","uploading","committing","mirroring"].includes(progress.phase))this.liveStatus.verified=false;this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total);},undefined,(path,hash)=>this.expectedLocalMutations.set(normalizePath(path),hash),undefined,Platform.isMobile,(path)=>!this.syncApplicationRevisions||this.syncApplicationRevisions.get(normalizePath(path))===this.pathVersions.get(normalizePath(path)),()=>this.canContinueOperation());
+    this.syncAdapter=canonicalAdapter(this.app.vault.adapter,()=>this.canonicalConfigEnabled?this.settings.configDir:".obsidian",()=>this.configAliases);
+    this.packageRuntime=new PluginRuntimeCoordinator(this.app,Plugin.prototype,()=>(this.app as typeof this.app&{plugins?:RuntimeManager}).plugins,this.app.vault.adapter,id=>`${this.settings.configDir}/plugins/${id}`,Platform.isMobile,()=>this.assertOperationCurrent(),cooperativeYield,(id,message,attention=true)=>this.recordRuntimeOutcome(id,message,attention));
+    this.engine = new SyncEngine(this.syncAdapter, this.api, () => this.settings, () => this.saveSettings(), (progress) => {if(this.stopped)return;if(progress.remoteChanged||["applying","uploading","committing","mirroring"].includes(progress.phase))this.liveStatus.verified=false;this.report(progress.phase,progress.message,progress.level??"info",progress.current,progress.total);},undefined,(path,hash)=>this.expectedLocalMutations.set(this.syncPath(path),hash),undefined,Platform.isMobile,(path)=>!this.syncApplicationRevisions||this.syncApplicationRevisions.get(this.syncPath(path))===this.pathVersions.get(this.syncPath(path)),()=>this.canContinueOperation(),this.packageRuntime);
     const ribbon=this.addRibbonIcon("refresh-cw","Gib Sync status",()=>this.openStatusOverview());
     this.ribbonEl=ribbon;
     ribbon.oncontextmenu=(event)=>{event.preventDefault();void this.runSync();};
@@ -75,16 +88,17 @@ export default class GibSyncPlugin extends Plugin {
     this.addCommand({id:"review-safeguards",name:"Review quarantined changes",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)this.openSafeguards();return true;}});
     this.addCommand({id:"repair-vault-health",name:"Repair vault health",checkCallback:(checking)=>{if(!this.settings.deviceToken)return false;if(!checking)void this.repairVaultHealth();return true;}});
     this.addSettingTab(new GibSyncSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.settings.folderCreateTimes[path]=Date.now();this.requireFullScan();}else{this.recordFileCreation(file.path);this.scheduleFileChangeSync(file.path);}}));
+    this.registerEvent(this.app.vault.on("create", (file) => {if(file instanceof TFolder){const path=this.syncPath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.journalIntent(this.vaultEventsReady?"create":"observe",path,"folder");this.settings.folderCreateTimes[path]=Date.now();this.requireFullScan();}else{this.recordFileCreation(file.path);this.scheduleFileChangeSync(file.path);}}));
     this.registerEvent(this.app.vault.on("modify", (file) => {if(!(file instanceof TFolder))this.scheduleFileChangeSync(file.path);}));
-    this.registerEvent(this.app.vault.on("delete", (file) => {if(file instanceof TFolder){const path=normalizePath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
-    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {if(this.stopped||!shouldSyncChangedPath(oldPath,this.settings)&&!shouldSyncChangedPath(file.path,this.settings))return;this.lastVaultRenameAt=Date.now();this.recordRename(oldPath,file.path);if(file instanceof TFolder){this.settings.folderCreateTimes[normalizePath(file.path)]=Date.now();this.persistJournalSoon();this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
+    this.registerEvent(this.app.vault.on("delete", (file) => {this.journalIntent("delete",file.path,file instanceof TFolder?"folder":"file");if(file instanceof TFolder){const path=this.syncPath(file.path);if(!shouldSyncChangedPath(path,this.settings))return;const expected=this.expectedLocalMutations.get(path);if(this.expectedLocalMutations.has(path)){this.queueExpectedMutationVerification(path,expected??null);return;}this.recordPathTime(path,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path);}));
+    this.registerEvent(this.app.vault.on("rename", (file,oldPath) => {if(this.stopped||!shouldSyncChangedPath(oldPath,this.settings)&&!shouldSyncChangedPath(file.path,this.settings))return;this.journalIntent("move",file.path,file instanceof TFolder?"folder":"file",oldPath);this.lastVaultRenameAt=Date.now();this.recordRename(oldPath,file.path);if(file instanceof TFolder){this.settings.folderCreateTimes[this.syncPath(file.path)]=Date.now();this.persistJournalSoon();this.recordPathTime(file.path,true);this.recordPathTime(oldPath,true);this.requireFullScan();}else this.scheduleFileChangeSync(file.path,oldPath);}));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
       if (info.file) this.scheduleFileChangeSync(info.file.path);
     }));
     this.registerEvent(this.app.workspace.on("layout-change",()=>this.scheduleMobileMount()));
     this.configWatcher=new ConfigWatcher(this.app.vault.adapter,()=>this.settings,(paths,created)=>{for(const path of created)this.recordFileCreation(path);this.scheduleFileChangeSync(...paths);});
     this.registerInterval(window.setInterval(()=>void this.checkConfigChanges(),5000));
+    this.registerInterval(window.setInterval(()=>void this.checkInventory(),2000));
     void this.checkConfigChanges();
     this.registerDomEvent(document,"visibilitychange",()=>{
       if(document.visibilityState!=="visible"||!this.settings.deviceToken)return;
@@ -104,6 +118,7 @@ export default class GibSyncPlugin extends Plugin {
     this.app.workspace.onLayoutReady(()=>{
       if(this.stopped)return;
       this.mobileLayoutReady=true;
+      this.vaultEventsReady=true;
       this.configureStatusSurfaces();
       void this.checkObsidianSyncProtection();
       if(this.settings.deviceToken&&this.settings.autoSync)this.scheduleSync(2500);
@@ -114,6 +129,8 @@ export default class GibSyncPlugin extends Plugin {
     this.stopped=true;
     this.configWatcher?.stop();
     this.cancelOperation();
+    this.engine?.stop?.();
+    this.packageRuntime?.dispose();
     this.watchGeneration++;
     if(this.timer!==null)window.clearInterval(this.timer);
     if(this.debounce!==null)window.clearTimeout(this.debounce);
@@ -127,6 +144,28 @@ export default class GibSyncPlugin extends Plugin {
     this.removeStaleMobileSidebarIndicators();
   }
   private async checkConfigChanges(){if(this.stopped||document.visibilityState==="hidden")return;try{await this.configWatcher?.poll();this.configWatchError="";}catch(error){const message=error instanceof Error?error.message:String(error);if(message!==this.configWatchError){this.configWatchError=message;this.liveStatus.activities.push({at:new Date().toISOString(),phase:"checking",level:"warning",message:`Configuration change tracking unavailable: ${message}; full reconciliation remains active.`});this.emitStatus();}}}
+  private async checkInventory(){
+    if(this.stopped||!this.vaultEventsReady||this.inventoryChecking||this.liveStatus.running||this.syncTask||this.settings.paused||!this.settings.deviceToken||this.nativeSyncBlocked||this.compatibilityBlocked||this.safetyHold||document.visibilityState==="hidden")return;
+    this.inventoryChecking=true;this.operationOwner=this.operationGeneration;
+    try{const result=await this.engine.verifyInventory();if(this.stopped)return;if(result.changedPaths.length)result.changedPaths.forEach(path=>this.scheduleFileChangeSync(path));if(this.settings.fullScanRequired&&!this.liveStatus.running)this.queueSync(750,"Folder inventory changed","automatic");if(result.pending){this.liveStatus.verified=false;this.report("checking",`Verifying saved inventory · ${result.pending} files remaining`,"info");}else if(!this.liveStatus.lastError&&!Object.keys(this.settings.packageHolds).length&&!this.settings.pendingPaths.length&&!this.settings.fullScanRequired&&!this.settings.pendingApplySnapshotId&&!this.settings.retiredFolderCount&&this.settings.lastSnapshotId){this.liveStatus.verified=true;this.report("up-to-date","Up to date · file contents verified","success");}}
+    catch(error){if(!(error instanceof SyncCancelledError)&&!this.stopped){this.liveStatus.verified=false;this.report("checking","Background verification will retry; local files are unchanged","info");}}finally{this.inventoryChecking=false;}
+  }
+  private syncPath(path:string):string{return this.canonicalConfigEnabled?canonicalConfigPath(normalizePath(path),this.settings.configDir):normalizePath(path);}
+  private journalIntent(kind:IntentKind,path:string,entity:"file"|"folder"="file",from?:string){const normalized=this.syncPath(path);if(this.stopped||this.expectedLocalMutations.has(normalized)||from&&this.expectedLocalMutations.has(this.syncPath(from))||!shouldSyncChangedPath(normalized,this.settings)&&(!from||!shouldSyncChangedPath(from,this.settings)))return;void this.engine.recordIntent(kind,normalized,entity,from?this.syncPath(from):undefined).catch(()=>{if(!this.stopped){this.liveStatus.verified=false;this.report("checking","Saving the change journal will retry before any files are published","info");}});}
+  private async ensureConfigurationNamespace():Promise<void>{
+    if(typeof this.api.supportsOperationsV2!=="function"||!this.api.supportsOperationsV2())return;
+    const scope=JSON.stringify([this.settings.serverUrl,this.settings.vaultId,this.settings.deviceId,this.settings.configDir]);if(this.declaredConfigScope===scope)return;
+    let declaration;try{declaration=await this.api.declareConfigRoot(this.settings.configDir);}catch(error){if(error instanceof ApiError&&error.status===404)return;throw error;}
+    this.assertOperationCurrent();this.configAliases=declaration.aliases;this.engine.setConfigAliases(declaration.aliases);this.canonicalConfigEnabled=true;
+    const mapPath=(path:string)=>{for(const alias of [...declaration.aliases].sort((a,b)=>b.length-a.length))if(path===alias||path.startsWith(`${alias}/`))return `.obsidian${path.slice(alias.length)}`;return this.syncPath(path);},mapRecord=<T>(record:Record<string,T>,entry?:(value:T,path:string,old:string)=>T)=>Object.fromEntries(Object.entries(record).map(([old,value])=>{const path=mapPath(old);return [path,entry?entry(value,path,old):value];}));
+    for(const field of ["pendingPaths","pendingApplyPaths"] as const)this.settings[field]=[...new Set(this.settings[field].map(mapPath))];
+    for(const field of ["pendingPathTimes","fileCreationTimes","folderCreateTimes","pendingApplyPriorHashes","retiredPaths"] as const)(this.settings as any)[field]=mapRecord(this.settings[field] as Record<string,unknown>);
+    this.settings.pendingMoves=this.settings.pendingMoves.map(move=>({...move,from:mapPath(move.from),to:mapPath(move.to)}));
+    this.settings.pendingApplyOperations=mapRecord(this.settings.pendingApplyOperations,(operation,path,old)=>({...operation,...old!==path?{namespacePath:operation.namespacePath??old}:{}}));
+    this.settings.pendingApplyPriorEntries=mapRecord(this.settings.pendingApplyPriorEntries,(entry,path)=>({...entry,path}));this.settings.localReconcileBases=mapRecord(this.settings.localReconcileBases,(entry,path)=>entry?{...entry,path}:null);
+    if(this.settings.pendingCommit){this.settings.pendingCommit.priorHashes=mapRecord(this.settings.pendingCommit.priorHashes);if(this.settings.pendingCommit.priorEntries)this.settings.pendingCommit.priorEntries=mapRecord(this.settings.pendingCommit.priorEntries,(entry,path)=>({...entry,path}));}
+    for(const [path,revision] of [...this.pathVersions]){this.pathVersions.delete(path);this.pathVersions.set(mapPath(path),revision);}this.settings.fullScanRequired=true;await this.saveSettings();this.declaredConfigScope=scope;
+  }
   private canContinueOperation():boolean{return !this.stopped&&!this.settings.paused&&!this.nativeSyncBlocked&&!this.compatibilityBlocked&&this.operationOwner===this.operationGeneration;}
   private assertOperationCurrent(){if(!this.canContinueOperation())throw new SyncCancelledError("Synchronization was safely stopped");}
   private cancelOperation(){this.operationGeneration++;this.engine?.cancel?.();}
@@ -138,6 +177,7 @@ export default class GibSyncPlugin extends Plugin {
     if(this.serverStatus?.containment?.active&&!this.serverStatus.containment.thisVaultAllowed)return {key:"blocked" as const,label:"Server paused",icon:"shield-alert",tone:"warning" as const,animated:false,attentionCount:0,description:"Emergency containment is protecting this vault; no files are being changed"};
     const health=this.indicatorHealth();
     if(this.settings.retiredFolderCount){health.warnings++;health.description=this.settings.retiredFolderNote||`${this.settings.retiredFolderCount} local folder mismatch${this.settings.retiredFolderCount===1?"":"es"} remain`;}
+    const packageHolds=Object.keys(this.settings.packageHolds);if(packageHolds.length){health.warnings++;health.description=`${packageHolds.length} plugin package${packageHolds.length===1?"":"s"} need repair; other vault files can still sync. ${packageHolds.slice(0,3).join(", ")}`;}
     return deriveIndicatorState(this.liveStatus,Boolean(this.settings.deviceToken),this.nativeSyncBlocked||this.settings.paused,this.attentionCount(),health);
   }
   isNativeSyncBlocking():boolean{return this.nativeSyncBlocked;}
@@ -260,6 +300,12 @@ export default class GibSyncPlugin extends Plugin {
   }
   private emitStatus() { if(this.stopped)return;this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
+  private recordRuntimeOutcome(id:string,message:string,attention:boolean):void{
+    if(attention){this.settings.packageHolds[id]={...this.settings.packageHolds[id],reason:message,at:Date.now()};this.liveStatus.verified=false;this.report("applying",message,"warning");return;}
+    // A blocked stale write touched only private recovery, not accepted files.
+    // Keep the truthful green/working phase while recording useful provenance.
+    const now=new Date().toISOString(),previous=this.liveStatus.activities.at(-1);if(previous?.message===message&&previous.level==="info"){previous.at=now;previous.repeats=(previous.repeats??1)+1;}else this.liveStatus.activities.push({at:now,phase:this.liveStatus.phase,level:"info",message,repeats:1});if(this.liveStatus.activities.length>100)this.liveStatus.activities.splice(0,this.liveStatus.activities.length-100);this.emitStatus();
+  }
   report(phase:SyncPhase,message:string,level:ActivityLevel="info",current?:number,total?:number) {
     this.liveStatus.phase=phase; this.liveStatus.message=message; this.liveStatus.current=current; this.liveStatus.total=total;
     const now=new Date().toISOString(),previous=this.liveStatus.activities.at(-1); if(previous&&previous.phase===phase&&previous.message===message&&current!==undefined){
@@ -325,6 +371,12 @@ export default class GibSyncPlugin extends Plugin {
     finally{if(this.syncTask===reservation)this.syncTask=null;this.liveStatus.running=false;this.syncApplicationRevisions=null;this.scheduleExpectedVerification();this.emitStatus();}
   }
   async rejectAndRestore(id:string){return this.exclusiveOperation(async()=>{await this.api.rejectQuarantine(id);this.assertOperationCurrent();const result=await this.engine.restoreAcceptedSnapshot();this.assertOperationCurrent();this.liveStatus.verified=false;this.report("complete","Held changes rejected; accepted server version restored","success");return result;});}
+  listConflictInbox():Promise<ConflictInboxItem[]>{return this.engine.listConflictInbox();}
+  previewConflict(id:string):Promise<ConflictInboxPreview>{return this.engine.previewConflict(id);}
+  listPackageRecoveryOriginals(){return this.engine.packageRecoveryOriginals();}
+  resolveConflict(id:string,choice:ConflictChoice,combinedText?:string):Promise<void>{return this.exclusiveOperation(async()=>{await this.ensureConfigurationNamespace();await this.engine.resolveConflict(id,choice,combinedText);this.liveStatus.verified=false;this.report("complete","Decision saved · both originals remain recoverable","success");});}
+  undoConflict(id:string):Promise<void>{return this.exclusiveOperation(async()=>{await this.ensureConfigurationNamespace();await this.engine.undoConflict(id);this.liveStatus.verified=false;this.report("complete","Decision undone · original versions restored","success");});}
+  restoreLocalRecovery(path:string):Promise<void>{return this.exclusiveOperation(async()=>{await this.ensureConfigurationNamespace();await this.engine.restoreLocalRecovery(path);this.liveStatus.verified=false;this.report("complete","Protected original restored · the current copy remains in recovery","success");});}
   async repairVaultHealth(){
     try{const result=await this.exclusiveOperation(async()=>{this.report("mirroring","Repairing from the accepted server snapshot","info");const result=await this.api.repairHealth();this.assertOperationCurrent();this.safetyHold=false;await this.refreshServerStatus();return result;});this.report("complete",`Health repaired · ${result.restoredFiles} readable files verified · ${result.removedConflictCopies} redundant conflict copies cleaned · ${result.removedFiles} obsolete files removed · ${result.dismissedQuarantines} held changes dismissed`,"success");new Notice("Gib Sync repaired the accepted vault and readable recovery copy.",6000);return await this.runSync();}
     catch(error){if(error instanceof SyncCancelledError){if(this.settings.paused)this.report("blocked","Synchronization paused");return false;}const message=error instanceof Error?error.message:String(error);if(error instanceof SyncSafetyError){this.notify("health-repair",message,8000,60_000);return false;}this.report("error",`Health repair failed: ${message}`,"error");this.notify("health-repair",`Gib Sync health repair failed: ${message}`,10000,60_000);return false;}
@@ -423,6 +475,7 @@ export default class GibSyncPlugin extends Plugin {
       const result = await recoverSync(async()=>{
         if(!await this.checkCompatibility(false,true))throw new SyncCancelledError("Update required");
         this.assertOperationCurrent();
+        await this.ensureConfigurationNamespace();this.assertOperationCurrent();
         if(await this.checkObsidianSyncProtection(true))throw new SyncCancelledError("Obsidian Sync is active");
         this.assertOperationCurrent();
         this.liveStatus.nextSyncAt=null;
@@ -447,13 +500,13 @@ export default class GibSyncPlugin extends Plugin {
       if(this.fullScanRevision!==startingFullScanRevision)this.settings.fullScanRequired=true;
       this.settings.pendingPaths=[...this.pathVersions.keys()].sort();
       this.liveStatus.running=false;this.liveStatus.completedAt=now;this.liveStatus.lastSuccessAt=now;this.liveStatus.lastResult=summary;this.liveStatus.lastError="";
-      this.liveStatus.verified=!result.pendingRetiredFolders&&!this.fileChangePending&&!this.settings.pendingPaths.length&&!this.settings.pendingApplyPaths.length&&!this.settings.fullScanRequired;
+      this.liveStatus.verified=!result.pendingRetiredFolders&&!result.pendingPackages?.length&&!this.fileChangePending&&!this.settings.pendingPaths.length&&!this.settings.pendingApplyPaths.length&&!this.settings.fullScanRequired&&!this.engine.verificationPending;
       this.changedDuringReadFailures.clear();
       this.safetyHold=false;
       this.settings.lastSuccessAt=now;this.settings.lastResult=summary;this.settings.lastError="";await this.saveSettings();
       this.assertOperationCurrent();
-      const changed=Boolean(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders),folderWarning=result.pendingRetiredFolders>0;
-      this.report(folderWarning?"blocked":changed?"complete":"up-to-date",`${folderWarning?"Files synchronized, but folder topology does not match":changed?"Sync complete":"Up to date"} · ${summary}`,result.conflicts||folderWarning?"warning":"success");
+      const changed=Boolean(result.uploaded||result.mirrored||result.downloaded||result.deleted||result.prunedFolders),folderWarning=result.pendingRetiredFolders>0,packageWarning=Boolean(result.pendingPackages?.length);
+      this.report(folderWarning?"blocked":changed?"complete":"up-to-date",`${folderWarning?"Files synchronized, but folder topology does not match":packageWarning?`Vault files synchronized · ${result.pendingPackages!.length} plugin packages held for repair`:changed?"Sync complete":"Up to date"} · ${summary}`,result.conflicts||folderWarning||packageWarning?"warning":"success");
       if(!folderWarning)await this.api.markDeviceReady(result.snapshotId).catch(()=>{});
       if (result.conflicts) this.notify("conflicts",`Gib Sync preserved ${result.conflicts} conflict${result.conflicts === 1 ? "" : "s"}.`,8000,30_000); void this.refreshServerStatus();
       runSucceeded=true;
@@ -496,11 +549,11 @@ export default class GibSyncPlugin extends Plugin {
   }
   scheduleFileChangeSync(...paths:string[]) {
     if(this.stopped||!this.settings.deviceToken)return;
-    const normalized=paths.map((path)=>normalizePath(path));
+    const normalized=paths.map((path)=>this.syncPath(path));
     const expected=normalized.filter((path)=>this.expectedLocalMutations.has(path));
     if(expected.length){for(const path of expected)this.queueExpectedMutationVerification(path,this.expectedLocalMutations.get(path)!);paths=normalized.filter((path)=>!expected.includes(path));}
-    const relevant=paths.map((path)=>normalizePath(path)).filter((path)=>shouldSyncChangedPath(path,this.settings));if(!relevant.length)return;
-    const changedAt=Date.now();for(const path of relevant){this.pathVersions.set(path,++this.pathRevision);this.recordPathTime(path,false,changedAt);}
+    const relevant=paths.map((path)=>this.syncPath(path)).filter((path)=>shouldSyncChangedPath(path,this.settings));if(!relevant.length)return;
+    const changedAt=Date.now();for(const path of relevant){this.journalIntent("modify",path);this.pathVersions.set(path,++this.pathRevision);this.recordPathTime(path,false,changedAt);}
     this.settings.pendingPaths=[...this.pathVersions.keys()].sort();this.persistJournalSoon();
     this.lastRelevantVaultChangeAt=Date.now();
     if(!this.settings.syncOnFileChange)return;
@@ -510,24 +563,24 @@ export default class GibSyncPlugin extends Plugin {
   }
   private recordRename(from:string,to:string){
     if(this.stopped)return;
-    const source=normalizePath(from),target=normalizePath(to);if(!source||source===target||!shouldSyncChangedPath(source,this.settings)&&!shouldSyncChangedPath(target,this.settings)||this.expectedLocalMutations.has(source)||this.expectedLocalMutations.has(target))return;
+    const source=this.syncPath(from),target=this.syncPath(to);if(!source||source===target||!shouldSyncChangedPath(source,this.settings)&&!shouldSyncChangedPath(target,this.settings)||this.expectedLocalMutations.has(source)||this.expectedLocalMutations.has(target))return;
     const moves=this.settings.pendingMoves,previous=moves.find((move)=>move.to===source);
     if(previous){previous.to=target;previous.at=Date.now();}else{const index=moves.findIndex((move)=>move.from===source);if(index>=0)moves.splice(index,1);moves.push({from:source,to:target,at:Date.now()});}
     this.persistJournalSoon();
   }
-  private recordFileCreation(path:string){const normalized=normalizePath(path);if(this.stopped||this.expectedLocalMutations.has(normalized)||!shouldSyncChangedPath(normalized,this.settings))return;this.settings.fileCreationTimes[normalized]=Date.now();this.persistJournalSoon();}
+  private recordFileCreation(path:string){const normalized=this.syncPath(path);if(this.stopped||this.expectedLocalMutations.has(normalized)||!shouldSyncChangedPath(normalized,this.settings))return;this.journalIntent(this.vaultEventsReady?"create":"observe",normalized);this.settings.fileCreationTimes[normalized]=Date.now();this.persistJournalSoon();}
   private recordPathTime(path:string,folder=false,at=Date.now()){
-    let normalized=normalizePath(path);if(!normalized)return;if(folder&&!normalized.endsWith("/"))normalized+="/";
+    let normalized=this.syncPath(path);if(!normalized)return;if(folder&&!normalized.endsWith("/"))normalized+="/";
     this.settings.pendingPathTimes[normalized]=Math.max(this.settings.pendingPathTimes[normalized]??0,at);
   }
   private async verifyExpectedMutation(path:string,expectedHash:string|null){
     if(this.stopped)return;
     try{
-      const stat=await this.app.vault.adapter.stat(path);
+      const adapter=this.syncAdapter??this.app.vault.adapter,stat=await adapter.stat(path);
       if(this.stopped)return;
       if(!stat&&expectedHash===null){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
       if(stat?.type==="folder"&&expectedHash==="folder"){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
-      if(stat?.type==="file"&&expectedHash&&await hashAdapterFile(this.app.vault.adapter,path,()=>{if(this.stopped)throw new SyncCancelledError("Plugin unloaded");},cooperativeYield)===expectedHash){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
+      if(stat?.type==="file"&&expectedHash&&await hashAdapterFile(adapter,path,()=>{if(this.stopped)throw new SyncCancelledError("Plugin unloaded");},cooperativeYield)===expectedHash){if(this.expectedLocalMutations.get(path)===expectedHash)this.expectedLocalMutations.delete(path);return;}
     }catch{}
     if(this.stopped)return;
     if(this.expectedLocalMutations.get(path)!==expectedHash)return;this.expectedLocalMutations.delete(path);

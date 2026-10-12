@@ -11,6 +11,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24, check-latest: true, cache: npm }
       - run: node --test scripts/verify-server-runtime.test.mjs
+      - run: node --test scripts/release-channel.test.mjs
+      - run: node --test scripts/release-artifacts.test.mjs
+      - run: python3 -B -m unittest discover -s scripts -p 'verify_candidate_archive_test.py'
+      - run: node --test scripts/publish-verified-release.test.mjs
       - run: node scripts/verify-server-runtime.mjs
       - run: npm ci
       - run: npm run typecheck
@@ -31,5 +35,6 @@ jobs:
         with:
           context: .
           pull: true
-          push: '${{ github.event_name == ''push'' && github.ref == ''refs/heads/main'' }}'
+          # Only the release workflow may publish a stable/default image.
+          push: false
           tags: ghcr.io/giblicious/gib-sync:latest
