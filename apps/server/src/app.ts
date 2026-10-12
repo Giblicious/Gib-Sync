@@ -37,6 +37,7 @@ import type {OperationBatch,FolderEntry} from "@gib-sync/protocol";
 import {registerConfigRoots,normalizeAliasEntries,normalizeAliasFolders,aliasCollisionRecords} from "./config-roots.js";
 import {CanaryScope} from "./canary-scope.js";
 import {getSnapshotView} from './snapshot-evidence.js';
+import {invitationHeaders,invitationSetupUrl,registerSetupInvitation} from './setup-invitation.js';
 
 type AuthDevice = { id: string; vault_id: string; name: string };
 
@@ -144,7 +145,8 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
   app.addHook("onRequest",async(request,reply)=>{
     const route=request.routeOptions.url??request.url.split("?")[0];
-    const publicRoute=route==="/healthz"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code"||route==="/v1/pairings/poll"||route==="/v1/pairings/cancel-claim";
+    const publicRoute=route==="/healthz"||route==="/setup"||route==="/v1/setup"||route==="/v1/storage/discover"||route==="/v1/pairings/claim-code"||route==="/v1/pairings/poll"||route==="/v1/pairings/cancel-claim";
+    if(route==='/setup')invitationHeaders(reply);
     if(request.method==="OPTIONS")return;
     if(publicRoute&&Number(request.headers["content-length"]??0)>64*1024)return reply.code(413).send({error:"Setup request exceeds its permitted size"});
     if(!publicRoute)await authenticate(request,{allowIncompatible:route==="/v1/status"||route==="/v1/compatibility",allowContainment:route==="/v1/status"||route==="/v1/compatibility"});
@@ -297,6 +299,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   }
 
   app.get("/healthz", async () => ({ ok: true, protocolVersion: PROTOCOL_VERSION,serverVersion:SERVER_VERSION,serverCapabilities:[...SERVER_CAPABILITIES],minimumClientVersion:config.GIBSYNC_MIN_CLIENT_VERSION,recommendedClientVersion:config.GIBSYNC_RECOMMENDED_CLIENT_VERSION, containmentActive:containment.state().active,storage: "seafile", readableMirrors:true,externalEdits:true,externalScanSeconds:3,quickCodes:true,quickCodeSeconds:60,instantReceive:true,conflictPolicy:"word-aware-v1",safeguards:"quarantine-v1",vaults: store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults")?.count ?? 0,activeVaults:store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults WHERE retired_at IS NULL")?.count??0,retiredVaults:store.one<{count:number}>("SELECT COUNT(*) AS count FROM vaults WHERE retired_at IS NOT NULL")?.count??0 }));
+  registerSetupInvitation(app,config.PUBLIC_URL);
 
   app.post("/v1/health/repair",async(request,reply)=>{
     const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
@@ -398,7 +401,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     for(let attempt=0;attempt<8;attempt++){code=quickCode();normalized=normalizeQuickCode(code);if(!store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))break;}
     if(!code||store.one("SELECT id FROM pairings WHERE quick_code_hash=?",sha256(normalized)))throw new Error("Unable to allocate a quick code");
     store.run("INSERT INTO pairings(id,vault_id,secret_hash,quick_code_hash,created_by_device,expires_at,requires_confirmation) VALUES(?,?,?,?,?,?,?)",pairingId,device.vault_id,sha256(normalized),sha256(normalized),device.id,expiresAt,requiresConfirmation?1:0);
-    return {code,expiresAt,requiresConfirmation};
+    return {code,expiresAt,requiresConfirmation,setupUrl:invitationSetupUrl(config.PUBLIC_URL,code,expiresAt)};
   });
 
   app.post("/v1/pairings/claim-code",{bodyLimit:64*1024},async(request,reply)=>{

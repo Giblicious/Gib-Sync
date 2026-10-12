@@ -1,4 +1,4 @@
-# Durable synchronization v2 (0.8.65 candidate)
+# Durable synchronization v2 (0.8.66 candidate)
 
 ## Authority and identities
 
@@ -128,6 +128,15 @@ Five-digit codes remain optional. A claim alone never releases vault credentials
 the trusted originating device must approve a matching verification number.
 Opaque claim tickets, expiry, single-use delivery and rate budgets apply. Older
 unsafe pairing flows cannot create codes; paired protocol-7 clients keep syncing.
+
+Optional setup QR codes are generated locally and rotate with the same short-lived
+invite. The phone's native Camera opens a no-store HTTPS invitation page, then an
+explicit Obsidian protocol handoff fills only the server and temporary code.
+Receiving vault/server review and trusted-device confirmation remain mandatory;
+already-connected vaults cannot be redirected. No vault key, password, device token
+or camera access inside Obsidian's webview is involved. See the official
+[iPhone QR scanning instructions](https://support.apple.com/en-us/102680) and
+[Obsidian protocol API](https://github.com/obsidianmd/obsidian-api/blob/master/obsidian.d.ts).
 
 ## Automatic migration and staged rollout
 

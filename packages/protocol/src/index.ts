@@ -178,7 +178,7 @@ export interface MirrorCompleteResponse {
   snapshotId: string;
 }
 
-export interface QuickCodePairing { code:string; expiresAt:string; }
+export interface QuickCodePairing { code:string; expiresAt:string; setupUrl?:string; }
 export interface QuickCodeClaim { pairingId:string; envelope:string; }
 
 export interface SyncState {

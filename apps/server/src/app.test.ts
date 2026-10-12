@@ -70,6 +70,31 @@ function encryptedFixture(clear:Buffer,key:Buffer,hash:string):Buffer{const iv=r
 
 describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
+  it('serves a public prefix-preserving invitation without consuming it or bypassing trusted-device approval',async()=>{
+    const {config,store,storage}=fixture();config.PUBLIC_URL='https://sync.example.test/candidate/prefix///';
+    const app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};
+    const pairing=(await app.inject({method:'POST',url:'/v1/pairings',headers,payload:{requireConfirmation:true}})).json(),url=new URL(pairing.setupUrl);
+    expect(url.origin).toBe('https://sync.example.test');expect(url.pathname).toBe('/candidate/prefix/setup');expect(url.searchParams.get('code')).toBe(pairing.code);expect(Number(url.searchParams.get('expires'))).toBe(Date.parse(pairing.expiresAt));expect(pairing.requiresConfirmation).toBe(true);expect(Date.parse(pairing.expiresAt)-Date.now()).toBeLessThanOrEqual(60_000);
+    const before=JSON.stringify({pairings:store.all('SELECT * FROM pairings'),devices:store.all('SELECT * FROM devices'),vaults:store.all('SELECT * FROM vaults'),claims:store.all('SELECT * FROM trusted_pairing_claims')});
+    const page=await app.inject({method:'GET',url:'/setup'+url.search,headers:{host:'attacker.example.test'}});expect(page.statusCode).toBe(200);expect(page.body).toContain('Open Gib Sync in Obsidian');expect(page.body).not.toContain(setup.deviceToken);expect(page.body).not.toContain(setup.vaultKey);
+    expect(JSON.stringify({pairings:store.all('SELECT * FROM pairings'),devices:store.all('SELECT * FROM devices'),vaults:store.all('SELECT * FROM vaults'),claims:store.all('SELECT * FROM trusted_pairing_claims')})).toBe(before);
+    const claim=await app.inject({method:'POST',url:'/v1/pairings/claim-code',payload:{code:pairing.code,deviceName:'Phone'}});expect(claim.statusCode).toBe(202);const pending=claim.json();expect(pending.confirmationCode).toMatch(/^\d{6}$/);expect(pending.envelope).toBeUndefined();
+    expect((await app.inject({method:'POST',url:'/v1/pairings/poll',payload:{ticket:pending.ticket}})).json()).toMatchObject({status:'pending'});expect(store.one<{count:number}>('SELECT COUNT(*) count FROM devices')?.count).toBe(1);
+    expect((await app.inject({method:'POST',url:`/v1/pairings/requests/${pending.claimId}/decision`,headers,payload:{approved:true}})).statusCode).toBe(200);
+    const approved=(await app.inject({method:'POST',url:'/v1/pairings/poll',payload:{ticket:pending.ticket}})).json();expect(openJson<any>(approved.envelope,pending.ticket,`pairing:${approved.pairingId}`)).toMatchObject({vaultId:setup.vaultId,deviceToken:expect.any(String)});
+    await app.close();
+  });
+  it('applies the normal public 120/min budget and safe headers to setup bridge requests',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),url=`/setup?code=12345&expires=${Date.now()+60_000}`;
+    for(let index=0;index<120;index++)expect((await app.inject({method:'GET',url})).statusCode).toBe(200);
+    const blocked=await app.inject({method:'GET',url});expect(blocked.statusCode).toBe(429);expect(blocked.headers['cache-control']).toBe('no-store');expect(blocked.headers['referrer-policy']).toBe('no-referrer');expect(store.one('SELECT 1 FROM pairings')).toBeUndefined();expect(store.one('SELECT 1 FROM trusted_pairing_claims')).toBeUndefined();await app.close();
+  });
+  it('does not consume the five-attempt claim budget while displaying invitations',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),url=`/setup?code=12345&expires=${Date.now()+60_000}`;
+    for(let index=0;index<8;index++)expect((await app.inject({method:'GET',url})).statusCode).toBe(200);
+    for(let attempt=1;attempt<=6;attempt++)expect((await app.inject({method:'POST',url:'/v1/pairings/claim-code',payload:{code:'12345',deviceName:'Phone'}})).statusCode).toBe(attempt<=5?410:429);
+    await app.close();
+  });
   it("integrates authenticated resumable content upload with chunk limits and legacy decryption",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:"POST",url:"/v1/setup",payload:setupPayload("Desktop")})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},clear=Buffer.from("resumable content"),hash=sha256(clear);
     expect((await app.inject({method:"POST",url:"/v1/content-uploads",headers:{"content-type":"application/json"},payload:"invalid JSON"})).statusCode).toBe(401);expect((await app.inject({method:"GET",url:"/v1/compatibility",headers:auth})).json().serverCapabilities).toContain("resumable-content-upload-v1");const begun=await app.inject({method:"POST",url:"/v1/content-uploads",headers:auth,payload:{hash,size:clear.length}});expect(begun.statusCode).toBe(200);const session=begun.json();expect(session).toMatchObject({hash,size:clear.length,offset:0,chunkBytes:256*1024,complete:false});

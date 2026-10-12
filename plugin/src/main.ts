@@ -15,6 +15,7 @@ import { canonicalConfigPath,createSerializedSettingsWriter, DEFAULT_SETTINGS, i
 import { deriveIndicatorState } from "./status";
 import { assertSetupServerCompatible,enforceServerCompatibility,unavailableServerCompatibility } from "./server-compatibility";
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
+import {parseSetupInvite} from "./setup-qr";
 
 export default class GibSyncPlugin extends Plugin {
   settings: GibSyncSettings = { ...DEFAULT_SETTINGS }; api!: GibSyncApi; engine!: SyncEngine;
@@ -35,6 +36,7 @@ export default class GibSyncPlugin extends Plugin {
   private declaredConfigScope="";
   private syncAdapter!:DataAdapter;
   private packageRuntime:PluginRuntimeCoordinator|null=null;
+  private setupInviteModal:QuickCodeEntryModal|null=null;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
@@ -68,6 +70,7 @@ export default class GibSyncPlugin extends Plugin {
 
   async onload() {
     this.settings = await loadSettings(this);this.settings.configDir=normalizePath(this.app.vault.configDir);this.settings.fullScanRequired=true;
+    this.registerSetupInviteHandler();
     for(const path of this.settings.pendingPaths)this.pathVersions.set(path,++this.pathRevision);
     this.api = new GibSyncApi(() => this.settings,new SnapshotCache(this.app.vault.adapter));
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
@@ -127,6 +130,7 @@ export default class GibSyncPlugin extends Plugin {
 
   onunload() {
     this.stopped=true;
+    this.setupInviteModal?.close();this.setupInviteModal=null;
     this.configWatcher?.stop();
     this.cancelOperation();
     this.engine?.stop?.();
@@ -391,7 +395,15 @@ export default class GibSyncPlugin extends Plugin {
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async verifyServerBeforeSetup(server:string){assertSetupServerCompatible(await this.api.serverInfo(server));}
-  async claimQuickCode(server:string,value:string,deviceName:string,onboardingMode:"preserve-local"|"server-first"="preserve-local"){await this.acceptSetup(await claimQuickCodeSetup(this,server,value,deviceName),deviceName,onboardingMode);}
+  private registerSetupInviteHandler(){this.registerObsidianProtocolHandler("gib-sync-setup",params=>this.openSetupInvite(params));}
+  openSetupInvite(params:Record<string,string>):void{
+    if(this.stopped)return;if(this.settings.deviceToken||this.settings.vaultId){new Notice("This vault is already connected. Open an unconnected vault before using a setup invitation.");return;}
+    try{const invite=parseSetupInvite(params);this.setupInviteModal?.close();const modal=new QuickCodeEntryModal(this.app,this,invite,()=>{if(this.setupInviteModal===modal)this.setupInviteModal=null;});this.setupInviteModal=modal;modal.open();}
+    catch{new Notice("This setup invitation is invalid or expired. Scan a fresh QR or enter a new code manually.");}
+  }
+  async claimQuickCode(server:string,value:string,deviceName:string,onboardingMode:"preserve-local"|"server-first"="preserve-local",signal?:AbortSignal){
+    const current=()=>{if(signal?.aborted||this.stopped)throw new Error("Device connection cancelled.");if(this.settings.deviceToken||this.settings.vaultId)throw new Error("This vault is already connected; its connection was not changed.");};current();const setup=await claimQuickCodeSetup(this,server,value,deviceName,signal);current();await this.acceptSetup(setup,deviceName,onboardingMode);
+  }
   private runtimeObsidianSyncState():boolean|null{
     type Entry={enabled?:boolean;instance?:unknown};
     type Manager={getPluginById?:(id:string)=>Entry|undefined;getEnabledPluginById?:(id:string)=>unknown;plugins?:Record<string,Entry>};

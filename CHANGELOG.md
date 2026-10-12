@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.66 candidate
+
+- Add optional locally generated rolling setup QR codes and a mobile HTTPS-to-Obsidian handoff, so the native Camera app can fill the server address and temporary code without in-WebView camera permissions.
+- Require explicit receiving-vault/server review and the existing trusted-device confirmation; QR links contain no vault key, password or device token. Expired invites, interrupted claims and already-connected vaults are protected, and manual quick-code setup remains available.
+
+This candidate is distributed only through Gib-Sync-Canary until fresh live and physical acceptance. Existing production users remain unchanged.
+
 ## 0.8.65 candidate
 
 - Complete the shared operation authority, stable file/folder generations, causal moves/recreation and exact crash-retry receipts, including compatible snapshot clients.

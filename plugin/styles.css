@@ -1,4 +1,12 @@
 .gib-sync-quick-code { margin: 1.25rem 0; padding: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px; background: var(--background-secondary); color: var(--text-normal); font-family: var(--font-monospace); font-size: clamp(1.8rem, 10vw, 3rem); font-weight: 700; letter-spacing: .12em; line-height: 1.2; text-align: center; user-select: all; }
+.gib-sync-setup-qr { display: flex; align-items: center; justify-content: center; box-sizing: border-box; inline-size: min(256px, 100%); aspect-ratio: 1; margin: 1rem auto .65rem; padding: 12px; border: 1px solid #d5d5d5; border-radius: 10px; background: #fff; color: #000; contain: layout paint; }
+.gib-sync-setup-qr-image { inline-size: 100%; block-size: 100%; }
+.gib-sync-setup-qr svg { display: block; inline-size: 100%; block-size: 100%; shape-rendering: crispEdges; }
+.gib-sync-setup-qr svg rect { fill: #fff !important; stroke: none !important; }
+.gib-sync-setup-qr svg path { fill: #000 !important; stroke: none !important; }
+.gib-sync-setup-qr-caption { min-height: 2.6em; margin: .5rem 0; color: var(--text-muted); overflow-wrap: anywhere; text-align: center; }
+.gib-sync-setup-review { padding: .85rem 1rem; margin: .75rem 0; border: 1px solid var(--background-modifier-border); border-radius: 10px; background: var(--background-secondary); overflow-wrap: anywhere; }
+.gib-sync-setup-review p { margin: .5rem 0 0; }
 .gib-sync-history { max-height: 60vh; overflow: auto; }
 .gib-sync-recovery-row { padding: .65rem 0; border-bottom: 1px solid var(--background-modifier-border); overflow-wrap: anywhere; }
 .gib-sync-recovery-row > summary { min-height: 44px; cursor: pointer; }
