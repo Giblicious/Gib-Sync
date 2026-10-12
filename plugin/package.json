@@ -1,6 +1,6 @@
 {
   "name": "gib-sync-plugin",
-  "version": "0.8.67",
+  "version": "0.8.68",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@gib-sync/protocol": "0.8.67",
+    "@gib-sync/protocol": "0.8.68",
     "@noble/hashes": "^2.4.0",
     "diff": "^8.0.2",
     "qrcode": "1.5.4"

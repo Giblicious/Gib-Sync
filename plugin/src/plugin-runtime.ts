@@ -1,12 +1,14 @@
 import type {DataAdapter} from "obsidian";
 import {hashAdapterFile} from "./file-io";
-import {isSafeVaultPath} from "./settings";
+import {isSafeVaultPath,isDeviceLocalPlugin} from "./settings";
+import {AdapterFileChangedError} from "./file-io";
 
 type Instance={app:unknown;manifest:{id:string;dir?:string};loadData():Promise<unknown>;saveData(value:unknown):Promise<void>};
 export class PackageRuntimeHoldError extends Error{constructor(readonly pluginId:string,message:string){super(message);this.name="PackageRuntimeHoldError";}}
 export interface PackageRuntime{
   quiesce(id:string):Promise<void>;
   activate(id:string,expectedDataHash:string|null):Promise<void>;
+  confirmRetirement?(id:string):Promise<void>;
   finish():Promise<void>;
   dispose():void;
 }
@@ -63,7 +65,7 @@ export class PluginRuntimeCoordinator implements PackageRuntime{
       this.hooks={owners,originalLoad,originalSave,load,save};sharedHooks.set(prototype,this.hooks);prototype.loadData=load;prototype.saveData=save;
     }
   }
-  private guard(instance:Instance):Guard|undefined{return instance.app===this.app&&instance.manifest?.id!=="gib-sync"?this.guards.get(instance.manifest?.id):undefined;}
+  private guard(instance:Instance):Guard|undefined{return instance.app===this.app&&!isDeviceLocalPlugin(instance.manifest?.id??"")?this.guards.get(instance.manifest?.id):undefined;}
   private components():Map<string,Component>{let map=sharedComponents.get(this.app as object);if(!map){map=new Map();sharedComponents.set(this.app as object,map);}return map;}
   private newGuard(id:string,manager:RuntimeManager):Guard{return {id,previous:manager.plugins[id],wanted:manager.enabledPlugins.has(id),phase:"unloading",expected:null,approved:new WeakSet(),writes:new Set(),activated:false};}
   private retire(component:Component):void{const guard=component.guard;guard.loadToken=undefined;guard.approved=new WeakSet();guard.phase="quiesced";guard.activated=false;component.needsRecovery=true;}
@@ -99,7 +101,7 @@ export class PluginRuntimeCoordinator implements PackageRuntime{
     finally{guard.cleanup=cleanup;}
   }
   private require(id:string):RuntimeManager{
-    if(this.closed||id==="gib-sync"||!isSafeVaultPath(id)||/[\\/:*?"<>|\x00-\x1f]/.test(id)||id.endsWith(".")||id.trim()!==id||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(id))throw new Error("Invalid managed plugin runtime scope");const manager=this.manager();
+    if(this.closed||isDeviceLocalPlugin(id)||!isSafeVaultPath(id)||/[\\/:*?"<>|\x00-\x1f]/.test(id)||id.endsWith(".")||id.trim()!==id||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(id))throw new Error("Invalid managed plugin runtime scope");const manager=this.manager();
     if(!manager||!manager.plugins||!manager.manifests||!(manager.enabledPlugins instanceof Set)||typeof manager.disablePlugin!=="function"||typeof manager.enablePlugin!=="function"||typeof manager.loadManifest!=="function")throw new PackageRuntimeHoldError(id,"This Obsidian version cannot safely refresh a complete plugin package; existing settings and files were retained");return manager;
   }
   private async hash(path:string,cleanup=false):Promise<string|null>{const stat=await this.adapter.stat(path);if(!stat)return null;if(stat.type!=="file")throw new Error("A managed plugin file is not a regular file; runtime activation remains held");return hashAdapterFile(this.adapter,path,cleanup?()=>{}:this.checkpoint,cleanup?()=>new Promise(resolve=>setTimeout(resolve,0)):this.cooperate,stat.size<8*1024*1024);}
@@ -172,6 +174,11 @@ export class PluginRuntimeCoordinator implements PackageRuntime{
     }catch(error){guard.phase="quiesced";guard.loadToken=undefined;guard.approved=new WeakSet();if(guard.previous){if(manager.plugins[id]===guard.previous&&(!component.pending||component.pending.settled)){this.restoreFence(guard.previous);this.guards.delete(id);if(this.owned(component))this.components().delete(id);else if(this.components().get(id)===component)this.components().delete(id);}else if(manager.plugins[id]!==guard.previous)this.activeFences.delete(guard.previous);}const message=error instanceof Error?error.message:String(error);this.hold(id,message);throw new PackageRuntimeHoldError(id,message);}
   }
   private async wanted(id:string,fallback:boolean):Promise<boolean>{const root=this.pluginRoot(id),directory=root.slice(0,root.lastIndexOf("/plugins/")),path=`${directory}/community-plugins.json`,stat=await this.adapter.stat(path);if(stat?.type!=="file")return fallback;if(stat.size>512*1024)throw new Error("Plugin enablement exceeds its safe runtime budget");const enabled=JSON.parse(new TextDecoder().decode(new Uint8Array(await this.adapter.readBinary(path)))) as unknown;if(!Array.isArray(enabled)||enabled.some(value=>typeof value!=="string"))throw new Error("Plugin enablement is not a valid list");return enabled.includes(id);}
+  async confirmRetirement(id:string):Promise<void>{
+    this.checkpoint();const manager=this.require(id),component=await this.begin(id,manager);
+    try{const guard=component.guard;if(guard.phase!=="quiesced"||manager.plugins[id])throw new Error("A running plugin cannot be retired");await this.drain(guard);if(await this.adapter.exists(this.pluginRoot(id)))throw new AdapterFileChangedError(this.pluginRoot(id));guard.wanted=false;guard.activated=true;component.needsRecovery=false;manager.enabledPlugins.delete(id);delete manager.manifests[id];}
+    finally{this.end(component);}
+  }
   private async refreshManifest(component:Component,id:string,proof:Proof,cleanup=false):Promise<{id:string;version?:string;isDesktopOnly?:boolean}>{
     const {manager}=component;
     const path=`${this.pluginRoot(id)}/manifest.json`,stat=await this.adapter.stat(path);if(stat?.type!=="file"||stat.size>128*1024)throw new Error("The plugin manifest exceeds its safe runtime budget");

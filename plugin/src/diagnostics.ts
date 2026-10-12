@@ -1,5 +1,5 @@
 import type { ServerStatus } from "@gib-sync/protocol";
-import type { LiveSyncStatus } from "./settings";
+import type { LiveSyncStatus,GibSyncSettings } from "./settings";
 
 export function privacySafeDiagnostics(live:LiveSyncStatus,server:ServerStatus|null,connection:{configured:boolean;storageConfigured:boolean}){
   return {
@@ -17,9 +17,10 @@ export function privacySafeDiagnostics(live:LiveSyncStatus,server:ServerStatus|n
   };
 }
 
-export function detailedDiagnostics(live:LiveSyncStatus,server:ServerStatus|null,connection:{configured:boolean;storageConfigured:boolean}){
+export function detailedDiagnostics(live:LiveSyncStatus,server:ServerStatus|null,connection:{configured:boolean;storageConfigured:boolean},packageHolds:GibSyncSettings["packageHolds"]={}){
   const safe=privacySafeDiagnostics(live,server,connection);
   const redact=(value:string)=>value.replace(/\bhttps?:\/\/[^\s)]+/gi,"<server-url>").replace(/\bBearer\s+[^\s]+/gi,"Bearer <redacted>");
-  return {...safe,warning:"Detailed diagnostics may contain vault-relative file names. Saved credentials, keys, tokens, and connection settings are excluded; URLs in error and activity text are redacted.",
+  return {...safe,warning:"Detailed diagnostics may contain vault-relative file names and plugin identifiers. Saved credentials, keys, tokens, and connection settings are excluded; URLs in error and activity text are redacted.",
+    packages:{held:Object.entries(packageHolds).map(([id,{reason,at,kind,attempts,retryAt}])=>({id,reason:redact(reason),at,kind,attempts,retryAt}))},
     live:{...safe.live,message:redact(live.message),lastError:redact(live.lastError),lastResult:redact(live.lastResult),activities:live.activities.map(({at,phase,level,message,current,total,repeats})=>({at,phase,level,message:redact(message),current,total,repeats}))}};
 }

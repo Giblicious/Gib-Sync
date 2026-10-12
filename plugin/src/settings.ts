@@ -165,6 +165,13 @@ export function isPluginDataPath(path:string,configDir=".obsidian"):boolean {
   return obsidianPluginPath(path,configDir)?.relative.toLowerCase()==="data.json";
 }
 
+// The transport and its installer are operational dependencies, not vault
+// content. Another device's inventory must never update or disable them.
+const DEVICE_LOCAL_PLUGIN_IDS=new Set(["gib-sync","obsidian42-brat"]);
+export function isDeviceLocalPlugin(id:string):boolean {
+  return DEVICE_LOCAL_PLUGIN_IDS.has(id.toLowerCase());
+}
+
 export function isGeneratedPluginPath(path:string,configDir=".obsidian"):boolean {
   const plugin=obsidianPluginPath(path,configDir);if(!plugin)return false;
   const generatedFolders=new Set([".cache","cache","caches","embeddings","index-data","indexes","logs","node_modules","search-index","temp","tmp"]);
@@ -193,7 +200,12 @@ export function shouldSyncChangedPath(path: string, settings: GibSyncSettings): 
   if(!isSafeVaultPath(path))return false;
   const actual=path.replace(/\\/g,"/").replace(/^\/+/,""),normalized=canonicalConfigPath(actual,settings.configDir).toLowerCase();
   if(!normalized||normalized===".gib-sync"||normalized.startsWith(".gib-sync/")||normalized===".trash"||normalized.startsWith(".trash/"))return false;
-  if(normalized===".obsidian/plugins/gib-sync"||normalized.startsWith(".obsidian/plugins/gib-sync/"))return false;
+  const plugin=obsidianPluginPath(normalized);
+  if(plugin&&isDeviceLocalPlugin(plugin.id))return false;
+  if(plugin&&settings.exclusions.some(prefix=>{
+    const excluded=canonicalConfigPath(prefix.replace(/\\/g,"/").replace(/^\/+|\/+$/g,""),settings.configDir).toLowerCase();
+    return excluded&&["manifest.json","main.js"].some(file=>{const path=`.obsidian/plugins/${plugin.id.toLowerCase()}/${file}`;return path===excluded||path.startsWith(`${excluded}/`);});
+  }))return false; // Never synchronize an intentionally incomplete executable package.
   if(/^\.obsidian\/plugins\/\.gib-sync-package-[0-9a-f-]+\.(?:stage|original|probe)(?:\/|$)/i.test(normalized))return false;
   // Workspace files are rapidly rewritten UI state and differ between desktop
   // and mobile. They are always device-local, even when config sync is enabled.

@@ -18,4 +18,8 @@ describe("privacy-safe diagnostics",()=>{
     const copied=JSON.stringify(detailedDiagnostics(live,null,{configured:true,storageConfigured:true}));
     expect(copied).toContain("Notes/example.md");expect(copied).toContain("RangeError");expect(copied).toContain("vault-relative file names");expect(copied).not.toContain("private.example");
   });
+  it("identifies held packages and retry reasons without copying their original settings or fingerprints",()=>{
+    const live=initialLiveStatus(true),copied=JSON.stringify(detailedDiagnostics(live,null,{configured:true,storageConfigured:true},{demo:{reason:"Runtime held at https://private.example/v1 with Bearer secret",at:123,kind:"activation",attempts:2,retryAt:456,fingerprint:"private-fingerprint",priorEntries:{"private.json":{path:"private.json",hash:"private-hash",size:42,mtime:1,sourcePath:"private-original"}}}}));
+    expect(JSON.parse(copied).packages.held).toEqual([{id:"demo",reason:"Runtime held at <server-url> with Bearer <redacted>",at:123,kind:"activation",attempts:2,retryAt:456}]);for(const secret of ["private.example","secret","private-fingerprint","private-hash","private-original"])expect(copied).not.toContain(secret);
+  });
 });

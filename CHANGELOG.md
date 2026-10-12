@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.68 candidate
+
+- Keep Gib Sync and BRAT as device-local operational dependencies; never synchronize their files, replace their enabled state from another device, or suspend them during package work.
+- Retain unrelated local installations and settings during first plugin setup and server-first onboarding instead of interpreting absence from an inventory as a deletion. Excluded executable/manifest paths keep the whole package local; excluded settings survive compatible code updates.
+- Restore a previously retired installer only from one scope-owned, hash-verified complete original into a vacant directory using qualified no-overwrite native activation. Reinstalled packages and ambiguous/changed originals remain untouched.
+- Read adopted bytes from their actual source, propagate real read/transport failures, inspect held component subtrees during incremental sync, and distinguish verified package retirement from interrupted activation.
+- Include plugin identifiers, exact held-package reasons and retry information in opt-in diagnostics, without copying saved settings, original contents or connection secrets.
+
+This candidate is distributed only through Gib-Sync-Canary. Production promotion remains blocked on actual preserving migration and physical-device acceptance.
+
 ## 0.8.67 candidate
 
 - Give QR setup a separate, single-use 256-bit invitation valid for ten minutes, still requiring explicit receiving-vault/server review and trusted-device approval.

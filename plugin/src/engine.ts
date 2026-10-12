@@ -3,7 +3,7 @@ import { detectMoves,planReconciliationCooperative,selectPluginPackage,MAX_SETTI
 import { ApiError, GibSyncApi } from "./api";
 import { decryptBlob, encryptBlob, hashBytes } from "./crypto";
 import { mergeText } from "./merge";
-import { canonicalConfigPath, isDeviceLocalObsidianPath, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type ApplyOperation, type GibSyncSettings, type SyncPhase } from "./settings";
+import { canonicalConfigPath, isDeviceLocalObsidianPath, isDeviceLocalPlugin, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type ApplyOperation, type GibSyncSettings, type SyncPhase } from "./settings";
 import { mergeCommunityPluginEnablement, mergeSystemJson } from "./system-merge";
 import { BodyCache } from "./body-cache";
 import { AdapterFileChangedError, hashAdapterFile,streamAdapterFile } from "./file-io";
@@ -85,6 +85,7 @@ export class SyncEngine {
   private readonly pendingRuntimeActivation=new Map<string,string|null>();
   private readonly pendingRuntimeFingerprints=new Map<string,string>();
   private firstRun=true;
+  private readonly bootstrapRetainedPluginIds=new Set<string>();
   private readonly workBatch=typeof navigator!=="undefined"&&/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)?MOBILE_WORK_BATCH:DESKTOP_WORK_BATCH;
   constructor(
     private readonly adapter: DataAdapter,
@@ -230,7 +231,7 @@ export class SyncEngine {
     const target=await this.optionalSnapshot(settings.pendingApplySnapshotId);if(!target)throw new SyncSafetyError("The interrupted copy's accepted snapshot is unavailable; its original, current and staged versions were retained.");
     const entries=new Map(target.entries.map(entry=>[entry.path,entry])),cache=this.bodyCache(),desktopOnly=new Set<string>();
     if(this.isMobileDevice)for(const entry of target.entries){const plugin=this.pluginPath(entry.path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if(JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
-    for(const path of settings.pendingApplyPaths){await this.cooperate();const entry=entries.get(path),priorHash=settings.pendingApplyPriorHashes[path]??null,targetHash=entry?(this.isMobileDevice&&path===this.enablementPath?(await this.deviceBytes(path,entry,cache,desktopOnly)).hash:entry.hash):null;await this.loadOperation(path,targetHash,priorHash);}
+    for(const path of settings.pendingApplyPaths){if(!this.include(path))continue;await this.cooperate();const entry=entries.get(path),priorHash=settings.pendingApplyPriorHashes[path]??null,targetHash=entry?(path===this.enablementPath?(await this.deviceBytes(path,entry,cache,desktopOnly)).hash:entry.hash):null;await this.loadOperation(path,targetHash,priorHash);}
     await this.finishOperations(true);
   }
 
@@ -262,7 +263,27 @@ export class SyncEngine {
 
   private pluginSyncPath(path:string):boolean{
     const normalized=normalizePath(path);if(normalized===this.enablementPath)return true;
-    const plugin=this.pluginPath(normalized);return Boolean(plugin&&plugin.id.toLowerCase()!=="gib-sync");
+    const plugin=this.pluginPath(normalized);return Boolean(plugin&&this.sharedPlugin(plugin.id));
+  }
+
+  private sharedPlugin(id:string):boolean{return !isDeviceLocalPlugin(id)&&this.include(this.pluginFile(id,"manifest.json"))&&this.include(this.pluginFile(id,"main.js"));}
+  private deviceLocalEnablementIds(...texts:string[]):Set<string>{const ids=new Set<string>();for(const text of texts)try{const value=JSON.parse(text) as unknown;if(Array.isArray(value))for(const id of value)if(typeof id==="string"&&!this.sharedPlugin(id))ids.add(id);}catch{/* The schema merge reports malformed input separately. */}return ids;}
+  private async entryBytes(entry:FileState,physical:Map<string,FileState>,bytes:Map<string,Uint8Array>,remote:Map<string,Uint8Array>):Promise<Uint8Array>{
+    const observed=physical.get(entry.path);
+    return bytes.get(entry.hash)??(observed?.hash===entry.hash?this.localBytes(entry.path,observed,bytes):this.remoteBytes(entry,remote));
+  }
+  private async deviceEnablement(clear:Uint8Array,desktopOnly:Set<string>):Promise<Uint8Array>{
+    let enabled:unknown;try{enabled=JSON.parse(decoder.decode(clear));}catch{return clear;}
+    if(!Array.isArray(enabled)||enabled.some(id=>typeof id!=="string"))return clear;
+    let local:string[]=[];const stat=await this.adapter.stat(this.enablementPath);
+    if(stat?.type==="file"){
+      if(stat.size>512*1024)throw new SyncSafetyError("Device plugin enablement exceeds its safe read budget; it was retained");
+      const current=JSON.parse(decoder.decode(new Uint8Array(await this.adapter.readBinary(this.enablementPath)))) as unknown;
+      if(!Array.isArray(current)||current.some(id=>typeof id!=="string"))throw new SyncSafetyError("Device plugin enablement is not a valid list; it was retained");
+      local=current;
+    }
+    const projected=[...new Set([...enabled.filter(id=>this.sharedPlugin(id)&&(!this.isMobileDevice||!desktopOnly.has(id))),...local.filter(id=>!this.sharedPlugin(id)||this.bootstrapRetainedPluginIds.has(id))])];
+    return projected.length===enabled.length&&projected.every((id,index)=>id===enabled[index])?clear:encoder.encode(`${JSON.stringify(projected,null,2)}\n`);
   }
 
   private async listFiles(path = "",folders=new Set<string>()): Promise<string[]> {
@@ -950,11 +971,11 @@ export class SyncEngine {
     if(this.packageRuntime&&this.getSettings().syncPlugins&&final.get(this.enablementPath)?.hash!==physicalLocal.get(this.enablementPath)?.hash){
       const readList=async(entry:FileState|undefined,local:boolean):Promise<string[]>=>{if(!entry||entry.size>512*1024)return [];const clear=local?await this.localBytes(entry.path,entry,bytes):bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);const value=JSON.parse(decoder.decode(clear)) as unknown;return Array.isArray(value)?value.filter((id):id is string=>typeof id==="string"):[];};
       const before=await readList(physicalLocal.get(this.enablementPath),true),after=await readList(final.get(this.enablementPath),false),ids=new Set([...before,...after].filter(id=>before.includes(id)!==after.includes(id)));
-      for(const id of ids){if(id==="gib-sync"||/[\\/]/.test(id))continue;const root=`${this.logicalConfigDir}/plugins/${id}`;if(!await this.adapter.exists(`${root}/manifest.json`)||!await this.adapter.exists(`${root}/main.js`))continue;try{await this.packageRuntime.quiesce(id);await this.queuePackageActivation(id,final.get(`${root}/data.json`)?.hash??await this.savedHash(`${root}/data.json`),[...final.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}catch(error){if(!(error instanceof PackageRuntimeHoldError))throw error;this.getSettings().packageHolds[id]={reason:error.message,at:Date.now()};}}
+      for(const id of ids){if(!this.sharedPlugin(id)||/[\\/]/.test(id))continue;const root=`${this.logicalConfigDir}/plugins/${id}`;if(!await this.adapter.exists(`${root}/manifest.json`)||!await this.adapter.exists(`${root}/main.js`))continue;try{await this.packageRuntime.quiesce(id);await this.queuePackageActivation(id,final.get(`${root}/data.json`)?.hash??await this.savedHash(`${root}/data.json`),[...final.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}catch(error){if(!(error instanceof PackageRuntimeHoldError))throw error;this.getSettings().packageHolds[id]={reason:error.message,at:Date.now()};}}
     }
     if(this.getSettings().syncPlugins){
-      for(const root of await this.packages.recover(this.getSettings().pendingApplySnapshotId??undefined)){const id=root.split("/").at(-1)!;await this.queuePackageActivation(id,await this.savedHash(`${root}/data.json`),[...final.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}
-      const changedIds=new Set([...Object.keys(this.getSettings().packageHolds),...[...new Set([...final.keys(),...physicalLocal.keys()])].filter(path=>this.include(path)&&final.get(path)?.hash!==physicalLocal.get(path)?.hash).map(path=>this.pluginPath(path)?.id).filter((id):id is string=>Boolean(id)&&id!=="gib-sync")].filter(id=>[...final.keys(),...physicalLocal.keys()].some(path=>this.pluginPath(path)?.id===id&&["manifest.json","main.js"].includes(this.pluginPath(path)!.relative))));
+      for(const root of await this.packages.recover(this.getSettings().pendingApplySnapshotId??undefined)){const id=root.split("/").at(-1)!;if(this.sharedPlugin(id))await this.queuePackageActivation(id,await this.savedHash(`${root}/data.json`),[...final.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}
+      const changedIds=new Set([...Object.keys(this.getSettings().packageHolds),...[...new Set([...final.keys(),...physicalLocal.keys()])].filter(path=>this.include(path)&&final.get(path)?.hash!==physicalLocal.get(path)?.hash).map(path=>this.pluginPath(path)?.id).filter((id):id is string=>Boolean(id))].filter(id=>this.sharedPlugin(id)&&[...final.keys(),...physicalLocal.keys()].some(path=>this.pluginPath(path)?.id===id&&["manifest.json","main.js"].includes(this.pluginPath(path)!.relative))));
       for(const id of changedIds){
         const desired=[...final.values()].filter(entry=>this.include(entry.path)&&this.pluginPath(entry.path)?.id===id),observed=[...physicalLocal.values()].filter(entry=>this.pluginPath(entry.path)?.id===id),root=normalizePath(`${this.logicalConfigDir}/plugins/${id}`);
         const hold=this.getSettings().packageHolds[id];if(hold&&(hold.kind==="incomplete"||hold.fingerprint===await this.packageFingerprint(desired)&&(hold.retryAt??0)>Date.now())){for(const entry of [...desired,...observed])packagePaths.add(entry.path);continue;}
@@ -965,7 +986,7 @@ export class SyncEngine {
           if(source){this.checkpoint();await this.adapter.copy(source,destination);this.checkpoint();return;}
           if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES&&typeof this.adapter.appendBinary==="function"&&typeof this.api.streamContent==="function"){await this.adapter.writeBinary(destination,new ArrayBuffer(0));await this.api.streamContent(entry.hash,entry.size,async chunk=>{this.checkpoint();await this.adapter.appendBinary(destination,exactArrayBuffer(chunk));await this.cooperate();},()=>this.checkpoint());}
           else{const clear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);await this.adapter.writeBinary(destination,exactArrayBuffer(clear));this.checkpoint();}
-        });delete this.getSettings().packageHolds[id];if(desired.length)await this.queuePackageActivation(id,desired.find(entry=>entry.path===`${root}/data.json`)?.hash??null,desired);
+        });delete this.getSettings().packageHolds[id];if(desired.length)await this.queuePackageActivation(id,desired.find(entry=>entry.path===`${root}/data.json`)?.hash??await this.savedHash(`${root}/data.json`),desired);else await this.packageRuntime?.confirmRetirement?.(id);
         }catch(error){if(error instanceof PackageRuntimeHoldError){await this.holdPackage(id,error.message,"activation",desired,observed);for(const entry of [...desired,...observed])packagePaths.add(entry.path);this.status({phase:"applying",message:error.message,level:"warning"});continue;}if(error instanceof AdapterFileChangedError)throw new FileChangedDuringReadError(error.path);throw error;}
         for(const entry of desired){packagePaths.add(entry.path);if(physicalLocal.get(entry.path)?.hash!==entry.hash)downloaded++;this.inventory.markDirty(entry.path);}
         for(const entry of observed){packagePaths.add(entry.path);if(!final.has(entry.path))deleted++;}
@@ -980,9 +1001,9 @@ export class SyncEngine {
       if(!this.include(path)||this.heldPackagePath(path))continue;
       if(packagePaths.has(path))continue;
       await this.cooperate();let deviceEntry=entry,deviceClear:Uint8Array|undefined;
-      if(this.isMobileDevice&&path===this.enablementPath&&desktopOnlyPlugins.size){
-        const serverClear=bytes.get(entry.hash)??await this.remoteBytes(entry,remoteCache);
-        try{const enabled=JSON.parse(decoder.decode(serverClear)) as unknown;if(Array.isArray(enabled)){deviceClear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnlyPlugins.has(id)),null,2)}\n`);const hash=await hashBytes(deviceClear);deviceEntry={...entry,hash,size:deviceClear.length};}}catch{}
+      if(path===this.enablementPath){
+        const serverClear=await this.entryBytes(entry,physicalLocal,bytes,remoteCache);
+        deviceClear=await this.deviceEnablement(serverClear,desktopOnlyPlugins);deviceEntry={...entry,hash:await hashBytes(deviceClear),size:deviceClear.length};
       }
       if(physicalLocal.get(path)?.hash===deviceEntry.hash)continue;
       this.status({phase:"applying",message:"Updating files on this device",current:downloaded+deleted,total:operationTotal});
@@ -1012,10 +1033,7 @@ export class SyncEngine {
   }
   private async deviceBytes(path:string,entry:FileState,cache:Map<string,Uint8Array>,desktopOnly:Set<string>):Promise<{clear:Uint8Array;hash:string}>{
     let clear=await this.remoteBytes(entry,cache),hash=entry.hash;
-    if(this.isMobileDevice&&path===this.enablementPath&&desktopOnly.size)try{
-      const enabled=JSON.parse(decoder.decode(clear)) as unknown;
-      if(Array.isArray(enabled)){clear=encoder.encode(`${JSON.stringify(enabled.filter((id)=>typeof id==="string"&&!desktopOnly.has(id)),null,2)}\n`);hash=await hashBytes(clear);}
-    }catch{}
+    if(path===this.enablementPath){clear=await this.deviceEnablement(clear,desktopOnly);hash=await hashBytes(clear);}
     return {clear,hash};
   }
   private async resumePendingApplication():Promise<number>{
@@ -1028,8 +1046,8 @@ export class SyncEngine {
     if(this.isMobileDevice)for(const [path,entry] of targetMap){const plugin=this.pluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
     const packageHandled=new Set<string>();
     if(settings.syncPlugins){
-      try{for(const root of await this.packages.recover(target.id)){const id=root.split("/").at(-1)!;await this.queuePackageActivation(id,targetMap.get(`${root}/data.json`)?.hash??null,[...targetMap.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}}catch(error){if(error instanceof AdapterFileChangedError)throw new FileChangedDuringReadError(error.path);throw error;}
-      const ids=new Set(pending.map(path=>this.pluginPath(path)?.id).filter((id):id is string=>Boolean(id)&&id!=="gib-sync"));
+      try{for(const root of await this.packages.recover(target.id)){const id=root.split("/").at(-1)!;if(this.sharedPlugin(id))await this.queuePackageActivation(id,targetMap.get(`${root}/data.json`)?.hash??await this.savedHash(`${root}/data.json`),[...targetMap.values()].filter(entry=>this.pluginPath(entry.path)?.id===id));}}catch(error){if(error instanceof AdapterFileChangedError)throw new FileChangedDuringReadError(error.path);throw error;}
+      const ids=new Set(pending.map(path=>this.pluginPath(path)?.id).filter((id):id is string=>Boolean(id)&&this.sharedPlugin(id!)));
       for(const id of ids){
         const packageEntries=[...targetMap.values()].filter(entry=>this.pluginPath(entry.path)?.id===id),oldEntries=[...priorMap.values()].filter(entry=>this.pluginPath(entry.path)?.id===id);
         if(![...packageEntries,...oldEntries].some(entry=>["manifest.json","main.js"].includes(this.pluginPath(entry.path)!.relative)))continue;
@@ -1051,11 +1069,12 @@ export class SyncEngine {
     this.trimRetiredPaths();await this.saveSettings();
     this.status({phase:"applying",message:`Resuming ${pending.length} accepted file operation${pending.length===1?"":"s"} from its exact snapshot`});
     for(const path of [...pending].sort((left,right)=>Number(left===this.enablementPath)-Number(right===this.enablementPath)||left.localeCompare(right))){
+      if(!this.include(path)){completed++;continue;}
       if(packageHandled.has(path)){completed++;continue;}
       await this.cooperate();const entry=targetMap.get(path),old=priorMap.get(path);
       this.inventory.markDirty(path);
       const priorHash=Object.prototype.hasOwnProperty.call(settings.pendingApplyPriorHashes,path)?settings.pendingApplyPriorHashes[path]:(old?.hash??null);
-      const expected=entry?(this.isMobileDevice&&path===this.enablementPath?await this.deviceBytes(path,entry,cache,desktopOnly):{hash:entry.hash,clear:undefined}):undefined;
+      const expected=entry?(path===this.enablementPath?await this.deviceBytes(path,entry,cache,desktopOnly):{hash:entry.hash,clear:undefined}):undefined;
       await this.recoverOperationBoundary(path,expected?.hash??null,priorHash);let stat=await this.adapter.stat(path),currentHash:string|null=null;
       if(stat?.type==="file")try{currentHash=await this.savedHash(path);}catch(error){if(await this.disappeared(path))stat=null;else throw error;}
       if(entry){
@@ -1119,6 +1138,14 @@ export class SyncEngine {
 
   private async run(attempt: number): Promise<SyncResult> {
     const settings = this.getSettings(); if (!settings.deviceToken || !settings.vaultKey) throw new Error("Gib Sync is not configured");
+    this.bootstrapRetainedPluginIds.clear();
+    if(this.firstRun){
+      const recovery=await this.packages.restoreDeviceLocalRetirements();
+      for(const root of recovery.restored)this.status({phase:"applying",message:`Restored protected device-local plugin original · ${root.split("/").at(-1)}`,level:"success"});
+      for(const root of recovery.held)this.status({phase:"applying",message:`Device-local plugin original retained for review · ${root.split("/").at(-1)}`,level:"warning"});
+      for(const id of Object.keys(settings.packageHolds))if(isDeviceLocalPlugin(id)&&await this.adapter.exists(this.pluginFile(id,"manifest.json"))&&await this.adapter.exists(this.pluginFile(id,"main.js")))delete settings.packageHolds[id];
+      if(recovery.restored.length)settings.fullScanRequired=true;
+    }
     if(this.firstRun){this.firstRun=false;for(const hold of Object.values(settings.packageHolds))hold.retryAt=0;}
     if(!settings.syncPlugins)settings.packageHolds={};
     await this.intents.flush();
@@ -1151,6 +1178,13 @@ export class SyncEngine {
     this.status({phase:"scanning",message:fullScan?"Reconciling the full local vault":pendingPaths.length?`Checking ${pendingPaths.length} changed path${pendingPaths.length===1?"":"s"}`:"No local paths changed"});
     const scanBaseline=ownDescendants&&remoteSnapshot?remoteSnapshot:baseSnapshot;
     const scanned=fullScan?await this.scan():await this.scanIncremental(scanBaseline!,pendingPaths),local=scanned.files;
+    // A held package has not consumed the acknowledged server package yet.
+    // Incremental scans must not treat that logical checkpoint as physical
+    // inventory. Inspect only its component subtree, not the entire vault.
+    if(!fullScan)for(const id of Object.keys(settings.packageHolds))if(this.sharedPlugin(id)){
+      for(const path of local.keys())if(this.pluginPath(path)?.id===id)local.delete(path);
+      for(const path of await this.listFiles(`${this.logicalConfigDir}/plugins/${id}`)){const entry=await this.inspectLocalFile(path);if(entry)local.set(path,entry);}
+    }
     // Carry server identities through physical scans without pretending a new
     // content hash has the baseline's authorship. The server assigns revisions.
     const intentPath=(path:string)=>{for(const alias of this.configAliases)if(path===alias||path.startsWith(`${alias}/`))return `.obsidian${path.slice(alias.length)}`;return path;},observedIntents=(await this.intents.snapshot()).map(event=>({...event,path:intentPath(event.path),...event.from?{from:intentPath(event.from)}:{}})),latestFileIntent=new Map([...indexedIntentCreates(observedIntents).values()].filter(event=>event.entity==="file").map(event=>[event.path,event]));
@@ -1183,6 +1217,7 @@ export class SyncEngine {
     }
     if(!settings.initialized&&remoteSnapshot&&settings.onboardingMode==="server-first"){
       const accepted=this.map(remoteSnapshot),desktopOnly=new Set<string>(),cache=this.bodyCache();
+      if(settings.syncPlugins){const acceptedIds=new Set([...accepted.keys()].map(path=>this.pluginPath(path)?.id).filter(Boolean));for(const [path,entry]of local){const id=this.pluginPath(path)?.id;if(id&&!acceptedIds.has(id)){accepted.set(path,entry);this.bootstrapRetainedPluginIds.add(id);}}}
       if(this.isMobileDevice&&settings.syncPlugins)for(const [path,entry] of accepted){const plugin=this.pluginPath(path);if(plugin?.relative.toLowerCase()!=="manifest.json")continue;try{if((JSON.parse(decoder.decode(await this.remoteBytes(entry,cache))) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnly.add(plugin.id);}catch{}}
       this.status({phase:"applying",message:"Downloading the accepted server vault; existing local differences are retained in local recovery"});
       const applied=await this.stageAndApply(remoteSnapshot.id,accepted,this.snapshotFolders(remoteSnapshot),local,desktopOnly,scanned,[],this.bodyCache(),cache,remoteSnapshot.folderRepair,remoteSnapshot.createdAt);
@@ -1222,7 +1257,16 @@ export class SyncEngine {
       const shadowBase=baseSnapshot?await this.api.snapshot(baseSnapshot.id):null,shadowRemote=remoteSnapshot?await this.api.snapshot(remoteSnapshot.id):null,preserved=(shadowRemote?.entries??[]).filter(entry=>!this.include(entry.path));
       const baseIds=new Map((shadowBase?.entries??[]).map(entry=>[entry.path,entry.fileId]));try{await this.api.observeReconciliation({base:shadowBase?.entries??[],local:[...physicalLocal.values(),...preserved].map(entry=>this.manifestEntry(entry)),remote:shadowRemote?.entries??[],localCreationIntents:[...latestFileIntent.values()].filter(event=>event.kind==="create"&&event.targetId).map(event=>({operationId:event.id,targetId:event.targetId!,path:event.path,baseTargetId:baseIds.get(event.path)??null}))},shadowBase?.id??null);}catch(error){if(error instanceof ApiError&&error.status===409)return this.convergeAfterConflict(attempt,"The accepted tree advanced during reconciliation validation");if(!(error instanceof ApiError&&error.status===404))throw error;}
     }
-    if(acceptedPluginState){for(const path of new Set([...local.keys(),...remote.keys()].filter((candidate)=>this.pluginSyncPath(candidate)))){const accepted=remote.get(path);if(accepted)local.set(path,accepted);else local.delete(path);}this.status({phase:"merging",message:"Plugin sync first activation · adopting the accepted server plugin inventory and settings before publishing device changes",level:"success"});}
+    const bootstrapLocalOnlyIds=this.bootstrapRetainedPluginIds;
+    if(acceptedPluginState){
+      const remoteIds=new Set([...remote.keys()].map(path=>this.pluginPath(path)?.id).filter(Boolean));
+      for(const path of local.keys()){const id=this.pluginPath(path)?.id;if(id&&!remoteIds.has(id))bootstrapLocalOnlyIds.add(id);}
+      for(const path of new Set([...local.keys(),...remote.keys()].filter(candidate=>this.pluginSyncPath(candidate)))){
+        const id=this.pluginPath(path)?.id;if(id&&bootstrapLocalOnlyIds.has(id))continue;
+        const accepted=remote.get(path);if(accepted)local.set(path,accepted);else local.delete(path);
+      }
+      this.status({phase:"merging",message:"Plugin sync first activation · adopting shared server packages and settings; retaining locally installed packages absent from that inventory",level:"success"});
+    }
     else if(bootstrapPluginSync)this.status({phase:"merging",message:"Plugin sync first activation · no accepted plugin inventory exists, so this device will establish it",level:"info"});
     const orphanUnreadableConflicts=[...scanned.unreadableConflictPaths].filter((path)=>!base.has(path)&&!remote.has(path));let suppressedRetired=0,retiredStateChanged=false;
     if(operationTree){const newest=new Map<string,typeof operationTree.tombstones[number]>();for(const tombstone of operationTree.tombstones){const old=newest.get(tombstone.path);if(!old||tombstone.deletedSequence>old.deletedSequence||tombstone.deletedSequence===old.deletedSequence&&(tombstone.deletedOrdinal??0)>(old.deletedOrdinal??0))newest.set(tombstone.path,tombstone);}for(const [path,tombstone]of newest){const current=local.get(path);if(!current||remote.has(path)||tombstone.entityKind!=="file"||!tombstone.content)continue;const created=latestFileIntent.get(path)?.kind==="create";if(current.hash===tombstone.content.hash&&!created){settings.retiredPaths[path]={hash:current.hash,snapshotId:remoteSnapshot?.id??"accepted",retiredAt:tombstone.revision.modifiedAt};local.delete(path);suppressedRetired++;retiredStateChanged=true;}}}
@@ -1254,7 +1298,7 @@ export class SyncEngine {
       const packageFor=(source:Map<string,FileState>,id:string)=>new Map([...source].filter(([path])=>{const plugin=this.pluginPath(path);return plugin?.id===id&&!this.pluginDataPath(path);}));
       const versionFor=async(source:"local"|"remote",entries:Map<string,FileState>,id:string):Promise<string|null>=>{
         const entry=entries.get(this.pluginFile(id,"manifest.json"));if(!entry||entry.size>64*1024)return null;
-        try{const clear=source==="local"&&!acceptedPluginState?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache),manifest=JSON.parse(decoder.decode(clear)) as {id?:unknown;version?:unknown;isDesktopOnly?:unknown};return manifest.id===id&&typeof manifest.version==="string"&&(manifest.isDesktopOnly===undefined||typeof manifest.isDesktopOnly==="boolean")?manifest.version:null;}catch{return null;}
+        try{const clear=source==="local"?await this.entryBytes(entry,physicalLocal,bytes,remoteCache):await this.remoteBytes(entry,remoteCache),manifest=JSON.parse(decoder.decode(clear)) as {id?:unknown;version?:unknown;isDesktopOnly?:unknown}|null;return manifest&&manifest.id===id&&typeof manifest.version==="string"&&(manifest.isDesktopOnly===undefined||typeof manifest.isDesktopOnly==="boolean")?manifest.version:null;}catch(error){if(!(error instanceof SyntaxError))throw error;return null;}
       };
       for(const id of [...pluginIds].sort()){
         await this.cooperate();
@@ -1272,7 +1316,7 @@ export class SyncEngine {
       for(const id of pluginIds){
         const path=this.pluginFile(id,"manifest.json"),entry=final.get(path);if(!entry)continue;
         try{
-          const localEntry=local.get(path),clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(path,localEntry,bytes):await this.remoteBytes(entry,remoteCache));
+          const clear=await this.entryBytes(entry,physicalLocal,bytes,remoteCache);
           if((JSON.parse(decoder.decode(clear)) as {isDesktopOnly?:unknown}).isDesktopOnly===true)desktopOnlyPlugins.add(id);
         }catch{/* Malformed manifests remain governed by normal package repair. */}
       }
@@ -1288,9 +1332,10 @@ export class SyncEngine {
       if(handledPluginPaths.has(path))continue;
       const b = base.get(path), l = local.get(path), r = remote.get(path);
       if (decision.kind==="equal"||decision.kind==="unchanged") { if (r) final.set(path, {...l,...r}); continue; }
-      if(settings.syncPlugins&&path===this.enablementPath&&b&&l&&r){
-        const baseText=decoder.decode(await this.remoteBytes(b,remoteCache)),localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache)),preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot,r);
-        const merged=mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice),clear=encoder.encode(merged.text);await this.prepareResult(path,clear,final,bytes);resolved++;
+      if(settings.syncPlugins&&path===this.enablementPath&&l&&r){
+        const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):"[]",localText=decoder.decode(await this.entryBytes(l,physicalLocal,bytes,remoteCache)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache)),preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot,r);
+        const deviceLocalIds=this.deviceLocalEnablementIds(baseText,localText,remoteText);
+        const merged=mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice,deviceLocalIds),clear=encoder.encode(merged.text);await this.prepareResult(path,clear,final,bytes);resolved++;
         this.status({phase:"merging",message:`Plugin enablement · ${merged.reason}`,level:"success"});continue;
       }
       // A filename is never proof of ownership or an accepted deletion.
@@ -1305,7 +1350,7 @@ export class SyncEngine {
           const preferred=this.preferredSide(path,l,effectiveBaseSnapshot,remoteSnapshot,r);
           if(Math.max(b?.size??0,l.size,r.size)>MAX_SETTINGS_JSON_BYTES){final.set(path,preferred==="local"?l:r);resolved++;this.status({phase:"merging",message:`Large Obsidian settings file · ${path} · used the newer complete ${preferred} version without parsing it; prior copies remain recoverable`,level:"warning"});await this.recordSystemConflict(path,l,r,preferred,final,remoteSnapshot?.deviceName??"Remote device","Large settings overlap was resolved with one complete version");continue;}
           if(decision.strategy==="json-settings"||path.toLowerCase().endsWith(".json")){
-            const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):"{}",localText=decoder.decode(await this.localBytes(path,l,bytes)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache));
+            const baseText=b?decoder.decode(await this.remoteBytes(b,remoteCache)):path===this.enablementPath?"[]":"{}",localText=decoder.decode(await this.entryBytes(l,physicalLocal,bytes,remoteCache)),remoteText=decoder.decode(await this.remoteBytes(r,remoteCache));
             const merged=path===this.enablementPath?mergeCommunityPluginEnablement(baseText,localText,remoteText,preferred,desktopOnlyPlugins,this.isMobileDevice):mergeSystemJson(baseText,localText,remoteText,preferred,this.configPath(path)===".obsidian/bookmarks.json"?"bookmarks":undefined),clear=encoder.encode(merged.text);await this.prepareResult(path,clear,final,bytes);
             if(merged.overlaps)await this.recordSystemConflict(path,l,r,preferred,final,remoteSnapshot?.deviceName??"Remote device","Overlapping settings were merged; both originals are recoverable");
             this.status({phase:"merging",message:`Obsidian settings · ${path} · ${merged.reason}`,level:merged.overlaps?"warning":"success"});
@@ -1355,15 +1400,16 @@ export class SyncEngine {
       const enablementPath=this.enablementPath,entry=final.get(enablementPath);
       if(entry){
         try{
-          const localEntry=local.get(enablementPath),clear=bytes.get(entry.hash)??(localEntry?.hash===entry.hash?await this.localBytes(enablementPath,localEntry,bytes):await this.remoteBytes(entry,remoteCache));
+          const clear=await this.entryBytes(entry,physicalLocal,bytes,remoteCache);
           const enabled=JSON.parse(decoder.decode(clear)) as unknown;
           if(Array.isArray(enabled)){
-            const valid=enabled.filter((id):id is string=>typeof id==="string"&&(id==="gib-sync"||(final.has(this.pluginFile(id,"manifest.json"))&&final.has(this.pluginFile(id,"main.js")))));
+            const valid=enabled.filter((id):id is string=>typeof id==="string"&&(!this.sharedPlugin(id)||(final.has(this.pluginFile(id,"manifest.json"))&&final.has(this.pluginFile(id,"main.js")))));
+            if(bootstrapLocalOnlyIds.size){const localEntry=physicalLocal.get(enablementPath);if(localEntry){const localEnabled=JSON.parse(decoder.decode(await this.localBytes(enablementPath,localEntry,bytes))) as unknown;if(Array.isArray(localEnabled))for(const id of localEnabled)if(typeof id==="string"&&bootstrapLocalOnlyIds.has(id)&&final.has(this.pluginFile(id,"manifest.json"))&&final.has(this.pluginFile(id,"main.js"))&&!valid.includes(id))valid.push(id);}}
             const missing=enabled.filter((id)=>typeof id==="string"&&!valid.includes(id));
-            if(missing.length){const sanitized=encoder.encode(`${JSON.stringify(valid,null,2)}\n`);await this.prepareResult(enablementPath,sanitized,final,bytes);resolved++;
-              this.status({phase:"merging",message:`Plugin enablement repaired · skipped ${missing.length} incomplete package${missing.length===1?"":"s"}: ${missing.slice(0,5).join(", ")}${missing.length>5?"…":""}`,level:"warning"});}
+            if(missing.length||valid.length!==enabled.length){const sanitized=encoder.encode(`${JSON.stringify(valid,null,2)}\n`);await this.prepareResult(enablementPath,sanitized,final,bytes);resolved++;
+              if(missing.length)this.status({phase:"merging",message:`Plugin enablement repaired · skipped ${missing.length} incomplete package${missing.length===1?"":"s"}: ${missing.slice(0,5).join(", ")}${missing.length>5?"…":""}`,level:"warning"});}
           }
-        }catch{this.status({phase:"merging",message:"Plugin enablement list is non-standard JSON · kept the newer complete file",level:"warning"});}
+        }catch(error){if(!(error instanceof SyntaxError))throw error;this.status({phase:"merging",message:"Plugin enablement list is non-standard JSON · kept the newer complete file",level:"warning"});}
       }
     }
 

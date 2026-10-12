@@ -2,7 +2,7 @@ import type {DataAdapter} from "obsidian";
 import type {ManifestEntry} from "@gib-sync/protocol";
 import {hashBytes} from "./crypto";
 import {AdapterFileChangedError} from "./file-io";
-import {isSafeVaultPath} from "./settings";
+import {isSafeVaultPath,isDeviceLocalPlugin} from "./settings";
 import {PackageRuntimeHoldError} from "./plugin-runtime";
 
 const ROOT=".gib-sync/packages-v2",encoder=new TextEncoder(),decoder=new TextDecoder(),UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -59,8 +59,9 @@ export class AtomicPackageInstaller{
   async recover(snapshotId?:string):Promise<Set<string>>{
     const handled=new Set<string>();
     for(const {path,journal}of await this.records()){this.checkpoint();const managed=new Set([...Object.keys(journal.prior),...Object.keys(journal.target)]);
+      if(isDeviceLocalPlugin(journal.root.split("/").at(-1)!))continue;
       if(journal.phase==="local-changed"){if(await this.adapter.exists(journal.backup)){await this.beforeSwitch(journal.root);await this.restoreChangedOriginal(journal,path);}continue;}
-      if(journal.phase==="installed"){await this.guardOriginal(journal,path);if(journal.snapshotId===snapshotId&&this.equal(await this.managedHashes(journal.root,managed),journal.target))handled.add(journal.root);continue;}
+      if(journal.phase==="installed"){await this.guardOriginal(journal,path);if(Object.keys(journal.target).length&&journal.snapshotId===snapshotId&&this.equal(await this.managedHashes(journal.root,managed),journal.target))handled.add(journal.root);continue;}
       await this.beforeSwitch(journal.root);await this.qualify(journal.root);const current=await this.managedHashes(journal.root,managed);
       if(this.equal(current,journal.target)&&await this.adapter.exists(journal.root)){await this.guardOriginal(journal,path);journal.phase="installed";await this.persist(path,journal);if(journal.snapshotId===snapshotId)handled.add(journal.root);continue;}
       if(journal.phase==="prepared"&&!await this.adapter.exists(journal.backup)&&await this.adapter.exists(journal.root)){await this.adapter.remove(path);continue;}
@@ -71,7 +72,36 @@ export class AtomicPackageInstaller{
       journal.unmanaged=[...new Set([...journal.unmanaged,...await this.unmanaged(journal.backup,managed)])];await this.persist(path,journal);await this.moveUnmanaged(journal,path);await this.guardOriginal(journal,path);journal.phase="promoting";await this.persist(path,journal);this.checkpoint();await this.adapter.rename(journal.stage,journal.root);this.checkpoint();if(!this.equal(await this.managedHashes(journal.root,managed),journal.target))throw new Error("The promoted package did not verify; original settings remain in local recovery");await this.guardOriginal(journal,path);journal.phase="installed";await this.persist(path,journal);if(journal.snapshotId===snapshotId)handled.add(journal.root);
     }return handled;
   }
+  async restoreDeviceLocalRetirements():Promise<{restored:string[];held:string[]}>{
+    const restored:string[]=[],held:string[]=[],groups=new Map<string,Array<{path:string;journal:PackageJournal}>>();
+    for(const record of await this.records())if(isDeviceLocalPlugin(record.journal.root.split("/").at(-1)!)){
+      const group=groups.get(record.journal.root)??[];group.push(record);groups.set(record.journal.root,group);
+    }
+    for(const [root,records]of groups){
+      this.checkpoint();if(await this.adapter.exists(root))continue; // A user reinstall always wins.
+      const candidates=[];
+      for(const record of records)if(await this.adapter.exists(record.journal.backup))candidates.push(record);
+      if(candidates.length!==1){if(candidates.length)held.push(root);continue;}
+      const {path,journal}=candidates[0];
+      if(Object.keys(journal.target).length||!journal.prior["manifest.json"]||!journal.prior["main.js"]||!this.equal(await this.managedHashes(journal.backup,Object.keys(journal.prior)),journal.prior)){held.push(root);continue;}
+      const manifestStat=await this.adapter.stat(`${journal.backup}/manifest.json`);
+      if(manifestStat?.type!=="file"||manifestStat.size>128*1024){held.push(root);continue;}
+      let manifest:{id?:unknown};try{manifest=JSON.parse(decoder.decode(new Uint8Array(await this.adapter.readBinary(`${journal.backup}/manifest.json`)))) as {id?:unknown};}catch(error){if(!(error instanceof SyntaxError))throw error;held.push(root);continue;}
+      if(!manifest||manifest.id!==root.split("/").at(-1)){held.push(root);continue;}
+      await this.qualify(root);this.checkpoint();
+      // Recheck after qualification/yields, then use native no-overwrite rename.
+      // The original directory (including settings/caches) is never copied away
+      // or replaced by defaults. The owned journal remains the recovery trail.
+      if(await this.adapter.exists(root)||!this.equal(await this.managedHashes(journal.backup,Object.keys(journal.prior)),journal.prior)){held.push(root);continue;}
+      journal.phase="local-changed";await this.persist(path,journal);this.checkpoint();
+      this.expected(root,"folder");await this.adapter.rename(journal.backup,root);this.checkpoint();
+      if(!this.equal(await this.managedHashes(root,Object.keys(journal.prior)),journal.prior))throw new AdapterFileChangedError(root);
+      restored.push(root);
+    }
+    return {restored,held};
+  }
   async install(root:string,desired:readonly ManifestEntry[],observed:readonly ManifestEntry[],snapshotId:string,stageFile:(entry:ManifestEntry,destination:string)=>Promise<void>):Promise<void>{
+    if(isDeviceLocalPlugin(root.split("/").at(-1)!))throw new Error("Operational device-local plugins cannot be installed or retired by sync");
     this.checkpoint();await this.qualify(root);await this.mkdir(ROOT);const id=crypto.randomUUID(),stage=this.privatePath(root,id,"stage"),backup=this.privatePath(root,id,"original"),journalPath=`${ROOT}/${id}.journal.json`;await this.mkdir(stage);
     const managed=new Set([...desired,...observed].map(entry=>entry.path.slice(root.length+1))),prior=await this.managedHashes(root,managed);for(const entry of observed)if(prior[entry.path.slice(root.length+1)]!==entry.hash)throw new AdapterFileChangedError(entry.path);
     const unmanaged=await this.unmanaged(root,managed);

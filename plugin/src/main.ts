@@ -305,7 +305,8 @@ export default class GibSyncPlugin extends Plugin {
   private emitStatus() { if(this.stopped)return;this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
   private recordRuntimeOutcome(id:string,message:string,attention:boolean):void{
-    if(attention){this.settings.packageHolds[id]={...this.settings.packageHolds[id],reason:message,at:Date.now()};this.liveStatus.verified=false;this.report("applying",message,"warning");return;}
+    if(attention){this.settings.packageHolds[id]={...this.settings.packageHolds[id],reason:message,at:Date.now()};this.liveStatus.verified=false;this.report("applying",`Plugin ${id} · ${message}`,"warning");return;}
+    message=`Plugin ${id} · ${message}`;
     // A blocked stale write touched only private recovery, not accepted files.
     // Keep the truthful green/working phase while recording useful provenance.
     const now=new Date().toISOString(),previous=this.liveStatus.activities.at(-1);if(previous?.message===message&&previous.level==="info"){previous.at=now;previous.repeats=(previous.repeats??1)+1;}else this.liveStatus.activities.push({at:now,phase:this.liveStatus.phase,level:"info",message,repeats:1});if(this.liveStatus.activities.length>100)this.liveStatus.activities.splice(0,this.liveStatus.activities.length-100);this.emitStatus();
