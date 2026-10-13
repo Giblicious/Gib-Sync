@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.74 candidate
+
+- Close legacy Gib Sync windows using the verified mobile native header control as well as the desktop close button, newest first. The physical Android hot-update test exposed the platform-specific selector missing from 0.8.73.
+- Preserve the per-instance dialog ownership and normal native close callbacks; do not remove arbitrary application or other-plugin UI.
+- Add a mobile-header/newest-first regression. This is still an isolated candidate, not production acceptance.
+
 ## 0.8.73 candidate
 
 - Tie all Gib Sync dialogs to their loaded plugin instance. Unloading closes status subscriptions, diagnostic observers, setup timers and pending prompts; closed windows are not retained, and legacy marked windows close through Obsidian's normal UI during an update.

@@ -19,7 +19,7 @@ const schema = z.object({
   SEAFILE_ALLOWED_HOSTS: z.string().optional(),
   MAX_BLOB_BYTES: z.coerce.number().int().positive().default(1073741824),
   GIBSYNC_MIN_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.55"),
-  GIBSYNC_RECOMMENDED_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.73")
+  GIBSYNC_RECOMMENDED_CLIENT_VERSION:z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).default("0.8.74")
 }).superRefine((config,context)=>{if(Boolean(config.GIBSYNC_CANARY_USERNAME)!==Boolean(config.GIBSYNC_CANARY_LIBRARY_ID)||config.GIBSYNC_CANARY_URL&&!config.GIBSYNC_CANARY_USERNAME)context.addIssue({code:"custom",message:"Canary account and library must be configured together"});if(config.GIBSYNC_CANARY_URL&&new URL(config.GIBSYNC_CANARY_URL).host!==new URL(config.SEAFILE_URL).host)context.addIssue({code:"custom",message:"Canary URL must use the configured backend host"});});
 
 export type Config = z.infer<typeof schema>;

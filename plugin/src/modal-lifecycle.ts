@@ -13,6 +13,6 @@ export class ModalRegistry {
  * close action on the exact Gib Sync content marker, never another plugin's UI. */
 export function closeLegacyPluginDialogs(root:ParentNode):number{
   const seen=new Set<Element>();let closed=0;
-  for(const content of Array.from(root.querySelectorAll('.gib-sync-modal-content'))){const modal=content.closest('.modal-container');if(!modal||seen.has(modal))continue;seen.add(modal);const action=modal.querySelector<HTMLElement>('.modal-close-button');if(action)try{action.click();closed++;}catch{/* A stale native close failure must not disable the newly loaded plugin. */}}
+  for(const content of Array.from(root.querySelectorAll('.gib-sync-modal-content')).reverse()){const modal=content.closest('.modal-container');if(!modal||seen.has(modal))continue;seen.add(modal);const action=modal.querySelector<HTMLElement>('.modal-close-button')??modal.querySelector<HTMLElement>('.modal-header-button');if(action)try{action.click();closed++;}catch{/* A stale native close failure must not disable the newly loaded plugin. */}}
   return closed;
 }
