@@ -29,7 +29,7 @@ function errorBody(response:{json:unknown}):any{
   try{return response.json;}catch{return null;}
 }
 
-export const CLIENT_VERSION="0.8.74";
+export const CLIENT_VERSION="0.8.75";
 export interface ContentUploadState{id:string;hash:string;size:number;offset:number;chunkBytes:number;complete:boolean;processing?:boolean;processingId?:string;stage?:"verifying"|"uploading"|"checking"|"waiting";}
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{

@@ -21,6 +21,7 @@ import {alignExternalNamespace,type NamespaceCollision} from './external-namespa
 import {externalCreationProofs} from './external-provenance.js';
 import {projectedCreationEntries} from './projection-provenance.js';
 import {conflictCopyPath} from '@gib-sync/protocol';
+import {CheckpointRepairs} from './checkpoint-repair.js';
 
 type MirrorEntry={path:string;hash:string;size:number;updated_at:string;storage_id:string|null;storage_mtime:number|null};
 export interface ExternalImportResult{snapshotId:string|null;changedFiles:number;deletedFiles:number;conflicts:number;changedFolders?:number;quarantineId?:string;locked?:boolean;deferredDeletions?:number;mirrorGenerationMismatch?:boolean;contained?:boolean;}
@@ -132,6 +133,7 @@ export class ExternalImporter{
 
   private async run(vaultId:string):Promise<ExternalImportResult>{
     this.conflictRecords=[];
+    if(new CheckpointRepairs(this.store).recover(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,locked:true};
     this.configAliases=this.store.all<{config_root:string}>("SELECT config_root FROM vault_config_aliases WHERE vault_id=?",vaultId).map(row=>row.config_root);
     if(!this.canOperate(vaultId))return {snapshotId:null,changedFiles:0,deletedFiles:0,conflicts:0,contained:true};
     const row=this.storageRow(vaultId),vault=this.store.one<{head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,mirror_generation_id,wrapped_key FROM vaults WHERE id=?",vaultId)!;

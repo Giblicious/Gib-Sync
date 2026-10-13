@@ -32,6 +32,7 @@ import { BinaryAdmission } from "./admission.js";
 import { TrustedPairing } from "./trusted-pairing.js";
 import { CONTENT_UPLOAD_CHUNK_BYTES,registerContentUploads } from "./content-upload.js";
 import {registerOperationRoutes} from "./operation-routes.js";
+import {CheckpointRepairs} from './checkpoint-repair.js';
 import {ConflictInbox,registerConflictInbox,type ConflictRecord} from "./conflict-inbox.js";
 import type {OperationBatch,FolderEntry} from "@gib-sync/protocol";
 import {registerConfigRoots,normalizeAliasEntries,normalizeAliasFolders,aliasCollisionRecords} from "./config-roots.js";
@@ -98,8 +99,13 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   const canOperateVault=(vaultId:string)=>containment.allows(vaultId)&&!retirements.isRetired(vaultId);
   const externalImporter=new ExternalImporter(config,store,storage,safeguards,(vaultId)=>canOperateVault(vaultId)&&!healthRepairLocks.has(vaultId));let externalTimer:NodeJS.Timeout|null=null,externalStartupTimer:NodeJS.Timeout|null=null,closing=false;
   const skipExternalOnce=new Set<string>(),restoreApprovedVaults=new Set<string>(),healthRepairLocks=new Set<string>(),mirrorWriteSettles=new Map<string,{snapshotId:string;until:number}>();
+  const checkpointRepairs=new CheckpointRepairs(store);
+  const healthRepairRequests=new Set<string>();
+  for(const id of checkpointRepairs.interruptedVaults())try{if(checkpointRepairs.recover(id)){healthRepairLocks.add(id);restoreApprovedVaults.add(id);}}catch{
+    integrityBlockedVaults.add(id);store.run("UPDATE vaults SET write_locked_at=COALESCE(write_locked_at,?),write_locked_by=COALESCE(write_locked_by,'Checkpoint recovery verification') WHERE id=?",new Date().toISOString(),id);safeguards.event(id,'checkpoint_repair_recovery_blocked','error','A saved checkpoint repair could not be verified. This vault is safely held; other vaults remain available.');
+  }
   const healthRepairPermit=Symbol('accepted-checkpoint-repair');
-  const assertWritable=(vaultId:string,permit?:symbol)=>{if(healthRepairLocks.has(vaultId)&&permit!==healthRepairPermit)throw Object.assign(new Error('The server is repairing its accepted checkpoint. Saved edits will sync automatically when it finishes.'),{statusCode:503,healthRepairActive:true});};
+  const assertWritable=(vaultId:string,permit?:symbol)=>{if((healthRepairLocks.has(vaultId)||checkpointRepairs.recover(vaultId))&&permit!==healthRepairPermit)throw Object.assign(new Error('The server is repairing its accepted checkpoint. Saved edits will sync automatically when it finishes.'),{statusCode:503,healthRepairActive:true});};
   const watchWaiters=new Map<string,Set<(headId:string|null,attention:boolean)=>void>>();
   function notifyVault(vaultId:string,headId:string|null,attention=false){
     const waiters=watchWaiters.get(vaultId);if(!waiters)return;
@@ -245,8 +251,9 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     const job=projectionTail.then(async()=>{for(let attempt=0;attempt<3;attempt++){
       if(closing||leaseLost||!durableJobs.owns(lease))return;
       await projectionJournal.recover(storageRow(vaultId));
+      const repair=checkpointRepairs.recover(vaultId);if(repair){healthRepairLocks.add(vaultId);restoreApprovedVaults.add(vaultId);}
       let external:ExternalImportResult|null=null;
-      if(skipExternalOnce.has(vaultId))skipExternalOnce.delete(vaultId);else external=await ingestExternalChanges(vaultId,false,true);
+      if(repair||skipExternalOnce.has(vaultId))skipExternalOnce.delete(vaultId);else external=await ingestExternalChanges(vaultId,false,true);
       if(externalScanRequests.has(vaultId)){
         if(external&&(external.snapshotId!==null||Boolean(external.quarantineId)||Boolean(external.deferredDeletions)||external.changedFiles>0||external.deletedFiles>0||external.conflicts>0))interruptedExternalResults.set(vaultId,external);
         scheduleMirror(vaultId,50);
@@ -256,10 +263,10 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       // recreated by the mirror. Likewise, quarantined external changes stay
       // untouched until the user accepts or rejects them.
       if(external?.deferredDeletions||external?.quarantineId||external?.locked)return;
-      const vault=store.one<{head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;mirror_repo_commit:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,mirror_generation_id,mirror_repo_commit,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id)return;
+      const vault=store.one<{head_id:string|null;mirror_head_id:string|null;mirror_generation_id:string|null;mirror_repo_commit:string|null;wrapped_key:string}>("SELECT head_id,mirror_head_id,mirror_generation_id,mirror_repo_commit,wrapped_key FROM vaults WHERE id=?",vaultId);if(!vault?.head_id){if(repair&&checkpointRepairs.finish(vaultId,null)&&!healthRepairRequests.has(vaultId))healthRepairLocks.delete(vaultId);return;}
       const snapshot=store.getSnapshot(vault.head_id);if(!snapshot)return;const row=storageRow(vaultId),generation=await readGeneration(config,storage,row);
       await projectionJournal.recover(row);
-      if(vault.mirror_head_id===vault.head_id&&vault.mirror_generation_id===vault.head_id&&vault.mirror_repo_commit&&validGeneration(generation,snapshot))return;
+      if(vault.mirror_head_id===vault.head_id&&vault.mirror_generation_id===vault.head_id&&vault.mirror_repo_commit&&validGeneration(generation,snapshot)){if(repair&&checkpointRepairs.finish(vaultId,snapshot.id)&&!healthRepairRequests.has(vaultId))healthRepairLocks.delete(vaultId);return;}
       const key=openJson<string>(vault.wrapped_key,config.GIBSYNC_SERVER_SECRET,vaultId),target=new Set(snapshot.entries.map((entry)=>entry.path));
       const visible=new Map((await storage.listReadable(row)).map((entry)=>[entry.path,entry]));
       const headStillCurrent=()=>store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",vaultId)?.head_id===snapshot.id,mayContinue=()=>!closing&&!leaseLost&&durableJobs.owns(lease)&&headStillCurrent()&&!externalScanRequests.has(vaultId)&&canOperateVault(vaultId);let superseded=false;
@@ -292,7 +299,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const folderResult=await reconcileReadableFolders(vaultId,snapshot,mayContinue),repoCommit=(await storage.repoHistory(row))[0]?.commitId??null,verified=await verifyReadableGeneration(vaultId,snapshot,removedPaths);if(verified.missing.length||verified.lingering.length||verified.missingFolders.length||verified.lingeringFolders.length)throw new Error(`Readable mirror generation is not yet visible (${verified.missing.length} files missing, ${verified.lingering.length} files lingering, ${verified.missingFolders.length} folders missing, ${verified.lingeringFolders.length} folders lingering${folderResult.remaining.length?`, ${folderResult.remaining.length} non-empty folder removals deferred`:""})`);
       if(!mayContinue()){const externalRequested=externalScanRequests.delete(vaultId);mirrorWriteSettles.delete(vaultId);if(!canOperateVault(vaultId))return;if(externalRequested){scheduleMirror(vaultId,50);return;}skipExternalOnce.add(vaultId);continue;}
       await writeGeneration(config,storage,row,snapshot);const completed=store.run("UPDATE vaults SET mirror_head_id=?,mirror_generation_id=?,mirror_repo_commit=? WHERE id=? AND head_id=?",snapshot.id,snapshot.id,repoCommit,vaultId,snapshot.id);
-      if(completed.changes){store.run("DELETE FROM external_absences WHERE vault_id=?",vaultId);mirrorWriteSettles.delete(vaultId);return;}
+      if(completed.changes){store.run("DELETE FROM external_absences WHERE vault_id=?",vaultId);mirrorWriteSettles.delete(vaultId);if(repair&&checkpointRepairs.finish(vaultId,snapshot.id)&&!healthRepairRequests.has(vaultId))healthRepairLocks.delete(vaultId);return;}
       skipExternalOnce.add(vaultId);mirrorWriteSettles.delete(vaultId);
     }throw new Error(`Readable mirror could not catch up for vault ${vaultId}`);}).then(()=>{mirrorFailureCounts.delete(vaultId);mirrorRetryNotBefore.delete(vaultId);}).catch((error)=>{
       const failures=(mirrorFailureCounts.get(vaultId)??0)+1,retryMs=Math.min(60_000,5000*(2**Math.min(failures-1,4)));mirrorFailureCounts.set(vaultId,failures);mirrorRetryNotBefore.set(vaultId,Date.now()+retryMs);
@@ -321,11 +328,12 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   app.post("/v1/health/repair",async(request,reply)=>{
     const device=await authenticate(request);z.object({restoreAcceptedHead:z.literal(true)}).parse(request.body);
     if(integrityBlockedVaults.has(device.vault_id))return reply.code(423).send({error:"The accepted snapshot failed structural integrity checks. Automated mirror repair is blocked to prevent propagation; restore the database from a verified backup or use an audited server repair."});
-    if(healthRepairLocks.has(device.vault_id))return reply.conflict("A health repair is already running for this vault");healthRepairLocks.add(device.vault_id);
+    if(healthRepairLocks.has(device.vault_id)||checkpointRepairs.recover(device.vault_id)){scheduleMirror(device.vault_id,0);return reply.code(503).header('Retry-After','5').send({error:'The accepted checkpoint repair is resuming automatically',healthRepairActive:true});}healthRepairLocks.add(device.vault_id);healthRepairRequests.add(device.vault_id);
     try{
     // Stop and drain the prior projection/import boundary before selecting the
     // accepted repair head; an already running external scan cannot race it.
     externalScanRequests.add(device.vault_id);await Promise.allSettled([externalImporter.settleVault(device.vault_id),mirrorJobs.get(device.vault_id)??Promise.resolve()]);externalScanRequests.delete(device.vault_id);interruptedExternalResults.delete(device.vault_id);
+    checkpointRepairs.begin(device.vault_id);
     mirrorFailureCounts.delete(device.vault_id);mirrorRetryNotBefore.delete(device.vault_id);
     const vault=store.one<{head_id:string|null}>("SELECT head_id FROM vaults WHERE id=?",device.vault_id)!;
     let snapshot=vault.head_id?store.getSnapshot(vault.head_id):null,removedConflictCopies=0;
@@ -335,7 +343,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       for(const entry of snapshot.entries){const original=entry.path.replace(generatedSuffix,"");if(original===entry.path)continue;const copies=groups.get(original)??[];copies.push(entry);groups.set(original,copies);}
       const byPath=new Map(snapshot.entries.map((entry)=>[entry.path,entry])),redundant=new Set<string>();for(const [original,copies] of groups){const intact=byPath.get(original);if(!intact)continue;for(const copy of copies)if(copy.hash===intact.hash)redundant.add(copy.path);}
       if(redundant.size){
-        const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)),snapshot.folders,snapshot.folderRepair,undefined,undefined,snapshot.folderEntries,healthRepairPermit);
+        const cleaned=await acceptSnapshot(device.vault_id,snapshot.id,device.id,device.name,`Health repair: removed ${redundant.size} redundant generated conflict copies`,snapshot.entries.filter((entry)=>!redundant.has(entry.path)),snapshot.folders,snapshot.folderRepair,undefined,accepted=>checkpointRepairs.setTarget(device.vault_id,accepted.id),snapshot.folderEntries,healthRepairPermit);
         if(!cleaned)return reply.conflict("Vault changed while health repair was preparing the cleaned snapshot");
         snapshot=cleaned;removedConflictCopies=redundant.size;
       }
@@ -357,7 +365,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     safeguards.event(device.vault_id,"health_repair",mirrorCurrent?"info":"error",mirrorCurrent?`${device.name} restored the accepted snapshot and rebuilt the readable mirror`:`${device.name} requested health repair but the readable mirror did not converge`);
     notifyVault(device.vault_id,repaired.head_id,!mirrorCurrent);const result={headId:repaired.head_id,mirrorCurrent,restoredFiles:snapshot?.entries.length??0,removedFiles,removedConflictCopies,dismissedQuarantines,clearedAlerts};
     return mirrorCurrent?result:reply.code(503).send({error:"Health repair could not make the readable mirror current",...result});
-    }finally{healthRepairLocks.delete(device.vault_id);}
+    }finally{healthRepairRequests.delete(device.vault_id);if(!checkpointRepairs.get(device.vault_id))healthRepairLocks.delete(device.vault_id);else scheduleMirror(device.vault_id,1000);}
   });
 
   const credentialsSchema = z.object({ seafileUrl:z.string().url(), seafileUsername:z.string().min(1).max(320), seafilePassword:z.string().min(1).max(1000) });
@@ -525,7 +533,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   await registerOperationRoutes(app,{store,committer:snapshotCommitter,safeguards,deploymentDigest:config.GIBSYNC_RELEASE_DIGEST,canaryConfig:config,authenticate,beforeCommit:async(vaultId)=>{assertWritable(vaultId);await ingestExternalChanges(vaultId);assertWritable(vaultId);},accepted:(vaultId,snapshotId)=>{safeguards.clearResolvedQuarantineAlerts(vaultId);mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
   await registerConflictInbox(app,{store,authenticate});
-  await registerConfigRoots(app,{store,committer:snapshotCommitter,blobs:verifiedBlobs,storageRow,authenticate,beforeCommit:ingestExternalChanges,accepted:(vaultId,snapshotId)=>{mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
+  await registerConfigRoots(app,{store,committer:snapshotCommitter,blobs:verifiedBlobs,storageRow,authenticate,beforeCommit:async(vaultId)=>{assertWritable(vaultId);await ingestExternalChanges(vaultId);assertWritable(vaultId);},accepted:(vaultId,snapshotId)=>{mirrorWriteSettles.delete(vaultId);notifyVault(vaultId,snapshotId);scheduleMirror(vaultId);}});
 
   app.get("/v1/safeguards",async(request)=>{const device=await authenticate(request);return safeguards.state(device.vault_id,device.id);});
   app.put("/v1/safeguards/policy",async(request)=>{
@@ -534,6 +542,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
   });
   app.post("/v1/safeguards/lock",async(request)=>{
     const device=await authenticate(request),locked=z.object({locked:z.boolean()}).parse(request.body).locked,now=new Date().toISOString();
+    assertWritable(device.vault_id);
     if(!locked&&integrityBlockedVaults.has(device.vault_id))throw Object.assign(new Error("The server integrity lock cannot be cleared until the accepted snapshot is repaired and the server is restarted."),{statusCode:423});
     store.run("UPDATE vaults SET write_locked_at=?,write_locked_by=? WHERE id=?",locked?now:null,locked?device.name:null,device.vault_id);
     safeguards.event(device.vault_id,locked?"write_lock_enabled":"write_lock_disabled","info",locked?`Remote writes frozen by ${device.name}`:`Remote writes resumed by ${device.name}`);
@@ -788,7 +797,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
 
   app.addHook("onReady",async()=>{
     for(const vault of store.all<{id:string;head_id:string}>("SELECT id,head_id FROM vaults WHERE head_id IS NOT NULL AND retired_at IS NULL")){
-      if(!canOperateVault(vault.id)||integrityBlockedVaults.has(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id)??planRetiredLegacyFolderRepair(store,vault.id,vault.head_id)??planMissingLegacyFolderRetirementDirective(store,vault.id,vault.head_id);if(!plan)continue;
+      if(!canOperateVault(vault.id)||integrityBlockedVaults.has(vault.id)||checkpointRepairs.get(vault.id))continue;const plan=planLegacyFolderDescendantRepair(store,vault.id,vault.head_id)??planRetiredLegacyFolderRepair(store,vault.id,vault.head_id)??planMissingLegacyFolderRetirementDirective(store,vault.id,vault.head_id);if(!plan)continue;
       const head=store.getSnapshot(vault.head_id);if(!head)continue;
       const repaired=await acceptSnapshot(vault.id,head.id,"server:folder-provenance-repair","Gib Sync server","Repair unsafe legacy folder provenance",head.entries,plan.desiredFolders,{retiredFolders:plan.contaminatedFolders,observedAt:plan.observedAt,originSnapshotIds:plan.originIds,...(plan.issuedAt?{issuedAt:plan.issuedAt}:{})});
       if(repaired){
@@ -797,6 +806,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       }
     }
     for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE head_id IS NOT NULL AND retired_at IS NULL"))if(!integrityBlockedVaults.has(id))scheduleMirror(id,50);
+    for(const id of checkpointRepairs.interruptedVaults())if(!integrityBlockedVaults.has(id)&&canOperateVault(id))scheduleMirror(id,50);
     const scanAll=()=>{for(const pending of durableJobs.pending())scheduleMirror(pending.vault_id,Math.max(0,pending.due_at-Date.now()),false);for(const {id} of store.all<{id:string}>("SELECT id FROM vaults WHERE storage_url IS NOT NULL AND retired_at IS NULL"))if(containment.allows(id))void ingestExternalChanges(id).catch((error)=>app.log.error({err:error,vaultId:id},"External Seafile scan failed"));};
     externalTimer=setInterval(scanAll,3000);externalTimer.unref();externalStartupTimer=setTimeout(scanAll,250);externalStartupTimer.unref();
   });

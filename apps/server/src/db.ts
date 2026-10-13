@@ -106,6 +106,7 @@ export class Store {
     if(!currentVaultColumns.has("safeguard_policy"))this.db.exec("ALTER TABLE vaults ADD COLUMN safeguard_policy TEXT");
     if(!currentVaultColumns.has("write_locked_at"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_at TEXT");
     if(!currentVaultColumns.has("write_locked_by"))this.db.exec("ALTER TABLE vaults ADD COLUMN write_locked_by TEXT");
+    if(!currentVaultColumns.has("checkpoint_repair_json"))this.db.exec("ALTER TABLE vaults ADD COLUMN checkpoint_repair_json TEXT");
     if(!currentVaultColumns.has("trusted_until"))this.db.exec("ALTER TABLE vaults ADD COLUMN trusted_until TEXT");
     if(!currentVaultColumns.has("trusted_device_id"))this.db.exec("ALTER TABLE vaults ADD COLUMN trusted_device_id TEXT");
     const deviceColumns=new Set(this.all<{name:string}>("PRAGMA table_info(devices)").map((row)=>row.name));

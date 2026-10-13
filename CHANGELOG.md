@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.75 candidate
+
+- Persist accepted-checkpoint repair intent and its exact target before changing the readable mirror. After a server restart, resume that same repair automatically without importing its own partial writes as independent file creations.
+- Keep new commits and manual unlocks held until the complete readable generation is verified. Preserve pre-existing manual locks and atomically advance repair intent when approved redundant-copy cleanup creates a new accepted head.
+- Recover reserved markers from older interrupted repairs; isolate unverifiable repair intent to the affected vault while other vaults remain available.
+- Add actual SQLite reopen, interrupted projection, authority-drift, manual-lock, empty-vault and multi-vault isolation regressions. This remains an isolated candidate, not current-user release approval.
+
 ## 0.8.74 candidate
 
 - Close legacy Gib Sync windows using the verified mobile native header control as well as the desktop close button, newest first. The physical Android hot-update test exposed the platform-specific selector missing from 0.8.73.

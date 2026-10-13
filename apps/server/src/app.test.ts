@@ -11,6 +11,7 @@ import { decryptVaultBlob,encryptVaultBlob,openJson,sealJson,sha256 } from "./se
 import { ContainmentService } from "./containment.js";
 import { VaultRetirementService } from "./vault-retirement.js";
 import { SERVER_VERSION } from "./version.js";
+import {CheckpointRepairs} from './checkpoint-repair.js';
 
 class MemoryStorage {
   files = new Map<string, Uint8Array>();
@@ -652,6 +653,26 @@ describe("Gib Sync API", () => {
     await vi.waitFor(()=>expect(entered).toBe(true));const proposal={parentId:first.id,message:'Saved edit during repair',entries:first.entries,folders:['New empty']};
     const deferred=await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal});expect(deferred.statusCode).toBe(503);expect(deferred.json().healthRepairActive).toBe(true);expect(deferred.headers['retry-after']).toBe('5');expect(store.one('SELECT head_id FROM vaults WHERE id=?',setup.vaultId)).toEqual({head_id:first.id});expect(store.all('SELECT id FROM quarantines WHERE vault_id=?',setup.vaultId)).toHaveLength(0);
     release();expect((await repair).statusCode).toBe(200);const accepted=await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal});expect(accepted.statusCode).toBe(201);expect(accepted.json().entries[0].fileId).toBe(first.entries[0].fileId);expect(accepted.json().folders).toEqual(['New empty']);await app.close();
+  });
+  it('automatically resumes an interrupted checkpoint repair after server restart without self-conflict or manual unlocking',async()=>{
+    const f=fixture(),{config,storage}=f;let store=f.store;const old=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await old.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Desktop')})).json(),auth={authorization:`Bearer ${setup.deviceToken}`},clear=Buffer.from('preserve this accepted note'),hash=sha256(clear);
+    await old.inject({method:'PUT',url:`/v1/blobs/${hash}`,headers:{...auth,'content-type':'application/octet-stream'},payload:encryptedFixture(clear,Buffer.from(setup.vaultKey,'base64url'),hash)});
+    const first=(await old.inject({method:'POST',url:'/v1/commit',headers:auth,payload:{parentId:null,message:'Initial',entries:[{path:'note.md',hash,size:clear.length,mtime:1}],folders:[]}})).json();await old.inject({method:'POST',url:'/v1/mirror/complete',headers:auth,payload:{snapshotId:first.id}});await old.close();
+    store=new Store(config.DATA_DIR);fixtureStores.push(store);const history=store.all('SELECT * FROM snapshots'),repairs=new CheckpointRepairs(store);repairs.begin(setup.vaultId);store.run('UPDATE mirror_entries SET hash=? WHERE vault_id=?','repair:'+new Date().toISOString(),setup.vaultId);store.run('UPDATE vaults SET mirror_head_id=NULL,mirror_generation_id=NULL WHERE id=?',setup.vaultId);
+    await storage.deleteReadable({id:setup.vaultId},'note.md');storage.blockReadableWrites=true;
+    const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();
+    const scan=(await app.inject({method:'POST',url:'/v1/external/scan',headers:auth,payload:{}})).json();expect(scan.snapshotId).toBeNull();expect(scan.conflicts).toBe(0);
+    const unlock=await app.inject({method:'POST',url:'/v1/safeguards/lock',headers:auth,payload:{locked:false}});expect(unlock.statusCode).toBe(503);expect(unlock.json().healthRepairActive).toBe(true);
+    const proposal={parentId:first.id,message:'Saved edit after restart',entries:first.entries,folders:['Saved empty folder']};expect((await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal})).statusCode).toBe(503);
+    storage.unblockReadableWrites();await vi.waitFor(async()=>{expect((await app.inject({method:'GET',url:'/v1/status',headers:auth})).json().mirrorCurrent).toBe(true);expect(repairs.get(setup.vaultId)).toBeNull();},{timeout:7000,interval:50});
+    expect(store.all('SELECT * FROM snapshots')).toEqual(history);expect(storage.files.get(`read:${setup.vaultId}:note.md`)).toEqual(clear);expect((await app.inject({method:'POST',url:'/v1/commit',headers:auth,payload:proposal})).statusCode).toBe(201);await app.close();
+  });
+  it('isolates an unverifiable saved repair instead of preventing other vaults from starting or syncing',async()=>{
+    const f=fixture(),{config,storage}=f;let store=f.store;const old=await buildApp(config,store,storage as unknown as SeafileStorage),a=(await old.inject({method:'POST',url:'/v1/setup',payload:setupPayload('A','/A')})).json(),b=(await old.inject({method:'POST',url:'/v1/setup',payload:setupPayload('B','/B')})).json();await old.close();store=new Store(config.DATA_DIR);fixtureStores.push(store);
+    store.run('UPDATE vaults SET checkpoint_repair_json=? WHERE id=?','{"schema":1}',a.vaultId);
+    const app=await buildApp(config,store,storage as unknown as SeafileStorage);await app.ready();
+    expect((await app.inject({method:'POST',url:'/v1/health/repair',headers:{authorization:`Bearer ${a.deviceToken}`},payload:{restoreAcceptedHead:true}})).statusCode).toBe(423);
+    const accepted=await app.inject({method:'POST',url:'/v1/commit',headers:{authorization:`Bearer ${b.deviceToken}`},payload:{parentId:null,message:'Unrelated vault stays usable',entries:[],folders:['New folder']}});expect(accepted.statusCode).toBe(201);expect(accepted.json().folders).toEqual(['New folder']);expect(store.one('SELECT 1 FROM health_events WHERE vault_id=? AND code=?',a.vaultId,'checkpoint_repair_recovery_blocked')).toBeDefined();await app.close();
   });
   it("resumes a partial mirror into a newer large generation without inventing deletions",async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage);
