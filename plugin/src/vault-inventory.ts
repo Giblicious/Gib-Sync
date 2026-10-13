@@ -1,12 +1,12 @@
 import type {DataAdapter} from "obsidian";
 import type {ManifestEntry} from "@gib-sync/protocol";
 import {hashBytes} from "./crypto";
-import {hashAdapterFile,AdapterFileChangedError} from "./file-io";
+import {inspectAdapterFile,AdapterFileChangedError} from "./file-io";
 import {isSafeVaultPath} from "./settings";
 import {SyncCancelledError} from "./sync-recovery";
 
 type Stamp={size:number;mtime:number;ctime:number};
-export interface InventoryEntry extends ManifestEntry{ctime:number;verifiedAt:number;}
+export interface InventoryEntry extends ManifestEntry{ctime:number;verifiedAt:number;metadataSize?:number;}
 type Bucket={version:2;scope:string;payload:string;hash:string};
 const ROOT=".gib-sync/inventory-v2",MAX_BUCKET_BYTES=4*1024*1024,MAX_FILES=200_000,AUDIT_MS=6*60*60*1000;
 const encoder=new TextEncoder(),decoder=new TextDecoder();
@@ -45,7 +45,7 @@ export class VaultInventory{
       for(const path of files){this.checkpoint();if(!/^\.gib-sync\/inventory-v2\/[a-f0-9]{2}\.json$/.test(path))continue;
         try{const stat=await this.adapter.stat(path);if(stat?.type!=="file"||stat.size>MAX_BUCKET_BYTES)continue;const packed=JSON.parse(decoder.decode(new Uint8Array(await this.adapter.readBinary(path)))) as Bucket;if(packed.version!==2||packed.scope!==scope||typeof packed.payload!=="string"||await hashBytes(encoder.encode(packed.payload))!==packed.hash)continue;
           const rows=JSON.parse(packed.payload) as InventoryEntry[];if(!Array.isArray(rows))continue;
-          let processed=0;for(const row of rows){if(++processed%64===0){this.checkpoint();await this.cooperate();}if(this.entries.size>=MAX_FILES)break;if(!row||!isSafeVaultPath(row.path)||!validStamp({size:row.size,mtime:row.mtime,ctime:row.ctime})||!/^[a-f0-9]{64}$/.test(row.hash)||!Number.isFinite(row.verifiedAt)||row.verifiedAt<0)continue;this.entries.set(row.path,row);this.buckets.set(row.path,path.slice(-7,-5));}
+          let processed=0;for(const row of rows){if(++processed%64===0){this.checkpoint();await this.cooperate();}if(this.entries.size>=MAX_FILES)break;if(!row||!isSafeVaultPath(row.path)||!validStamp({size:row.size,mtime:row.mtime,ctime:row.ctime})||row.metadataSize!==undefined&&(!Number.isSafeInteger(row.metadataSize)||row.metadataSize<0)||!/^[a-f0-9]{64}$/.test(row.hash)||!Number.isFinite(row.verifiedAt)||row.verifiedAt<0)continue;this.entries.set(row.path,row);this.buckets.set(row.path,path.slice(-7,-5));}
         }catch{/* Torn or corrupt cache cannot establish content truth. */}
         await this.cooperate();
       }
@@ -56,10 +56,11 @@ export class VaultInventory{
   async inspect(path:string,force=false):Promise<InventoryEntry|null>{
     await this.load();this.checkpoint();const generation=this.dirtyGenerations.get(path)??0,stat=await this.adapter.stat(path);if(generation!==(this.dirtyGenerations.get(path)??0))throw new AdapterFileChangedError(path);
     if(stat?.type!=="file"){if(this.entries.delete(path)){this.dirtyBuckets.add(await this.bucket(path));this.keysChanged=true;}this.sessionVerified.delete(path);this.dirty.delete(path);return null;}
-    const saved=this.entries.get(path),same=saved&&saved.size===stat.size&&saved.mtime===stat.mtime&&saved.ctime===stat.ctime;
+    const saved=this.entries.get(path),same=saved&&(saved.metadataSize??saved.size)===stat.size&&saved.mtime===stat.mtime&&saved.ctime===stat.ctime;
     if(!force&&same&&!this.dirty.has(path))return {...saved};
-    const hash=await hashAdapterFile(this.adapter,path,()=>this.checkpoint(),this.cooperate,this.canBuffer(stat.size));this.checkpoint();const after=await this.adapter.stat(path);if(generation!==(this.dirtyGenerations.get(path)??0))throw new AdapterFileChangedError(path);if(after?.type!=="file")return null;
-    const next:InventoryEntry={...saved,path,hash,size:after.size,mtime:after.mtime,ctime:after.ctime,verifiedAt:Date.now()};this.entries.set(path,next);if(!saved)this.keysChanged=true;this.sessionVerified.add(path);this.dirty.delete(path);this.dirtyBuckets.add(await this.bucket(path));return {...next};
+    const observed=await inspectAdapterFile(this.adapter,path,()=>this.checkpoint(),this.cooperate,this.canBuffer(stat.size));this.checkpoint();const after=await this.adapter.stat(path);if(generation!==(this.dirtyGenerations.get(path)??0))throw new AdapterFileChangedError(path);if(after?.type!=="file")return null;
+    if(after.size!==observed.metadataSize||after.mtime!==stat.mtime||after.ctime!==stat.ctime)throw new AdapterFileChangedError(path);
+    const next:InventoryEntry={...saved,path,hash:observed.hash,size:observed.size,metadataSize:observed.metadataSize,mtime:after.mtime,ctime:after.ctime,verifiedAt:Date.now()};this.entries.set(path,next);if(!saved)this.keysChanged=true;this.sessionVerified.add(path);this.dirty.delete(path);this.dirtyBuckets.add(await this.bucket(path));return {...next};
   }
   async finishListing(paths:readonly string[]):Promise<void>{await this.load();const visible=new Set(paths);for(const path of [...this.entries.keys()])if(!visible.has(path)){this.entries.delete(path);this.keysChanged=true;this.sessionVerified.delete(path);this.dirty.delete(path);this.dirtyBuckets.add(await this.bucket(path));}await this.flush();}
   async verifyStep(maxFiles=16,maxBytes=8*1024*1024,maxMilliseconds=16):Promise<{changedPaths:string[];pending:number;checked:number}>{

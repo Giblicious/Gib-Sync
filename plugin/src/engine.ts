@@ -6,7 +6,7 @@ import { mergeText } from "./merge";
 import { canonicalConfigPath, isDeviceLocalObsidianPath, isDeviceLocalPlugin, isGibSyncConflictPath, isObsidianSystemPath, isPluginDataPath, obsidianPluginPath, shouldSyncChangedPath, type ApplyOperation, type GibSyncSettings, type SyncPhase } from "./settings";
 import { mergeCommunityPluginEnablement, mergeSystemJson } from "./system-merge";
 import { BodyCache } from "./body-cache";
-import { AdapterFileChangedError, hashAdapterFile,streamAdapterFile } from "./file-io";
+import { AdapterFileChangedError, hashAdapterFile,streamAdapterFile,copyVerifiedAdapterFile } from "./file-io";
 import {uploadAdapterFile} from "./outbound-stream";
 import {sha256} from "@noble/hashes/sha2.js";
 import {bytesToHex} from "@noble/hashes/utils.js";
@@ -168,7 +168,7 @@ export class SyncEngine {
   private async queuePackageActivation(id:string,hash:string|null,entries:readonly FileState[]):Promise<void>{this.pendingRuntimeActivation.set(id,hash);this.pendingRuntimeFingerprints.set(id,await this.packageFingerprint(entries));}
   private async holdPackage(id:string,reason:string,kind:"incomplete"|"activation",desired:readonly FileState[],observed:readonly FileState[]):Promise<void>{
     const settings=this.getSettings(),previous=settings.packageHolds[id],fingerprint=await this.packageFingerprint(desired),same=previous?.fingerprint===fingerprint,attempts=same?(previous?.attempts??0)+1:1,priorEntries=previous?.priorEntries??{};
-    for(const entry of observed){if(priorEntries[entry.path])continue;const sourcePath=`.gib-sync/package-hold-originals/${crypto.randomUUID()}.bin`;await this.ensureParent(sourcePath);await this.adapter.copy(entry.sourcePath??entry.path,sourcePath);this.checkpoint();if(await this.savedHash(sourcePath)!==entry.hash)throw new FileChangedDuringReadError(entry.path);priorEntries[entry.path]={...this.manifestEntry(entry),sourcePath};}
+    for(const entry of observed){if(priorEntries[entry.path])continue;const sourcePath=`.gib-sync/package-hold-originals/${crypto.randomUUID()}.bin`;await this.ensureParent(sourcePath);await this.copyProtectedOriginal(entry,sourcePath);priorEntries[entry.path]={...this.manifestEntry(entry),sourcePath};}
     settings.packageHolds[id]={reason,kind,at:Date.now(),attempts,retryAt:Date.now()+(kind==="incomplete"?300000:Math.min(300000,10000*2**Math.min(attempts-1,5))),fingerprint,priorEntries};
   }
   async listConflictInbox():Promise<ConflictInboxItem[]>{
@@ -658,16 +658,20 @@ export class SyncEngine {
     await this.prepareResult(path,originalClear,final,bytes);await this.prepareResult(copyPath,copyClear,final,bytes);
     await this.recordConflict(path,local,remote,localName,remoteName,preferred,copyPath,final,"Concurrent versions preserved");
   }
+  private async copyProtectedOriginal(entry:FileState,destination:string):Promise<void>{
+    try{await copyVerifiedAdapterFile(this.adapter,entry.sourcePath??entry.path,destination,entry.hash,entry.size,()=>this.checkpoint(),()=>this.cooperate());}
+    catch(error){if(error instanceof AdapterFileChangedError)throw new FileChangedDuringReadError(entry.path);throw error;}
+  }
   private async recordConflict(path:string,local:FileState,remote:FileState,localName:string,remoteName:string,preferred:"local"|"remote",copyPath:string,final:Map<string,FileState>,reason:string):Promise<void>{
     const known=(await this.conflictStore.list()).find(item=>item.state==="open"&&!item.originSnapshotId&&item.path===path&&item.versions[0]?.hash===local.hash&&item.versions[1]?.hash===remote.hash),id=known?.id??crypto.randomUUID(),sourcePath=known?.versions[0]?.sourcePath??`.gib-sync/conflict-originals/${crypto.randomUUID()}.bin`;
-    if(!await this.adapter.exists(sourcePath)){await this.ensureParent(sourcePath);this.checkpoint();await this.adapter.copy(local.sourcePath??local.path,sourcePath);this.checkpoint();}
+    if(!await this.adapter.exists(sourcePath)){await this.ensureParent(sourcePath);await this.copyProtectedOriginal(local,sourcePath);}
     if(await this.savedHash(sourcePath)!==local.hash)throw new FileChangedDuringReadError(local.sourcePath??local.path);
     const localPath=preferred==="local"?path:copyPath,remotePath=preferred==="remote"?path:copyPath,settings=this.getSettings();
     await this.conflictStore.save({id,originSnapshotId:null,path,createdAt:known?.createdAt??new Date().toISOString(),reason,state:"open",versions:[{id:known?.versions[0]?.id??crypto.randomUUID(),label:localName.slice(0,100),path,hash:local.hash,size:local.size,deviceId:settings.deviceId,deviceName:localName,revisionId:local.revision?.id,sourcePath,annotatedPath:localPath,annotatedHash:final.get(localPath)!.hash},{id:known?.versions[1]?.id??crypto.randomUUID(),label:remoteName.slice(0,100),path,hash:remote.hash,size:remote.size,deviceId:remote.revision?.deviceId,deviceName:remoteName,revisionId:remote.revision?.id,annotatedPath:remotePath,annotatedHash:final.get(remotePath)!.hash}]});
   }
   private async recordDeletionConflict(path:string,survivor:FileState,localSurvived:boolean,remoteName:string,final:Map<string,FileState>):Promise<void>{
     const settings=this.getSettings(),annotatedHash=final.get(path)!.hash,sourcePath=localSurvived?`.gib-sync/conflict-originals/${crypto.randomUUID()}.bin`:undefined;
-    if(sourcePath){await this.ensureParent(sourcePath);await this.adapter.copy(survivor.sourcePath??survivor.path,sourcePath);this.checkpoint();if(await this.savedHash(sourcePath)!==survivor.hash)throw new FileChangedDuringReadError(survivor.path);}
+    if(sourcePath){await this.ensureParent(sourcePath);await this.copyProtectedOriginal(survivor,sourcePath);}
     const edited={id:crypto.randomUUID(),label:(localSurvived?settings.deviceName:remoteName).slice(0,100),path,hash:survivor.hash,size:survivor.size,deviceId:localSurvived?settings.deviceId:survivor.revision?.deviceId,deviceName:localSurvived?settings.deviceName:remoteName,revisionId:survivor.revision?.id,...sourcePath?{sourcePath}:{},annotatedPath:path,annotatedHash},deleted={id:crypto.randomUUID(),label:(localSurvived?remoteName:settings.deviceName).slice(0,100),path,hash:null,size:0,deleted:true,deviceId:localSurvived?undefined:settings.deviceId,deviceName:localSurvived?remoteName:settings.deviceName,annotatedPath:path,annotatedHash};
     await this.conflictStore.save({id:crypto.randomUUID(),originSnapshotId:null,path,createdAt:new Date().toISOString(),reason:"An edit and a deletion overlapped; the complete edit was preserved",state:"open",versions:localSurvived?[edited,deleted]:[deleted,edited]});
   }
@@ -678,7 +682,7 @@ export class SyncEngine {
     for(let index=0;index<versions.length;index++){await this.cooperate();const version=versions[index],entry=version.entry,target=targets[index],side=version.side==="local"?"local":"remote";
       if(entry.size>=LOW_MEMORY_DOWNLOAD_BYTES)await this.prepareStreamedVersion(target,entry,side,prefix,final);else{const clear=side==="local"?await this.localBytes(entry.path,entry,bytes):await this.remoteBytes(entry,remoteCache);await this.prepareResult(target,prefix?encoder.encode(prefix+decoder.decode(clear)):clear,final,bytes);}
       const accepted=final.get(target)!;if(index===0){accepted.fileId=canonical.entry.fileId;accepted.revision=canonical.entry.revision;}else{delete accepted.fileId;delete accepted.revision;}
-      let sourcePath:string|undefined;if(side==="local"){sourcePath=known?.versions[index]?.sourcePath??`.gib-sync/conflict-originals/${crypto.randomUUID()}.bin`;if(!await this.adapter.exists(sourcePath)){await this.ensureParent(sourcePath);await this.adapter.copy(entry.sourcePath??version.originalPath,sourcePath);this.checkpoint();}if(await this.savedHash(sourcePath)!==entry.hash)throw new FileChangedDuringReadError(version.originalPath);}
+      let sourcePath:string|undefined;if(side==="local"){sourcePath=known?.versions[index]?.sourcePath??`.gib-sync/conflict-originals/${crypto.randomUUID()}.bin`;if(!await this.adapter.exists(sourcePath)){await this.ensureParent(sourcePath);await this.copyProtectedOriginal({...entry,path:version.originalPath},sourcePath);}if(await this.savedHash(sourcePath)!==entry.hash)throw new FileChangedDuringReadError(version.originalPath);}
       sides.push({id:known?.versions[index]?.id??crypto.randomUUID(),label:names[index].slice(0,100),path:version.originalPath,hash:entry.hash,size:entry.size,deviceId:entry.revision?.deviceId??(side==="local"?this.getSettings().deviceId:undefined),deviceName:entry.revision?.deviceName,revisionId:entry.revision?.id,...sourcePath?{sourcePath}:{},annotatedPath:target,annotatedHash:accepted.hash});
     }
     await this.conflictStore.save({id:known?.id??crypto.randomUUID(),originSnapshotId:null,path,createdAt:known?.createdAt??new Date().toISOString(),reason:"Folders converged onto the same location; every distinct file generation was preserved",state:"open",versions:sides});

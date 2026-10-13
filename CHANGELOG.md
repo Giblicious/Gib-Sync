@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.76 candidate
+
+- Fix a physical Android reproduction where newly saved notes retain a zero-byte native size hint and repeatedly retry instead of publishing. Corroborate inconsistent small-file length with independent native bytes and unchanged stamps; retain complete hash and length checks and bounded memory use.
+- Keep verified content length separate from its metadata hint in the durable inventory. Existing cache records remain compatible; dirty files and process restarts still require content verification.
+- Protect originals with verified copies. If a native size hint is inconsistent, prepare the new recovery copy through bounded streaming rather than the native copy path that returned an empty successful copy during testing. Existing protected destinations are never overwritten.
+- Add truncated-reader, changing-content, bounded-memory, protected-copy, persistent-inventory and 16-note creation regressions. This is still an isolated candidate, not approval to update current users.
+
 ## 0.8.75 candidate
 
 - Persist accepted-checkpoint repair intent and its exact target before changing the readable mirror. After a server restart, resume that same repair automatically without importing its own partial writes as independent file creations.

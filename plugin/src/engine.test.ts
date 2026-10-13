@@ -230,6 +230,14 @@ describe("durable apply ownership and recovery",()=>{
 });
 
 describe("SyncEngine", () => {
+  it('syncs a burst of new notes when native file metadata keeps reporting zero bytes',async()=>{
+    const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),stat=adapter.stat.bind(adapter);adapter.dirs.add('New');
+    for(let i=0;i<16;i++)adapter.files.set(`New/note-${i}.md`,new TextEncoder().encode(`Saved note ${i}\n`));
+    adapter.stat=async(path:string)=>{const actual=await stat(path);return actual?.type==='file'&&path.startsWith('New/')?{...actual,size:0}:actual;};
+    const engine=new SyncEngine(adapter as unknown as DataAdapter,api as unknown as GibSyncApi,()=>config,async()=>{},()=>{});const result=await engine.sync();
+    expect(result.conflicts).toBe(0);expect(api.head!.entries).toHaveLength(16);for(const entry of api.head!.entries){const actual=adapter.files.get(entry.path)!;expect(entry.size).toBe(actual.length);expect(entry.hash).toBe(await hashBytes(actual));expect(await decryptBlob(api.blobs.get(entry.hash)!,config.vaultKey,entry.hash)).toEqual(actual);}
+    const commits=api.commits;await engine.sync();expect(api.commits).toBe(commits);
+  });
   it("recovers an established device's lost commit response and unjournaled newer edits after restart",async()=>{
     const adapter=new MemoryAdapter(),api=new MemoryApi(),config=settings(),encode=(prefix:string)=>new TextEncoder().encode(Array.from({length:32},(_,i)=>`${prefix}${i}`).join(" ")+"\n");
     adapter.files.set("note.md",encode("base"));let persisted=structuredClone(config);
