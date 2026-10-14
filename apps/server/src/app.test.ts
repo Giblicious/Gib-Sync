@@ -76,6 +76,30 @@ function encryptedFixture(clear:Buffer,key:Buffer,hash:string):Buffer{const iv=r
 
 describe("Gib Sync API", () => {
   const setupPayload = (deviceName:string,basePath="/Obsidian/Test",username="test@example.test") => ({vaultName:"Test",deviceName,seafileUrl:"https://seafile.example.test",seafileUsername:username,seafilePassword:"password",libraryId:"library-1",libraryName:"Notes",basePath});
+  const diagnostic=()=>({schemaVersion:1,reportId:randomUUID(),pluginVersion:SERVER_VERSION,platform:'ios',sampledAt:new Date().toISOString(),live:{phase:'up-to-date',running:false,verified:true,pendingPaths:0,pendingApply:0,current:0,total:0,hasError:false},packages:[],activities:[]});
+  it('authenticates and isolates automatic diagnostics without changing accepted content',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Phone')})).json(),other=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Other','/Obsidian/Other')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`,'x-gib-sync-client-version':SERVER_VERSION},report=diagnostic(),before=JSON.stringify(store.all('SELECT * FROM snapshots'));
+    expect((await app.inject({method:'POST',url:'/v1/diagnostics',payload:report})).statusCode).toBe(401);
+    expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:report})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:report})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:{...report,platform:'android'}})).statusCode).toBe(409);
+    expect((await app.inject({method:'GET',url:'/v1/diagnostics',headers})).json().reports[0]).toMatchObject({deviceId:setup.deviceId,report});
+    expect((await app.inject({method:'GET',url:'/v1/diagnostics?deviceId='+setup.deviceId,headers:{authorization:`Bearer ${other.deviceToken}`}})).json().reports).toEqual([]);
+    expect(JSON.stringify(store.all('SELECT * FROM snapshots'))).toBe(before);
+    store.run('UPDATE devices SET revoked_at=? WHERE id=?',new Date().toISOString(),setup.deviceId);expect((await app.inject({method:'GET',url:'/v1/diagnostics',headers})).statusCode).toBe(401);
+  });
+  it('rejects secret-bearing extra fields, oversized diagnostics and mismatched versions',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Phone')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`,'x-gib-sync-client-version':SERVER_VERSION},r=diagnostic();
+    for(const payload of [{...r,deviceToken:'secret'},{...r,live:{...r.live,message:'private note'}},{...r,packages:[{id:'demo',kind:'activation',reasonCode:'other',at:1,attempts:1,retryAt:1,reason:'secret'}]},{...r,pluginVersion:'0.0.0'}])expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload})).statusCode).toBe(400);
+    expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:{...r,extra:'x'.repeat(40000)}})).statusCode).toBe(413);expect(store.all('SELECT * FROM device_diagnostics')).toEqual([]);
+  });
+  it('bounds diagnostic retention and throttles new reports while allowing idempotent retries',async()=>{
+    const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Phone')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`,'x-gib-sync-client-version':SERVER_VERSION},first=diagnostic();
+    store.run('INSERT INTO device_diagnostics VALUES(?,?,?,?,?)',setup.vaultId,setup.deviceId,randomUUID(),Date.now()-8*86400000,JSON.stringify(first));
+    for(let i=0;i<30;i++)expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:i===0?first:diagnostic()})).statusCode).toBe(200);
+    expect(store.all('SELECT * FROM device_diagnostics')).toHaveLength(30);expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:diagnostic()})).statusCode).toBe(429);expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:first})).statusCode).toBe(200);
+    store.run("DELETE FROM request_budgets WHERE scope='device-diagnostics'");expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:diagnostic()})).statusCode).toBe(200);expect(store.all('SELECT * FROM device_diagnostics')).toHaveLength(30);
+  });
   it('keeps QR valid after numeric expiry, hashes the invitation, requires approval and consumes both alternatives once',async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};
     const before=Date.now(),pairing=(await app.inject({method:'POST',url:'/v1/pairings',headers,payload:{requireConfirmation:true}})).json(),token=new URL(pairing.qrSetupUrl).searchParams.get('token')!;

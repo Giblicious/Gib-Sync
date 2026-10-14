@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.80 candidate
+
+- Add opt-in automatic server diagnostic logging so phone testing no longer requires transferring clipboard logs. Authenticated reports include sync state, bounded activity codes, plugin repair codes and native device-test results; notes, paths, raw errors, keys and credentials stay excluded.
+- Keep reporting separate from sync, retain transient repair observations, retry network failures with stable report identities, and clear queued reports on opt-out, scope changes or unload. Older servers remain supported without diagnostic requests.
+- Bound server reports to 32 KiB, 30 reports per device and seven days, with strict field validation, per-device request limits, idempotent retries and vault isolation. Candidate distribution remains isolated from stable users.
+
 ## 0.8.79 candidate
 
 - Give foreground mobile rendering a frame opportunity during sustained hashing and verification. The physical A10e's 32 MB hash benchmark went from repeated 100 ms frame gaps to no gaps above 50 ms while retaining the exact content hash.

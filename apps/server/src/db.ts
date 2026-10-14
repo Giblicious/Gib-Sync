@@ -17,6 +17,8 @@ export class Store {
         storage_url TEXT, storage_username TEXT, storage_repo_id TEXT, storage_repo_name TEXT, storage_base_path TEXT, storage_token TEXT, storage_layout TEXT,
         mirror_base_path TEXT, mirror_head_id TEXT, mirror_generation_id TEXT);
       CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, revoked_at TEXT);
+      CREATE TABLE IF NOT EXISTS device_diagnostics(vault_id TEXT NOT NULL REFERENCES vaults(id),device_id TEXT NOT NULL REFERENCES devices(id),report_id TEXT NOT NULL,received_at INTEGER NOT NULL,report_json TEXT NOT NULL,PRIMARY KEY(device_id,report_id));
+      CREATE INDEX IF NOT EXISTS device_diagnostics_vault_received ON device_diagnostics(vault_id,received_at DESC);
       CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(id), parent_id TEXT, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created_at TEXT NOT NULL, message TEXT NOT NULL, manifest_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS snapshots_vault_created ON snapshots(vault_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS blobs(vault_id TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(vault_id, hash));

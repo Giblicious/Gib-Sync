@@ -7,6 +7,7 @@ import type {SnapshotCache} from "./snapshot-cache";
 import {sha256} from "@noble/hashes/sha2.js";
 import {bytesToHex} from "@noble/hashes/utils.js";
 import {controlledIo} from "./io-control";
+import type {DeviceDiagnosticReport} from '@gib-sync/protocol';
 import type {ConflictInboxItem} from "./conflict-inbox";
 export interface PendingDeviceClaim{status:"pending";claimId:string;ticket:string;expiresAt:string;confirmationCode:string;}
 export interface TrustedDeviceRequest{id:string;deviceName:string;confirmationCode:string;expiresAt:string;}
@@ -29,7 +30,7 @@ function errorBody(response:{json:unknown}):any{
   try{return response.json;}catch{return null;}
 }
 
-export const CLIENT_VERSION="0.8.79";
+export const CLIENT_VERSION="0.8.80";
 export interface ContentUploadState{id:string;hash:string;size:number;offset:number;chunkBytes:number;complete:boolean;processing?:boolean;processingId?:string;stage?:"verifying"|"uploading"|"checking"|"waiting";}
 
 function exactArrayBuffer(bytes:Uint8Array):ArrayBuffer{
@@ -55,6 +56,8 @@ export class GibSyncApi {
   supportsStreamUpload():boolean{try{if(new URL(this.settings().serverUrl).protocol!=="https:")return false;}catch{return false;}return this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.has("resumable-content-upload-v1")===true;}
   disableStreamUpload():void{this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.delete("resumable-content-upload-v1");}
   supportsOperationsV2():boolean{return this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.has("snapshot-operations-v2")===true;}
+  supportsServerDiagnostics():boolean{return this.capabilities.get(this.settings().serverUrl.replace(/\/$/,""))?.has('device-diagnostics-v1')===true;}
+  postDiagnostic(report:DeviceDiagnosticReport,connection:{serverUrl:string;token:string}){return this.json<{ok:boolean;reportId:string}>('POST','/v1/diagnostics',report,connection.token,connection.serverUrl);}
   syncTree(){return this.json<SyncTree>("GET","/v2/tree",undefined,this.settings().deviceToken);}
   operationBatch(batch:OperationBatch){return this.json<OperationReceipt>("POST","/v2/batches",batch,this.settings().deviceToken);}
   batchReceipt(id:string){return this.json<OperationReceipt>("GET",`/v2/batches/${encodeURIComponent(id)}`,undefined,this.settings().deviceToken);}

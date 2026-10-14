@@ -17,6 +17,8 @@ import { assertSetupServerCompatible,enforceServerCompatibility,unavailableServe
 import { GibSyncSettingTab, HistoryModal, NativeSyncConflictModal, QuickCodeDisplayModal, QuickCodeEntryModal, SafeguardReviewModal, SetupModal, StatusOverviewModal, claimQuickCodeSetup } from "./ui";
 import {parseSetupInvite} from "./setup-qr";
 import {ModalRegistry,closeLegacyPluginDialogs} from './modal-lifecycle';
+import {ServerDiagnosticReporter,serverDiagnosticReport} from './server-diagnostics';
+import type {DeviceProbeReport} from './device-diagnostics';
 
 export default class GibSyncPlugin extends Plugin {
   readonly modalRegistry=new ModalRegistry();
@@ -39,6 +41,8 @@ export default class GibSyncPlugin extends Plugin {
   private syncAdapter!:DataAdapter;
   private packageRuntime:PluginRuntimeCoordinator|null=null;
   private setupInviteModal:QuickCodeEntryModal|null=null;
+  private diagnosticReporter:ServerDiagnosticReporter|null=null;
+  private deviceTestReport:DeviceProbeReport|undefined;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
@@ -77,6 +81,8 @@ export default class GibSyncPlugin extends Plugin {
     for(const path of this.settings.pendingPaths)this.pathVersions.set(path,++this.pathRevision);
     this.api = new GibSyncApi(() => this.settings,new SnapshotCache(this.app.vault.adapter));
     this.liveStatus = {...initialLiveStatus(Boolean(this.settings.deviceToken)),lastSuccessAt:this.settings.lastSuccessAt,lastErrorAt:this.settings.lastErrorAt,lastError:this.settings.lastError,lastResult:this.settings.lastResult};
+    this.diagnosticReporter=new ServerDiagnosticReporter(()=>({serverUrl:this.settings.serverUrl,vaultId:this.settings.vaultId,deviceId:this.settings.deviceId,token:this.settings.deviceToken,enabled:this.settings.serverDiagnosticLogging,supported:this.api.supportsServerDiagnostics()}),()=>serverDiagnosticReport(this.settings,this.liveStatus,this.manifest.version,Platform.isIosApp?'ios':Platform.isAndroidApp?'android':'desktop',this.deviceTestReport),(connection,report)=>this.api.postDiagnostic(report,connection));
+    this.registerInterval(window.setInterval(()=>this.diagnosticReporter?.notify(),30000));
     this.statusEl = this.addStatusBarItem();
     this.syncAdapter=canonicalAdapter(this.app.vault.adapter,()=>this.canonicalConfigEnabled?this.settings.configDir:".obsidian",()=>this.configAliases);
     this.packageRuntime=new PluginRuntimeCoordinator(this.app,Plugin.prototype,()=>(this.app as typeof this.app&{plugins?:RuntimeManager}).plugins,this.app.vault.adapter,id=>`${this.settings.configDir}/plugins/${id}`,Platform.isMobile,()=>this.assertOperationCurrent(),cooperativeYield,(id,message,attention=true)=>this.recordRuntimeOutcome(id,message,attention));
@@ -133,6 +139,7 @@ export default class GibSyncPlugin extends Plugin {
 
   onunload() {
     this.stopped=true;
+    this.diagnosticReporter?.stop();this.diagnosticReporter=null;
     this.modalRegistry.dispose();
     this.setupInviteModal?.close();this.setupInviteModal=null;
     this.configWatcher?.stop();
@@ -306,7 +313,9 @@ export default class GibSyncPlugin extends Plugin {
       if(host&&(element.parentElement!==host||mode&&element.nextElementSibling!==mode))host.insertBefore(element,mode??host.firstChild);
     }else{this.mobileLongPressCancel?.();this.mobileTopEl?.remove();}
   }
-  private emitStatus() { if(this.stopped)return;this.updateStatusBar(); for (const listener of this.statusListeners) listener(); }
+  private emitStatus() { if(this.stopped)return;this.updateStatusBar(); for (const listener of this.statusListeners) listener();this.diagnosticReporter?.notify(); }
+  configureDiagnosticLogging(){this.diagnosticReporter?.notify();}
+  recordDeviceTestReport(report:DeviceProbeReport){this.deviceTestReport=report;this.diagnosticReporter?.notify();}
   subscribeStatus(listener:()=>void):()=>void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
   private recordRuntimeOutcome(id:string,message:string,attention:boolean):void{
     if(attention){this.settings.packageHolds[id]={...this.settings.packageHolds[id],reason:message,at:Date.now()};this.liveStatus.verified=false;this.report("applying",`Plugin ${id} · ${message}`,"warning");return;}

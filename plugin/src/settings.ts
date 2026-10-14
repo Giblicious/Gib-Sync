@@ -40,7 +40,7 @@ export interface GibSyncSettings {
   observedFolderSnapshotId:string|null;
   serverUrl: string; vaultId: string; vaultName: string; vaultKey: string;
   deviceId: string; deviceName: string; deviceToken: string;
-  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean; paused:boolean;
+  lastSnapshotId: string | null; initialized: boolean; autoSync: boolean; instantReceive: boolean; syncOnFileChange: boolean; paused:boolean;serverDiagnosticLogging:boolean;
   syncIntervalSeconds: number; syncBookmarks: boolean; syncObsidianConfig: boolean; syncPlugins: boolean; pluginSyncBootstrapPending:boolean; exclusions: string[];
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
@@ -60,7 +60,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   onboardingMode:"preserve-local",
   pendingMoves:[],fileCreationTimes:{},observedFolderSnapshotId:null,
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
-  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,pluginSyncBootstrapPending:false,
+  lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false,serverDiagnosticLogging:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,pluginSyncBootstrapPending:false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null,
   pendingCommit:null,pendingApplyOperations:{},pendingApplyPriorEntries:{},localReconcileBases:{}, storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
@@ -86,6 +86,7 @@ export function createSerializedSettingsWriter<T>(read:()=>T,write:(snapshot:T)=
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
   const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
+  settings.serverDiagnosticLogging=stored?.serverDiagnosticLogging===true;
   settings.packageHolds=stored?.packageHolds&&typeof stored.packageHolds==="object"&&!Array.isArray(stored.packageHolds)?Object.fromEntries(Object.entries(stored.packageHolds).filter(([id,hold])=>/^[a-z0-9._-]+$/i.test(id)&&hold&&typeof hold.reason==="string"&&typeof hold.at==="number"&&Number.isFinite(hold.at)).map(([id,hold])=>[id,{reason:hold.reason.slice(0,500),at:hold.at}])):{};
   settings.configDir=normalizedConfigDir(typeof stored?.configDir==="string"?stored.configDir:".obsidian");
   settings.onboardingMode=stored?.onboardingMode==="server-first"?"server-first":"preserve-local";

@@ -14,6 +14,7 @@ import { assessChanges,policyFor,SafeguardService } from "./safeguards.js";
 import { clientCompatibility } from "./compatibility.js";
 import { readGeneration,validGeneration,writeGeneration } from "./mirror-generation.js";
 import { SERVER_CAPABILITIES,SERVER_VERSION } from "./version.js";
+import {deviceDiagnosticSchema,retainDeviceDiagnostics} from './device-diagnostics.js';
 import { ContainmentService } from "./containment.js";
 import { planLegacyFolderDescendantRepair,planMissingLegacyFolderRetirementDirective,planRetiredLegacyFolderRepair } from "./folder-migration.js";
 import { canonicalManifest } from "./manifest.js";
@@ -158,7 +159,7 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
     if(route==='/setup')invitationHeaders(reply);
     if(request.method==="OPTIONS")return;
     if(publicRoute&&Number(request.headers["content-length"]??0)>64*1024)return reply.code(413).send({error:"Setup request exceeds its permitted size"});
-    if(!publicRoute)await authenticate(request,{allowIncompatible:route==="/v1/status"||route==="/v1/compatibility",allowContainment:route==="/v1/status"||route==="/v1/compatibility"});
+    if(!publicRoute)await authenticate(request,{allowIncompatible:route==="/v1/status"||route==="/v1/compatibility"||route==="/v1/diagnostics",allowContainment:route==="/v1/status"||route==="/v1/compatibility"||route==="/v1/diagnostics"});
     else if(route!=="/healthz"&&!takeRequestBudget(store,route==="/v1/pairings/poll"?"public-pairing-poll":"public-api",request.ip,route==="/v1/pairings/poll"?480:120,60_000))return reply.code(429).send({error:"Too many requests; try again shortly"});
     if(binaryRoute(route)){
       const hash=(request.params as {hash?:string})?.hash,device=store.one<AuthDevice>("SELECT id,vault_id,name FROM devices WHERE token_hash=?",sha256(request.headers.authorization?.replace(/^Bearer\s+/i,"")??""));
@@ -166,6 +167,23 @@ export async function buildApp(config: Config, store = new Store(config.DATA_DIR
       const expected=route==="/v1/content-uploads/:id/chunks/:index"||route==="/v1/content-uploads/:id/complete"?CONTENT_UPLOAD_CHUNK_BYTES:request.method==="PUT"?Number(request.headers["content-length"]??Number.NaN):storedSize??config.MAX_BLOB_BYTES+1024,release=binaryAdmission.acquire(expected);
       if(!release)return reply.code(503).header("Retry-After","2").send({error:"The server is safely processing another file; retry shortly"});binaryReleases.set(request,release);
     }
+  });
+
+  app.post('/v1/diagnostics',{bodyLimit:32*1024},async(request,reply)=>{
+    const device=await authenticate(request,{allowIncompatible:true,allowContainment:true});
+    const parsed=deviceDiagnosticSchema.safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:'Invalid bounded device diagnostic report'});
+    if(parsed.data.pluginVersion!==header(request,'x-gib-sync-client-version'))return reply.code(400).send({error:'Diagnostic client version differs from its authenticated request'});
+    const previous=store.one<{report_json:string}>('SELECT report_json FROM device_diagnostics WHERE device_id=? AND report_id=?',device.id,parsed.data.reportId);
+    if(previous&&previous.report_json!==JSON.stringify(parsed.data))return reply.code(409).send({error:'Diagnostic report identity was already used'});
+    if(!previous){if(!takeRequestBudget(store,'device-diagnostics',device.id,30,60_000))return reply.code(429).send({error:'Diagnostic reporting limit reached'});retainDeviceDiagnostics(store,device.vault_id,device.id,parsed.data);}
+    return {ok:true,reportId:parsed.data.reportId};
+  });
+  app.get<{Querystring:{deviceId?:string}}>('/v1/diagnostics',async(request)=>{
+    const device=await authenticate(request,{allowIncompatible:true,allowContainment:true}),id=request.query.deviceId;
+    if(id&&!/^[a-f0-9-]{36}$/i.test(id))throw app.httpErrors.badRequest('Invalid diagnostic device selector');
+    const rows=store.all<{device_id:string;received_at:number;report_json:string}>('SELECT device_id,received_at,report_json FROM device_diagnostics WHERE vault_id=? AND received_at>?'+(id?' AND device_id=?':'')+' ORDER BY received_at DESC,rowid DESC LIMIT 30',device.vault_id,Date.now()-7*86400000,...(id?[id]:[]));
+    return {reports:rows.map(r=>({deviceId:r.device_id,receivedAt:new Date(r.received_at).toISOString(),report:JSON.parse(r.report_json)}))};
   });
 
   function storageRow(vaultId: string): VaultStorageRow {

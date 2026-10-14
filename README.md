@@ -13,6 +13,8 @@ Gib Sync is a self-hosted, versioned Obsidian synchronization system for desktop
 - Server-enforced mass-change safeguards for both Obsidian devices and direct Seafile/WebDAV edits.
 - Optional Obsidian bookmark synchronization, enabled by default without requiring full `.obsidian` configuration sync.
 
+In **Diagnostics**, enable **Server diagnostic logging** once on a device to automatically send bounded sync state, plugin repair codes, and native device-test results to its connected Gib Sync server. It is off by default and requires a server advertising `device-diagnostics-v1`. Reports exclude note contents, file paths, connection credentials, keys, raw errors and activity text. Transport runs separately from synchronization, retries network failures without blocking sync, and keeps a bounded in-memory queue until the plugin unloads. The server retains up to 30 reports per device for seven days. Authenticated devices can read their vault's reports at `GET /v1/diagnostics`, optionally with `deviceId`; reports cannot cross vault boundaries. Detailed local logs and the clipboard actions remain available separately.
+
 ## Durable synchronization and recovery
 
 The 0.8.71 candidate adds an operation ledger, stable file and folder identities,

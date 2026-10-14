@@ -1,0 +1,16 @@
+import {z} from 'zod';
+import {DIAGNOSTIC_PHASES,DIAGNOSTIC_REASONS} from '@gib-sync/protocol';
+import type {Store} from './db.js';
+const count=z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),time=z.number().finite().min(0).max(Number.MAX_SAFE_INTEGER),version=z.string().regex(/^\d+\.\d+\.\d+$/),platform=z.enum(['ios','android','desktop']);
+const frames=z.object({samples:count,p95WindowSamples:count.max(1024),p95Ms:time,maxGapMs:time,over50Ms:count,over100Ms:count,backgroundGaps:count}).strict();
+const sync=z.object({observedMs:time,runningMs:time,startedRuns:count,completedRuns:count,interruptedRuns:count,stageMs:z.object({checking:time.optional(),scanning:time.optional(),'reading-remote':time.optional(),merging:time.optional(),applying:time.optional(),uploading:time.optional(),committing:time.optional(),mirroring:time.optional(),retrying:time.optional(),other:time.optional()}).strict(),frames}).strict();
+const native=z.object({schemaVersion:z.literal(2),pluginVersion:version,platform,sampledAt:z.string().datetime(),frames,responsiveness:z.object({idle:frames,generatedIo:frames,actualSync:sync}).strict(),lifecycle:z.object({hidden:count,shown:count,pagehide:count,pageshow:count}).strict(),fileIo:z.object({appendSupported:z.boolean(),resourceSupported:z.boolean(),testedBytes:count.max(1048576),verified:z.boolean()}).strict(),evidence:z.object({syntheticOnly:z.boolean(),realRunObserved:z.boolean(),fullScaleNotCertified:z.literal(true)}).strict()}).strict();
+export const deviceDiagnosticSchema=z.object({schemaVersion:z.literal(1),reportId:z.string().uuid(),pluginVersion:version,platform,sampledAt:z.string().datetime(),live:z.object({phase:z.enum(DIAGNOSTIC_PHASES),running:z.boolean(),verified:z.boolean(),pendingPaths:count,pendingApply:count,current:count,total:count,hasError:z.boolean()}).strict(),packages:z.array(z.object({id:z.string().regex(/^[a-z0-9][a-z0-9_-]{0,99}$/),kind:z.enum(['activation','incomplete','other']),reasonCode:z.enum(DIAGNOSTIC_REASONS),at:time,attempts:count,retryAt:time}).strict()).max(32),activities:z.array(z.object({at:z.string().datetime(),phase:z.enum(DIAGNOSTIC_PHASES),level:z.enum(['info','success','warning','error']),reasonCode:z.enum(DIAGNOSTIC_REASONS)}).strict()).max(32),deviceTest:native.optional()}).strict().superRefine((r,c)=>{if(r.deviceTest&&(r.deviceTest.pluginVersion!==r.pluginVersion||r.deviceTest.platform!==r.platform))c.addIssue({code:'custom',message:'Native test version/platform differs from its device report'});});
+export function retainDeviceDiagnostics(store:Store,vaultId:string,deviceId:string,report:z.infer<typeof deviceDiagnosticSchema>,now=Date.now()){
+  store.db.exec('BEGIN IMMEDIATE');try{
+    store.run('INSERT OR IGNORE INTO device_diagnostics(vault_id,device_id,report_id,received_at,report_json) VALUES(?,?,?,?,?)',vaultId,deviceId,report.reportId,now,JSON.stringify(report));
+    store.run('DELETE FROM device_diagnostics WHERE received_at<?',now-7*86400000);
+    store.run('DELETE FROM device_diagnostics WHERE device_id=? AND report_id NOT IN (SELECT report_id FROM device_diagnostics WHERE device_id=? ORDER BY received_at DESC,rowid DESC LIMIT 30)',deviceId,deviceId);
+    store.db.exec('COMMIT');
+  }catch(error){store.db.exec('ROLLBACK');throw error;}
+}
