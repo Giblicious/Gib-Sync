@@ -95,10 +95,12 @@ describe("Gib Sync API", () => {
   });
   it('bounds diagnostic retention and throttles new reports while allowing idempotent retries',async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Phone')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`,'x-gib-sync-client-version':SERVER_VERSION},first=diagnostic();
+    const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now());try{
     store.run('INSERT INTO device_diagnostics VALUES(?,?,?,?,?)',setup.vaultId,setup.deviceId,randomUUID(),Date.now()-8*86400000,JSON.stringify(first));
     for(let i=0;i<30;i++)expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:i===0?first:diagnostic()})).statusCode).toBe(200);
     expect(store.all('SELECT * FROM device_diagnostics')).toHaveLength(30);expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:diagnostic()})).statusCode).toBe(429);expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:first})).statusCode).toBe(200);
     store.run("DELETE FROM request_budgets WHERE scope='device-diagnostics'");expect((await app.inject({method:'POST',url:'/v1/diagnostics',headers,payload:diagnostic()})).statusCode).toBe(200);expect(store.all('SELECT * FROM device_diagnostics')).toHaveLength(30);
+    }finally{clock.mockRestore();}
   });
   it('keeps QR valid after numeric expiry, hashes the invitation, requires approval and consumes both alternatives once',async()=>{
     const {config,store,storage}=fixture(),app=await buildApp(config,store,storage as unknown as SeafileStorage),setup=(await app.inject({method:'POST',url:'/v1/setup',payload:setupPayload('Trusted desktop')})).json(),headers={authorization:`Bearer ${setup.deviceToken}`};

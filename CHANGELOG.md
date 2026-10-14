@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.81 candidate
+
+- Make the automatic diagnostic retention/rate-limit regression independent of wall-clock minute boundaries. Keep the same bounded opt-in reporting behavior from the 0.8.80 candidate.
+- Preserve the immutable 0.8.80 source tag; only the candidate whose complete CI gate passes is distributed to disposable test vaults.
+
 ## 0.8.80 candidate
 
 - Add opt-in automatic server diagnostic logging so phone testing no longer requires transferring clipboard logs. Authenticated reports include sync state, bounded activity codes, plugin repair codes and native device-test results; notes, paths, raw errors, keys and credentials stay excluded.
