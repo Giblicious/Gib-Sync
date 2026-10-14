@@ -1,5 +1,5 @@
 import type {DataAdapter} from "obsidian";
-import {hashAdapterFile} from "./file-io";
+import {hashAdapterFile,inspectAdapterFile,copyVerifiedAdapterFile} from "./file-io";
 import {isSafeVaultPath,isDeviceLocalPlugin} from "./settings";
 import {AdapterFileChangedError} from "./file-io";
 
@@ -131,7 +131,17 @@ export class PluginRuntimeCoordinator implements PackageRuntime{
   private async protectIncoming(guard:Guard,proof:Proof):Promise<void>{
     if(typeof this.adapter.copy!=="function"||typeof this.adapter.rename!=="function")throw new Error("This adapter cannot protect incoming plugin settings during runtime activation");
     const incoming:{proof:Proof;dataCopy?:string}={proof};
-    if(proof.data!==null){const root=this.recoveryRoot(guard.id);await this.mkdir(root);const destination=`${root}/data.json`;await this.adapter.copy(`${this.pluginRoot(guard.id)}/data.json`,destination);if(await this.hash(destination,true)!==proof.data||await this.hash(`${this.pluginRoot(guard.id)}/data.json`,guard.cleanup)!==proof.data)throw new Error("Incoming settings changed while their runtime checkpoint was being protected");incoming.dataCopy=destination;}
+    if(proof.data!==null){
+      const path=`${this.pluginRoot(guard.id)}/data.json`,stamp=await this.adapter.stat(path),checkpoint=guard.cleanup?()=>{}:this.checkpoint;
+      if(stamp?.type!=='file')throw new Error('Incoming plugin settings are unavailable; activation remains held');
+      const observed=await inspectAdapterFile(this.adapter,path,checkpoint,this.cooperate,stamp.size<8*1024*1024);
+      if(observed.hash!==proof.data)throw new Error('Incoming settings changed before their runtime checkpoint was protected');
+      const root=this.recoveryRoot(guard.id);await this.mkdir(root);const destination=`${root}/data.json`;
+      // This is a fresh private checkpoint, never the active public settings
+      // path. Public restoration retains native no-overwrite copy semantics.
+      await copyVerifiedAdapterFile(this.adapter,path,destination,observed.hash,observed.size,checkpoint,this.cooperate);
+      if(await this.hash(path,guard.cleanup)!==proof.data)throw new Error('Incoming settings changed while their runtime checkpoint was being protected');incoming.dataCopy=destination;
+    }
     guard.incoming=incoming;
   }
   private async restoreIncoming(guard:Guard):Promise<void>{

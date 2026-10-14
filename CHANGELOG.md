@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.77 candidate
+
+- Extend verified private settings checkpoints to plugin runtime activation. Incoming settings with inconsistent native size hints no longer produce empty recovery copies and unnecessary activation holds.
+- Preserve exact incoming hashes and actual content lengths before enabling plugins; concurrent saved settings still block activation safely. Public-path restoration retains native no-overwrite semantics and both recoverable versions.
+- Add zero-size native metadata, broken-copy, startup bypass restoration and concurrent-settings regressions. Candidate-only distribution remains isolated from current users.
+
 ## 0.8.76 candidate
 
 - Fix a physical Android reproduction where newly saved notes retain a zero-byte native size hint and repeatedly retry instead of publishing. Corroborate inconsistent small-file length with independent native bytes and unchanged stamps; retain complete hash and length checks and bounded memory use.
