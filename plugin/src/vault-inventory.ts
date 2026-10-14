@@ -40,7 +40,7 @@ export class VaultInventory{
   private async load():Promise<void>{
     const scope=this.scopeValue();if(this.loaded&&this.scope===scope)return this.loaded;
     if(this.dirtyScope!==scope){this.dirty.clear();this.dirtyGenerations.clear();}this.dirtyScope=scope;this.scope=scope;this.entries.clear();this.sessionVerified.clear();this.dirtyBuckets.clear();this.buckets.clear();this.auditCursor=0;this.auditPaths=[];this.keysChanged=true;
-    this.loaded=(async()=>{
+    const loading=(async()=>{
       let files:string[]=[];try{files=(await this.adapter.list(ROOT)).files;}catch{return;}
       for(const path of files){this.checkpoint();if(!/^\.gib-sync\/inventory-v2\/[a-f0-9]{2}\.json$/.test(path))continue;
         try{const stat=await this.adapter.stat(path);if(stat?.type!=="file"||stat.size>MAX_BUCKET_BYTES)continue;const packed=JSON.parse(decoder.decode(new Uint8Array(await this.adapter.readBinary(path)))) as Bucket;if(packed.version!==2||packed.scope!==scope||typeof packed.payload!=="string"||await hashBytes(encoder.encode(packed.payload))!==packed.hash)continue;
@@ -49,7 +49,8 @@ export class VaultInventory{
         }catch{/* Torn or corrupt cache cannot establish content truth. */}
         await this.cooperate();
       }
-    })();return this.loaded;
+    })();this.loaded=loading;
+    try{await loading;}catch(error){if(this.loaded===loading)this.loaded=null;throw error;}
   }
   markDirty(path:string):void{if(isSafeVaultPath(path)){const scope=this.scopeValue();if(this.dirtyScope!==scope){this.dirty.clear();this.dirtyGenerations.clear();this.dirtyScope=scope;}this.dirtyGenerations.set(path,(this.dirtyGenerations.get(path)??0)+1);this.dirty.add(path);this.sessionVerified.delete(path);}}
   markMove(from:string,to:string):void{for(const path of this.entries.keys())if(path===from||path.startsWith(`${from}/`)){this.markDirty(path);this.markDirty(path===from?to:`${to}${path.slice(from.length)}`);}}

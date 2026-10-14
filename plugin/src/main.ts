@@ -450,7 +450,7 @@ export default class GibSyncPlugin extends Plugin {
   }
   openCorePluginSettings(){
     const setting=(this.app as unknown as {setting?:{open?:()=>void;openTabById?:(id:string)=>void}}).setting;
-    setting?.open?.();window.setTimeout(()=>setting?.openTabById?.("core-plugins"),50);
+    setting?.open?.();window.setTimeout(()=>setting?.openTabById?.("plugins"),50);
   }
   async setPaused(paused:boolean){
     this.settings.paused=paused;if(paused)this.cancelOperation();await this.saveSettings();

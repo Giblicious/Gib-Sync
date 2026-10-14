@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.78 candidate
+
+- Retry interrupted durable inventory loading instead of caching a rejected load forever. Pausing during cache initialization or changing sync scope can now resume while still revalidating saved content and retaining dirty-file evidence.
+- Correct the native Obsidian Sync conflict dialog's Core plugins settings destination, verified on the physical Android test device.
+- Add a cancellation/retry regression covering saved edits made during the pause. Distribution remains confined to the isolated Canary channel.
+
 ## 0.8.77 candidate
 
 - Extend verified private settings checkpoints to plugin runtime activation. Incoming settings with inconsistent native size hints no longer produce empty recovery copies and unnecessary activation holds.
