@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.79 candidate
+
+- Give foreground mobile rendering a frame opportunity during sustained hashing and verification. The physical A10e's 32 MB hash benchmark went from repeated 100 ms frame gaps to no gaps above 50 ms while retaining the exact content hash.
+- Keep the existing background-safe scheduler, settle immediately on visibility changes, and bound missing-frame waits. Add frame, background, fallback and cleanup regressions.
+- Candidate distribution remains isolated; the extra foreground yielding trades some hashing throughput for responsive interaction.
+
 ## 0.8.78 candidate
 
 - Retry interrupted durable inventory loading instead of caching a rejected load forever. Pausing during cache initialization or changing sync scope can now resume while still revalidating saved content and retaining dirty-file evidence.

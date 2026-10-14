@@ -35,7 +35,16 @@ const RETIRED_PATH_LIMIT=5000;
 const PROTECTED_FOLDER_ROOTS=new Set([".obsidian",".obsidian/plugins",".obsidian/themes",".trash",".git",".gib-sync"]);
 const DISPOSABLE_FOLDER_METADATA=new Set([".ds_store",".nomedia","desktop.ini","thumbs.db"]);
 
+let lastForegroundPaintYield=0;
 export function cooperativeYield():Promise<void>{
+  const mobile=typeof navigator!=="undefined"&&/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if(mobile&&typeof document!=="undefined"&&!document.hidden&&typeof requestAnimationFrame==="function"&&performance.now()-lastForegroundPaintYield>=8){
+    return new Promise(resolve=>{
+      let settled=false,frame:number,timer:ReturnType<typeof setTimeout>;
+      const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);cancelAnimationFrame(frame);document.removeEventListener("visibilitychange",finish);lastForegroundPaintYield=performance.now();resolve();};
+      document.addEventListener("visibilitychange",finish);frame=requestAnimationFrame(finish);timer=setTimeout(finish,50);
+    });
+  }
   const taskScheduler=(globalThis as typeof globalThis&{scheduler?:{yield?:()=>Promise<void>}}).scheduler;
   if(typeof taskScheduler?.yield==="function")return taskScheduler.yield();
   if(typeof MessageChannel!=="undefined")return new Promise((resolve)=>{const channel=new MessageChannel();channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};channel.port2.postMessage(undefined);});
