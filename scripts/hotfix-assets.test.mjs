@@ -1,0 +1,5 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {assetManifest,verify} from './hotfix-assets.mjs';
+const commit='a'.repeat(40),read=name=>Buffer.from(name==='manifest.json'?JSON.stringify({id:'gib-sync',version:'0.8.83',minAppVersion:'1.8.7',isDesktopOnly:false}):name==='versions.json'?'{"0.8.83":"1.8.7"}':'generated fixture '+name);
+test('binds exact client assets to stable base without a server image',()=>{const value=assetManifest(commit,read);assert.equal(value.serverImagePublished,false);verify(value,commit,read);});
+test('rejects altered bytes or foreign commit',()=>{const value=assetManifest(commit,read);assert.throws(()=>verify(value,commit,name=>name==='main.js'?Buffer.from('changed'):read(name)));assert.throws(()=>verify(value,'b'.repeat(40),read));});
+test('rejects desktop-only or wrong-version manifests',()=>{for(const patch of [{version:'0.8.82'},{isDesktopOnly:true}])assert.throws(()=>assetManifest(commit,name=>name==='manifest.json'?Buffer.from(JSON.stringify({...JSON.parse(read(name)),...patch})):read(name)));});

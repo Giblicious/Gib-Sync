@@ -1,3 +1,4 @@
+import {loadVaultLocationBinding,type VaultLocationBinding} from './vault-location';
 import type { Plugin } from "obsidian";
 import type { ManifestEntry,StorageLocation } from "@gib-sync/protocol";
 
@@ -42,6 +43,7 @@ export interface GibSyncSettings {
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
+  vaultLocationBinding:VaultLocationBinding|null;
   pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[];
   pendingApplySnapshotId:string|null; pendingApplyBaseSnapshotId:string|null; pendingApplyPriorHashes:Record<string,string|null>; retiredPaths:Record<string,RetiredPathState>;
   pendingCommit:PendingCommit|null;
@@ -53,6 +55,7 @@ export interface GibSyncSettings {
 
 export const DEFAULT_SETTINGS: GibSyncSettings = {
   configDir:".obsidian",
+  vaultLocationBinding:null,
   onboardingMode:"preserve-local",
   pendingMoves:[],fileCreationTimes:{},observedFolderSnapshotId:null,
   serverUrl: "", vaultId: "", vaultName: "", vaultKey: "", deviceId: "", deviceName: "", deviceToken: "",
@@ -82,6 +85,7 @@ export function createSerializedSettingsWriter<T>(read:()=>T,write:(snapshot:T)=
 export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
   const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
+  settings.vaultLocationBinding=loadVaultLocationBinding(stored?.vaultLocationBinding);
   settings.configDir=normalizedConfigDir(typeof stored?.configDir==="string"?stored.configDir:".obsidian");
   settings.onboardingMode=stored?.onboardingMode==="server-first"?"server-first":"preserve-local";
   settings.pendingMoves=Array.isArray(stored?.pendingMoves)?stored.pendingMoves.filter(move=>move&&typeof move.from==="string"&&isSafeVaultPath(move.from)&&typeof move.to==="string"&&isSafeVaultPath(move.to)&&typeof move.at==="number"&&Number.isFinite(move.at)&&move.at>0):[];

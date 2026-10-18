@@ -1,0 +1,46 @@
+name: Stable portable-vault hotfix
+on:
+  push:
+    tags: ["v0.8.83"]
+permissions: { contents: write }
+concurrency: { group: gib-sync-release-publication, cancel-in-progress: false }
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      RELEASE_COMMIT: '${{ github.sha }}'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, check-latest: true, cache: npm }
+      - run: node scripts/verify-stable-hotfix.mjs "$GITHUB_REF_NAME"
+      - run: node --test scripts/verify-server-runtime.test.mjs scripts/verify-stable-hotfix.test.mjs scripts/hotfix-assets.test.mjs
+      - run: node scripts/verify-server-runtime.mjs
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+        env: { LOG_LEVEL: silent }
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+      - run: node scripts/verify-release.mjs "$GITHUB_REF_NAME"
+      - name: Stage exact client-only assets
+        run: |
+          set -euo pipefail
+          (cd plugin && zip ../gib-sync-${GITHUB_REF_NAME}.zip main.js manifest.json styles.css versions.json)
+          mkdir hotfix-assets
+          cp plugin/main.js plugin/manifest.json plugin/styles.css plugin/versions.json "gib-sync-${GITHUB_REF_NAME}.zip" hotfix-assets/
+          node scripts/hotfix-assets.mjs create hotfix-assets "$GITHUB_REF_NAME"
+          node scripts/hotfix-assets.mjs guard unused "$GITHUB_REF_NAME"
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: false
+          make_latest: true
+          body_path: .github/release-notes/portable-hotfix.md
+          files: hotfix-assets/*
+      - name: Independently verify all published client bytes
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" --dir published-hotfix
+          node scripts/hotfix-assets.mjs verify published-hotfix "$GITHUB_REF_NAME"

@@ -1,0 +1,7 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {verifyScope} from './verify-stable-hotfix.mjs';
+const old=path=>path==='plugin/versions.json'?'{}':path==='plugin/manifest.json'?'{"version":"0.8.62","minAppVersion":"1.8.7"}':'stable 0.8.62',current=path=>path==='plugin/versions.json'?'{"0.8.83":"1.8.7"}':path==='.github/workflows/stable-portable-hotfix.yml'?'node scripts/verify-stable-hotfix.mjs':path==='.github/workflows/release.yml'?old(path):old(path).replaceAll('0.8.62','0.8.83');
+test('accepts the focused client hotfix and version alignment',()=>assert.equal(verifyScope(['plugin/src/vault-location.ts'],old,current),true));
+test('rejects a v2 engine or backend implementation',()=>{for(const path of ['plugin/src/engine.ts','apps/server/src/app.ts','packages/protocol/src/operation.ts'])assert.throws(()=>verifyScope([path],old,current),/Unrelated hotfix change/);});
+test('rejects behavior or dependency changes hidden in version files',()=>assert.throws(()=>verifyScope([],old,path=>path==='apps/server/src/config.ts'?'changed':current(path)),/Non-version/));
+test('rejects container publication',()=>assert.throws(()=>verifyScope([],old,path=>path==='.github/workflows/stable-portable-hotfix.yml'?current(path)+' docker/build-push-action':current(path)),/server images/));
+test('retains existing version mappings',()=>assert.throws(()=>verifyScope([],old,path=>path==='plugin/versions.json'?'{}':current(path))));

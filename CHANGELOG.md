@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.83 stable hotfix
+
+- Built from stable 0.8.62 with only the portable Windows vault-location fix. Versions 0.8.63 through 0.8.82 are already reserved by experimental tags; this release does not include that v2 work.
+- Keep the same flash-drive vault trusted when Windows changes its drive letter; retain checks for a different storage volume, folder or vault name.
+- Preserve credentials and pending sync state. If the drive letter already changed before upgrading, verify the intended vault and trust its current location once. Later letter changes use the saved native binding.
+- Publish plugin assets only. Existing servers remain on their current version; no container image or latest-image update is part of this hotfix.
+
 ## 0.8.62
 
 - Add staged, hash-verified local application with durable phase journals and retained original recovery copies.

@@ -8,9 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 24, check-latest: true, cache: npm }
       - run: node --test scripts/verify-server-runtime.test.mjs
+      - run: node scripts/verify-stable-hotfix.mjs
+      - run: node --test scripts/verify-stable-hotfix.test.mjs scripts/hotfix-assets.test.mjs
       - run: node scripts/verify-server-runtime.mjs
       - run: npm ci
       - run: npm run typecheck
