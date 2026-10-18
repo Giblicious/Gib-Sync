@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.82 candidate
+
+- Recognize the same Windows portable vault across drive-letter changes using its native volume and folder identity, while still blocking changed storage devices, folders and vault names.
+- Preserve existing credentials and durable journal scope. Anchor legacy trust only at the previously trusted path; a vault whose letter already changed may need one explicit location trust before the new binding is established.
+- Keep native filesystem access lazy on mobile, retain strict path checks where native identity is unavailable, and fail closed if a saved binding is corrupt or cannot be verified.
+- Add drive-letter, wrong-volume/folder, migration, cancellation and real Windows drive-alias regressions. Candidate publication remains separate from stable users.
+
 ## 0.8.81 candidate
 
 - Make the automatic diagnostic retention/rate-limit regression independent of wall-clock minute boundaries. Keep the same bounded opt-in reporting behavior from the 0.8.80 candidate.

@@ -1,5 +1,6 @@
 import type { Plugin } from "obsidian";
 import type { ManifestEntry,StorageLocation } from "@gib-sync/protocol";
+import {loadVaultLocationBinding,type VaultLocationBinding} from './vault-location';
 
 export type SyncPhase = "not-configured"|"blocked"|"idle"|"scheduled"|"checking"|"retrying"|"offline"|"scanning"|"reading-remote"|"merging"|"applying"|"uploading"|"committing"|"mirroring"|"complete"|"up-to-date"|"error";
 export type ActivityLevel = "info"|"success"|"warning"|"error";
@@ -45,6 +46,7 @@ export interface GibSyncSettings {
   desktopStatusIcon: boolean; desktopStatusText: boolean;
   mobileSidebarIndicator: boolean; mobileTopIndicator: boolean; animateStatusIndicator: boolean; showAttentionBadge: boolean;
   vaultIdentity: string;
+  vaultLocationBinding:VaultLocationBinding|null;
   pendingPaths: string[]; pendingPathTimes:Record<string,number>; pendingApplyPaths:string[];
   pendingApplySnapshotId:string|null; pendingApplyBaseSnapshotId:string|null; pendingApplyPriorHashes:Record<string,string|null>; retiredPaths:Record<string,RetiredPathState>;
   pendingCommit:PendingCommit|null;
@@ -63,6 +65,7 @@ export const DEFAULT_SETTINGS: GibSyncSettings = {
   lastSnapshotId: null, initialized: false, autoSync: true, instantReceive: true, syncOnFileChange: true, paused:false,serverDiagnosticLogging:false, syncIntervalSeconds: 60, syncBookmarks:true, syncObsidianConfig: false, syncPlugins: false,pluginSyncBootstrapPending:false,
   desktopStatusIcon:true,desktopStatusText:true,mobileSidebarIndicator:true,mobileTopIndicator:false,animateStatusIndicator:true,showAttentionBadge:true,
   exclusions: [".trash/", ".git/", ".obsidian/plugins/gib-sync/"], vaultIdentity:"", pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null,
+  vaultLocationBinding:null,
   pendingCommit:null,pendingApplyOperations:{},pendingApplyPriorEntries:{},localReconcileBases:{}, storage:null, lastSuccessAt:null, lastErrorAt:null, lastError:"", lastResult:""
 };
 
@@ -87,6 +90,7 @@ export async function loadSettings(plugin: Plugin): Promise<GibSyncSettings> {
   const stored=(await plugin.loadData()) as Partial<GibSyncSettings>|null;
   const settings=Object.assign({},DEFAULT_SETTINGS,stored??{});
   settings.serverDiagnosticLogging=stored?.serverDiagnosticLogging===true;
+  settings.vaultLocationBinding=loadVaultLocationBinding(stored?.vaultLocationBinding);
   settings.packageHolds=stored?.packageHolds&&typeof stored.packageHolds==="object"&&!Array.isArray(stored.packageHolds)?Object.fromEntries(Object.entries(stored.packageHolds).filter(([id,hold])=>/^[a-z0-9._-]+$/i.test(id)&&hold&&typeof hold.reason==="string"&&typeof hold.at==="number"&&Number.isFinite(hold.at)).map(([id,hold])=>[id,{reason:hold.reason.slice(0,500),at:hold.at}])):{};
   settings.configDir=normalizedConfigDir(typeof stored?.configDir==="string"?stored.configDir:".obsidian");
   settings.onboardingMode=stored?.onboardingMode==="server-first"?"server-first":"preserve-local";

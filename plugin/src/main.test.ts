@@ -37,6 +37,32 @@ describe("review-only setup URI routing",()=>{
 });
 
 describe("plugin synchronization lifecycle",()=>{
+  const portable={version:1 as const,volume:'123',directory:'456',relativePath:'/portable/notes',vaultName:'notes'};
+  function locationFixture(current='notes|e:/portable/notes'){
+    const f=fixture();f.plugin.settings.initialized=true;f.plugin.settings.vaultIdentity='notes|e:/portable/notes';f.plugin.currentVaultIdentity=()=>current;
+    (f.plugin as any).refreshVaultLocation=vi.fn(async()=>{(f.plugin as any).observedVaultLocation=portable;(f.plugin as any).observedVaultPath=current;});return f;
+  }
+  it('migrates an exact legacy location without changing credentials or durable journal scope',async()=>{
+    const {plugin}=locationFixture();plugin.settings.pendingCommit={parentId:'old-head',fingerprint:'saved',priorHashes:{}};const journal=plugin.settings.pendingCommit;
+    await expect(plugin.runSync()).resolves.toBe(true);expect(plugin.settings.vaultLocationBinding).toEqual(portable);expect(plugin.settings.vaultIdentity).toBe('notes|e:/portable/notes');expect(plugin.settings.deviceToken).toBe('test');expect(plugin.settings.pendingCommit).toBe(journal);
+  });
+  it('syncs after a drive-letter change using the saved volume/folder binding',async()=>{
+    const {plugin,sync}=locationFixture('notes|k:/portable/notes');plugin.settings.vaultLocationBinding={...portable};await expect(plugin.runSync()).resolves.toBe(true);expect(sync).toHaveBeenCalledOnce();expect(plugin.hasVaultLocationChanged()).toBe(false);expect(plugin.settings.vaultIdentity).toBe('notes|e:/portable/notes');
+  });
+  it.each(['volume','directory']as const)('blocks a changed %s even when the drive letter and path are unchanged',async key=>{
+    const {plugin,sync}=locationFixture();plugin.settings.vaultLocationBinding={...portable,[key]:'other'};plugin.liveStatus.verified=true;
+    await expect(plugin.runSync()).resolves.toBe(false);expect(sync).not.toHaveBeenCalled();expect(plugin.liveStatus.verified).toBe(false);expect(plugin.hasVaultLocationChanged()).toBe(true);
+  });
+  it('requires one explicit trust when the legacy path changed before a volume binding existed',async()=>{
+    const {plugin,sync}=locationFixture('notes|k:/portable/notes');await expect(plugin.runSync()).resolves.toBe(false);expect(sync).not.toHaveBeenCalled();expect(plugin.settings.vaultLocationBinding).toBeNull();
+    await plugin.acceptCurrentVaultIdentity();expect(plugin.settings.vaultIdentity).toBe('notes|k:/portable/notes');expect(plugin.settings.vaultLocationBinding).toEqual(portable);await expect(plugin.runSync()).resolves.toBe(true);
+  });
+  it('does not fall back to path-only trust when bound volume metadata is unavailable',async()=>{
+    const {plugin,sync}=locationFixture();plugin.settings.vaultLocationBinding={...portable};(plugin as any).refreshVaultLocation=vi.fn(async()=>{(plugin as any).observedVaultLocation=null;(plugin as any).observedVaultPath=plugin.currentVaultIdentity();});await expect(plugin.runSync()).resolves.toBe(false);expect(sync).not.toHaveBeenCalled();
+  });
+  it('does not save a new location or begin sync after pausing during metadata lookup',async()=>{
+    const {plugin,sync}=locationFixture();plugin.engine.cancel=vi.fn();let finish!:()=>void;(plugin as any).refreshVaultLocation=vi.fn(()=>new Promise<void>(resolve=>{finish=resolve;}));const run=plugin.runSync();await Promise.resolve();await plugin.setPaused(true);vi.mocked(plugin.saveSettings).mockClear();finish();await expect(run).resolves.toBe(false);expect(sync).not.toHaveBeenCalled();expect(plugin.settings.vaultLocationBinding).toBeNull();expect(plugin.saveSettings).not.toHaveBeenCalled();
+  });
   it("does not leave a green check over a newly queued folder or a changed sync scope",()=>{const {plugin}=fixture();plugin.liveStatus.verified=true;plugin.liveStatus.lastSuccessAt=new Date().toISOString();(plugin as any).recordPathTime("New empty folder",true);plugin.requireFullScan();expect(plugin.liveStatus.verified).toBe(false);expect(plugin.indicatorState()).toMatchObject({key:"queued",icon:"cloud-upload"});expect(plugin.liveStatus.pendingChanges).toBe(1);plugin.settings.pendingPathTimes={};expect(plugin.indicatorState().tone).not.toBe("success");});
   it("does not count excluded or operational device-local paths as unsent vault changes",()=>{const {plugin}=fixture();plugin.settings.syncPlugins=true;plugin.settings.pendingPaths=[".obsidian/plugins/obsidian42-brat/data.json","note.md"];plugin.settings.pendingPathTimes={".obsidian/plugins/gib-sync/data.json":1,".trash/old.md":1};plugin.liveStatus.lastSuccessAt=new Date().toISOString();plugin.liveStatus.verified=true;expect(plugin.indicatorState()).toMatchObject({key:"queued",icon:"cloud-upload"});expect(plugin.liveStatus.pendingChanges).toBe(1);expect(plugin.settings.pendingPaths).toHaveLength(2);expect(Object.keys(plugin.settings.pendingPathTimes)).toHaveLength(2);});
   it("keeps a proven no-change checkpoint visible during a transient verification retry",async()=>{

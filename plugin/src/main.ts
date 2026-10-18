@@ -19,6 +19,7 @@ import {parseSetupInvite} from "./setup-qr";
 import {ModalRegistry,closeLegacyPluginDialogs} from './modal-lifecycle';
 import {ServerDiagnosticReporter,serverDiagnosticReport} from './server-diagnostics';
 import type {DeviceProbeReport} from './device-diagnostics';
+import {readWindowsVaultLocation,sameVaultLocation,type WindowsVaultLocation} from './vault-location';
 
 export default class GibSyncPlugin extends Plugin {
   readonly modalRegistry=new ModalRegistry();
@@ -43,6 +44,8 @@ export default class GibSyncPlugin extends Plugin {
   private setupInviteModal:QuickCodeEntryModal|null=null;
   private diagnosticReporter:ServerDiagnosticReporter|null=null;
   private deviceTestReport:DeviceProbeReport|undefined;
+  private observedVaultLocation:WindowsVaultLocation|null=null;
+  private observedVaultPath:string|null=null;
   liveStatus: LiveSyncStatus = initialLiveStatus(false); serverStatus: ServerStatus | null = null;
   private statusListeners = new Set<() => void>();
   private safeguardModalOpen=false;
@@ -77,6 +80,7 @@ export default class GibSyncPlugin extends Plugin {
   async onload() {
     if(typeof document!=='undefined'&&typeof document.querySelectorAll==='function')closeLegacyPluginDialogs(document);
     this.settings = await loadSettings(this);this.settings.configDir=normalizePath(this.app.vault.configDir);this.settings.fullScanRequired=true;
+    await this.refreshVaultLocation();
     this.registerSetupInviteHandler();
     for(const path of this.settings.pendingPaths)this.pathVersions.set(path,++this.pathRevision);
     this.api = new GibSyncApi(() => this.settings,new SnapshotCache(this.app.vault.adapter));
@@ -378,7 +382,16 @@ export default class GibSyncPlugin extends Plugin {
     const adapter=this.app.vault.adapter as unknown as {getBasePath?:()=>string};
     return `${this.app.vault.getName()}|${adapter.getBasePath?.()??"mobile-adapter"}`.replace(/\\/g,"/").toLowerCase();
   }
-  async acceptCurrentVaultIdentity(){this.settings.vaultIdentity=this.currentVaultIdentity();await this.saveSettings();this.report("idle","Current vault location trusted","success");}
+  private async refreshVaultLocation(){
+    const vault=this.app?.vault,adapter=vault?.adapter as unknown as {getBasePath?:()=>string}|undefined;
+    this.observedVaultLocation=await readWindowsVaultLocation(vault?.getName()??'',adapter?.getBasePath?.()??null,Boolean(Platform.isDesktopApp));
+    this.observedVaultPath=this.currentVaultIdentity();
+  }
+  hasVaultLocationChanged():boolean{
+    if(this.settings.vaultLocationBinding)return this.observedVaultPath!==this.currentVaultIdentity()||!sameVaultLocation(this.settings.vaultLocationBinding,this.observedVaultLocation);
+    return Boolean(this.settings.vaultIdentity&&this.settings.vaultIdentity!==this.currentVaultIdentity());
+  }
+  async acceptCurrentVaultIdentity(){await this.refreshVaultLocation();this.settings.vaultIdentity=this.currentVaultIdentity();this.settings.vaultLocationBinding=this.observedVaultLocation;await this.saveSettings();this.report("idle","Current vault location trusted","success");}
   openSafeguards(){if(this.safeguardModalOpen)return;this.safeguardModalOpen=true;new SafeguardReviewModal(this.app,this,()=>{this.safeguardModalOpen=false;}).open();}
   private async exclusiveOperation<T>(operation:()=>Promise<T>):Promise<T>{
     if(this.syncTask||this.liveStatus.running)throw new SyncSafetyError("Let the current sync finish before starting recovery.");
@@ -406,6 +419,7 @@ export default class GibSyncPlugin extends Plugin {
     this.settings.onboardingMode=onboardingMode;
     Object.assign(this.settings, { serverUrl: setup.serverUrl, vaultId: setup.vaultId, vaultName: setup.vaultName, vaultKey: setup.vaultKey, deviceId: setup.deviceId, deviceToken: setup.deviceToken,deviceName,storage:setup.storage,lastSnapshotId:null,initialized:false,vaultIdentity:this.currentVaultIdentity(),pendingPaths:[],pendingPathTimes:{},pendingApplyPaths:[],pendingApplySnapshotId:null,pendingApplyBaseSnapshotId:null,pendingApplyPriorHashes:{},pendingCommit:null,pendingApplyPriorEntries:{},pendingApplyOperations:{},pendingMoves:[],fileCreationTimes:{},observedFolderSnapshotId:null,localReconcileBases:{},retiredPaths:{},folderCreateTimes:{},folderCleanupVersion:5,lastFolderCleanupAt:0,lastFolderCleanupError:"",retiredFolderCount:0,retiredFolderNote:"",fullScanRequired:true,lastFullScanAt:null });
     this.pathVersions.clear();
+    this.settings.vaultLocationBinding=this.observedVaultPath===this.currentVaultIdentity()?this.observedVaultLocation:null;
     this.liveStatus=initialLiveStatus(true); this.report("idle","Connected; ready for first sync","success"); await this.saveSettings(); this.configureTimer(); this.configureWatch(); void this.refreshServerStatus();
   }
   async verifyServerBeforeSetup(server:string){assertSetupServerCompatible(await this.api.serverInfo(server));}
@@ -487,12 +501,20 @@ export default class GibSyncPlugin extends Plugin {
     this.operationOwner=this.operationGeneration;
     const settleWindow=Date.now()-this.lastVaultRenameAt<30_000?5000:2000,quietFor=Date.now()-this.lastRelevantVaultChangeAt;
     if(this.lastRelevantVaultChangeAt&&quietFor<settleWindow){this.queueSync(settleWindow+250-quietFor,"Waiting for file moves and automatic link updates to settle","file-change");return false;}
-    const identity=this.currentVaultIdentity();
-    if(this.settings.initialized&&this.settings.vaultIdentity&&identity!==this.settings.vaultIdentity){
-      const message="Vault-location protection paused sync because this device now points to a different vault path or name. Verify it in Gib Sync settings before trusting the new location.";
-      this.report("error",message,"error");this.notify("vault-location",message,10000,300_000);return false;
+    if(this.settings.initialized){
+      await this.refreshVaultLocation();
+      if(this.stopped||this.settings.paused||this.operationOwner!==this.operationGeneration)return false;
+      if(this.hasVaultLocationChanged()){
+        const message="Vault-location protection paused sync because this device now points to a different vault folder, name, or storage device. Verify it in Gib Sync settings before trusting the new location.";
+        this.liveStatus.verified=false;this.report("error",message,"error");this.notify("vault-location",message,10000,300_000);return false;
+      }
+      // Anchor only an already-trusted legacy location. Keep the legacy identity
+      // unchanged because durable queues and inventory journals are scoped to it.
+      if(!this.settings.vaultLocationBinding&&this.observedVaultLocation&&this.settings.vaultIdentity){this.settings.vaultLocationBinding=this.observedVaultLocation;await this.saveSettings();}
     }
+    const identity=this.currentVaultIdentity();
     if(!this.settings.vaultIdentity){this.settings.vaultIdentity=identity;await this.saveSettings();}
+    if(this.stopped||this.settings.paused||this.operationOwner!==this.operationGeneration)return false;
     if(this.debounce!==null){window.clearTimeout(this.debounce);this.debounce=null;this.debounceKind=null;}
     this.liveStatus.running=true; this.liveStatus.startedAt=new Date().toISOString(); this.liveStatus.completedAt=null; this.liveStatus.nextSyncAt=null; this.report("checking","Checking for changes");
     let changedDuringRead:FileChangedDuringReadError|null=null,genericFailure=false,runSucceeded=false,retryStarted=false,serverRepairWaiting=false;
